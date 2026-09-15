@@ -237,7 +237,7 @@
       (is (= :error (:status r)))
       (is (str/includes? (:value r) (:url rt))))))
 
-(h/deftest-when h/node? test-the-oracle-over-the-long-poll
+(h/deftest-when h/node? test-the-oracle-over-the-browser-transport
   ;; doc/cljs-repl.md 9's R0 oracle, over the other transport. It is the same test
   ;; because the transport is not what makes it work: a var is a property of a
   ;; namespace object in the runtime, and the JVM half above it does not know
@@ -315,28 +315,37 @@
 
 ;; --- what a refresh does ----------------------------------------------------
 
-(h/deftest-when h/node? test-a-refresh-ends-the-evaluation-the-old-page-never-answered
-  ;; The reason session numbering is the valuable half of Replique's transport
-  ;; (doc/cljs-repl.md 6). A refresh is not a disconnection a socket would notice -
-  ;; the old page just stops polling - so without a number the JVM would wait for
-  ;; an answer that has no one left to produce it. With one, the new page's :ready
-  ;; drains the eval executor and every blocked caller is told.
+(h/deftest-when h/node? test-a-second-page-leaves-the-first-one-alone
+  ;; THE SEMANTICS A SOCKET CHANGED. Over the long-poll a second page arriving was
+  ;; indistinguishable from a refresh - both were a :ready - and both had to end
+  ;; whatever the previous page owed, because two runtimes polling one REPL would
+  ;; answer each other's questions.
+  ;;
+  ;; A socket tells the two apart: a refresh closes before it opens, a new tab
+  ;; closes nothing. So opening one moves where evaluation goes and disturbs
+  ;; nothing that is running - and it is the CLOSE, when it comes, that ends what
+  ;; the old page owed.
   (let [out (StringWriter.) log (StringBuffer.)]
     (with-open [rt (browser/browser-runtime {:out out})]
       (with-core! rt)
       (let [[a n] (connected! rt log)
-            ;; a script the page will never finish
-            hung (future (repl/-evaluate
-                          rt "(async function () { return new Promise(function () {}); })()"))]
-        (is (nil? (deref hung 500 nil)) "still waiting on the page")
+            hung  (future (repl/-evaluate
+                           rt "(async function () { return new Promise(function () {}); })()"))]
+        (is (nil? (deref hung 500 nil)) "waiting on the first page")
         (let [[b _] (connected! rt log n)]
-          (is (= {:status :error :value "Connection broken"} (deref hung 10000 :blocked)))
-          ;; and the new page has the REPL
-          (is (= ["2"] (values rt 'refresh.core "(js* \"1 + 1\")")))
-          (.destroy ^Process a)
+          (is (nil? (deref hung 1000 nil))
+              "a new tab is not a refresh: what the first page owes is still owed")
+          (is (= 2 (count (:connections rt))) "both are connected")
+          ;; and now the close, which is the half a refresh really consists of
+          (.destroyForcibly ^Process a)
+          (let [r (deref hung 10000 :blocked)]
+            (is (= :error (:status r)))
+            (is (str/includes? (:value r) "browser is gone")))
+          (is (= ["2"] (values rt 'refresh.core "(js* \"1 + 1\")"))
+              "and the page that is left has the REPL")
           (.destroy ^Process b))))))
 
-(h/deftest-when h/node? test-a-refresh-ends-the-evaluations-that-never-started-either
+(h/deftest-when h/node? test-a-page-going-away-ends-the-evaluations-that-never-started-either
   ;; The half a single-thread executor needed a second mechanism for. Replique's
   ;; shutdownNow interrupts the RUNNING task and hands back the ones still queued,
   ;; which it then runs itself with a dynamic var bound so each answers its caller
@@ -344,30 +353,22 @@
   ;; and cannot be interrupted.
   ;;
   ;; A permit collapses that: an evaluation that has not started is a thread parked
-  ;; on acquire, and it ends because it re-checks the session on the way in as the
-  ;; permit comes free. This is the test that says so - the second evaluation never
-  ;; reached the page at all, and still answered its caller.
-  ;;
-  ;; It does NOT isolate the interrupt in stop-evaluations!, and cannot: the two
-  ;; paths overlap by design, and the re-check alone is enough here. See that
-  ;; docstring for which of them is the guarantee.
+  ;; on acquire, and end-turns! interrupts it. This is the test that says so - the
+  ;; second evaluation never reached the page at all, and still answered its caller.
   (let [out (StringWriter.) log (StringBuffer.)]
     (with-open [rt (browser/browser-runtime {:out out})]
-      (let [[a n] (connected! rt log)
+      (let [[p _]  (connected! rt log)
             running (future (repl/-evaluate
                              rt "(async function () { return new Promise(function () {}); })()"))
             _       (Thread/sleep 500)          ; let it take the permit
             waiting (future (repl/-evaluate rt "(async function () { return 1; })()"))]
         (is (nil? (deref running 200 nil)) "the first holds the permit")
         (is (nil? (deref waiting 200 nil)) "the second is behind it")
-        (let [[b _] (connected! rt log n)]
-          (is (= connection-broken (deref running 10000 :blocked)) "the one that was running")
-          (is (= connection-broken (deref waiting 10000 :blocked)) "the one that never started")
-          (.destroy ^Process a)
-          (.destroy ^Process b))))))
-
-
-;; --- what a page that goes away does ----------------------------------------
+        (.destroyForcibly ^Process p)
+        (is (str/includes? (:value (deref running 10000 {})) "browser is gone")
+            "the one that was running, completed")
+        (is (str/includes? (:value (deref waiting 10000 {})) "browser is gone")
+            "the one that never started, interrupted")))))
 
 (h/deftest-when h/node? test-a-page-that-is-killed-ends-its-evaluations-at-once
   ;; WHAT THE SOCKET IS FOR. Over the long-poll this was the expensive case: a page
@@ -451,6 +452,77 @@
         (is (= #{"1" "2"} #{(:value (deref a 10000 :never)) (:value (deref b 10000 :never))})
             "and each got its own answer, not the other's")
         (.abort ws)))))
+
+;; --- a load goes everywhere, a value comes from one -------------------------
+
+(deftest test-a-load-reaches-every-page-but-a-value-comes-from-one
+  ;; THE DISTINCTION STEP 4 IS ABOUT (doc/cljs-repl.md 6.2, repl/IJsRuntimes). A
+  ;; require is idempotent and answers nil wherever it runs, and what you want from
+  ;; it is that every page you have open picks up the new code. An ordinary form has
+  ;; a value, and a value needs ONE answer rather than a set of them differing by
+  ;; which page's clock or random seed produced it.
+  ;;
+  ;; Both pages are spoken by hand, because what is under test is which sockets the
+  ;; script was written into - and a real page would answer before the question
+  ;; could be asked.
+  (let [src (h/write-sources! two-files)]
+    (try
+      (with-open [rt (browser/browser-runtime {})]
+        (let [[^WebSocket a as] (fake-page! rt)
+              n1                (wait-for #(:session rt))
+              [^WebSocket b bs] (fake-page! rt)]
+          (is (some? n1))
+          (is (wait-for #(= 2 (count (:connections rt)))) "both are connected")
+          (let [cenv (env/compile-env {:ns 'cljs.user})
+                opts {:out-dir (:dir rt) :source-paths [src]}
+                done (future (repl/eval-src cenv rt "(require '[app.core :as app])" opts))
+                ja   (took as)
+                jb   (took bs)]
+            (is (str/includes? ja "$CLJS.require") "a load, not a body")
+            (is (= ja jb) "and the same one reached both pages")
+            (answer! a "{:status :success :value \"nil\"}")
+            (answer! b "{:status :success :value \"nil\"}")
+            (is (= ["nil"] (mapv :value (deref done 10000 :never))))
+            ;; an ordinary form: the newest page only
+            (let [v (future (repl/eval-src cenv rt "(app/use-it)" opts))]
+              (is (some? (took bs)) "the page evaluation targets got it")
+              (is (nil? (.poll ^LinkedBlockingQueue as 1000 TimeUnit/MILLISECONDS))
+                  "and the other was not asked")
+              (answer! b "{:status :success :value \"42\"}")
+              (is (= ["42"] (mapv :value (deref v 10000 :never))))))
+          (.abort a)
+          (.abort b)))
+      (finally (h/delete-tree! src)))))
+
+(deftest test-a-page-that-will-not-load-does-not-fail-the-require
+  ;; The grace the other pages get, and why they get one. The page evaluation
+  ;; targets is waited for without a bound - an evaluation may legitimately take
+  ;; minutes. The others cannot have that: a backgrounded tab on a sleeping laptop
+  ;; is connected, will answer eventually, and must not be able to hold up a
+  ;; require. So it is reported rather than waited for, and a tab left open from
+  ;; yesterday is not the reason your require says it failed.
+  (with-redefs [browser/other-page-ms 500]
+    (let [src (h/write-sources! two-files)
+          out (StringWriter.)]
+      (try
+        (with-open [rt (browser/browser-runtime {:out out})]
+          (let [[^WebSocket a as] (fake-page! rt)
+                _                 (wait-for #(:session rt))
+                [^WebSocket b bs] (fake-page! rt)]
+            (is (wait-for #(= 2 (count (:connections rt)))))
+            (let [cenv (env/compile-env {:ns 'cljs.user})
+                  opts {:out-dir (:dir rt) :source-paths [src]}
+                  done (future (repl/eval-src cenv rt "(require 'app.core)" opts))]
+              (took as)
+              (took bs)
+              (answer! b "{:status :success :value \"nil\"}")   ; only the target answers
+              (is (= ["nil"] (mapv :value (deref done 10000 :never)))
+                  "the require succeeded on the strength of the page that answered")
+              (is (str/includes? (str out) "another connected page")
+                  "and the one that did not was reported rather than ignored"))
+            (.abort a)
+            (.abort b)))
+        (finally (h/delete-tree! src))))))
 
 ;; --- not sending what the browser already has -------------------------------
 

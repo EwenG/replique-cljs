@@ -79,6 +79,36 @@
     One method. Loading is an ordinary expression inside the script (§5), so
     there is nothing else a runtime has to be asked to do."))
 
+(defprotocol IJsRuntimes
+  "A runtime that may be more than one runtime - the browser transport, where
+  several pages can hold a socket at the same time. OPTIONAL: node implements
+  IJsRuntime alone, and everything below works on either.
+
+  It exists for one distinction, which is the whole of the fan-out design:
+  LOADING IS NOT EVALUATION. A require, a load-file or a remove-var is idempotent
+  and has no interesting value - it answers nil wherever it runs - and what you
+  want from it is that every page you have open picks up the new code. An
+  ordinary form has a value, and a value needs one answer rather than a set of
+  them differing by which page's clock or random seed produced it.
+
+  So ship! broadcasts and eval-src does not, and that is decided here rather than
+  in the transport."
+  (-evaluate-all [this js]
+    "Evaluate `js` in every connected runtime, and answer as -evaluate does for
+    the one an ordinary evaluation would have gone to.
+
+    What the others answered is the runtime's business, not the REPL's - a tab
+    left open from yesterday failing to load something must not be the reason
+    your require reports a failure. A runtime that wants to say so writes it to
+    its own output."))
+
+(defn- broadcast!
+  "-evaluate-all where the runtime has it, -evaluate where it does not."
+  [runtime js]
+  (if (satisfies? IJsRuntimes runtime)
+    (-evaluate-all runtime js)
+    (-evaluate runtime js)))
+
 ;; --- compiling one input ----------------------------------------------------
 
 (defn- root-message
@@ -296,10 +326,14 @@
 
 (defn- ship!
   "Evaluate each of `scripts` in order, stopping at the first failure and returning
-  it - or nil_result when they all succeed."
+  it - or nil_result when they all succeed.
+
+  THIS IS THE BROADCAST PATH. Everything that reaches here is a load - require,
+  load-file, remove-var - which is idempotent, answers nil, and is the thing you
+  want every page you have open to receive. See IJsRuntimes."
   [runtime scripts]
   (or (some (fn [script]
-              (let [r (-evaluate runtime script)]
+              (let [r (broadcast! runtime script)]
                 (when (= :error (:status r)) r)))
             scripts)
       nil-result))

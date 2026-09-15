@@ -65,7 +65,8 @@
            [java.nio.file Files LinkOption]
            [java.nio.file.attribute BasicFileAttributes FileAttribute]
            [java.util.concurrent CompletableFuture ConcurrentHashMap
-            ExecutionException Executors Semaphore ThreadFactory TimeUnit]))
+            ExecutionException Executors Semaphore ThreadFactory TimeoutException
+            TimeUnit]))
 
 ;; --- what a browser runtime is run beside -----------------------------------
 
@@ -245,6 +246,27 @@
   (spit (File. dir info-name)
         (str "{\"ws\": \"ws://127.0.0.1:" ws-port "/?token=" token "\"}\n")))
 
+;; --- who is connected ------------------------------------------------------
+;;
+;; A VECTOR, NEWEST LAST, AND THE LAST OF IT IS WHERE EVALUATION GOES. The
+;; long-poll could not have held more than one page: two runtimes polling one REPL
+;; would take alternate turns and answer each other's questions, so a page that was
+;; replaced had to be told to step aside. Scripts now go to a connection by name,
+;; so an older page cannot take a turn it was not offered, and several may stay.
+;;
+;; WHICH MAKES THE INTERESTING DISTINCTION POSSIBLE, and it is repl/IJsRuntimes':
+;; loading is not evaluation. A require is idempotent and answers nil wherever it
+;; runs, and what you want from it is that every page you have open picks up the new
+;; code - so it goes to all of them. An ordinary form has a value, and a value needs
+;; one answer rather than a set of them differing by which page's clock or random
+;; seed produced it - so it goes to one.
+;;
+;; A SECOND TAB BREAKS NOTHING; A REFRESH STILL BREAKS EVERYTHING. The two used to
+;; be indistinguishable - both arrived as a :ready - and both had to be treated as a
+;; replacement. Over a socket a refresh closes before it opens and a new tab closes
+;; nothing, so opening one moves the cursor and leaves what is running alone, while
+;; the close that a refresh begins with ends the evaluations the old page owned.
+
 ;; --- serializing evaluations -----------------------------------------------
 ;;
 ;; A VIRTUAL THREAD PER EVALUATION, HOLDING A PERMIT, where Replique has a
@@ -265,10 +287,14 @@
 ;; itself with a dynamic var bound so each answers its caller instead of waiting -
 ;; the *stopped-eval-executor?* dance. Here there is no such split: every evaluation
 ;; is a thread, waiting or working, and interrupting them all is the whole of it.
+;;
+;; THE PERMIT BELONGS TO THE REPL AND NOT TO A PAGE. One evaluation at a time is a
+;; property of the prompt - you typed one form - and it stays true across a refresh,
+;; which is why it is made once with the runtime rather than once per session.
 
 (def ^:private broken
   "Replique's wording, for Replique's case: the evaluation was interrupted because
-  the session ended under it - which now means another page connected."
+  the session ended under it."
   {:status :error :value "Connection broken"})
 
 (def ^:private gone
@@ -277,103 +303,142 @@
   {:status :error
    :value  "The browser is gone - it was closed, reloaded or crashed."})
 
-(defn- end-session!
-  "End every evaluation belonging to the session that is finishing, and say why.
+(def ^:private other-page-ms
+  "How long a broadcast waits for a page that is NOT the one evaluation targets.
 
-  THREE THINGS ARE DONE AND THEY ARE NOT THE SAME. The reason is recorded first, so
-  that whatever wakes next reports the right one. The turn in flight is COMPLETED,
-  which is how the thread waiting on it returns at once rather than by being
-  interrupted out of a wait. And every worker is interrupted, which is for the ones
-  parked on the permit that have no future to complete yet - though the guarantee
-  for those is really the session re-check each makes on its way in.
+  The target is waited for without a bound, because an evaluation may legitimately
+  take minutes and that is the REPL's semantics. The others cannot have that: a
+  backgrounded tab on a sleeping laptop is connected, will answer eventually, and
+  must not be able to hold up a require. So they get a generous fixed grace and are
+  reported rather than waited for - a load is a few hundred milliseconds of module
+  fetching, and ten seconds of it means something is wrong with that page, not with
+  this one."
+  10000)
+
+(defn- end-turns!
+  "End every evaluation in flight, and say why.
+
+  TWO MECHANISMS FOR TWO POPULATIONS. A turn that has been sent is COMPLETED, which
+  is how the thread waiting on it returns at once and with the right reason rather
+  than by being interrupted out of a wait. An evaluation that has not started is a
+  thread parked on the permit with no turn to complete, and for that the interrupt
+  is the mechanism.
 
   One call where a single-thread executor needed two mechanisms and a dynamic var:
   an evaluation that has not started is a thread parked on acquire, not a Runnable
   in a queue somebody has to run by hand."
   [state reason]
   (swap! state assoc :reason reason)
-  (when-let [^CompletableFuture p (:pending @state)]
+  (doseq [[_ ^CompletableFuture p] (:pending @state)]
     (.complete p reason))
   (doseq [^Thread t (:workers @state)]
     (.interrupt t)))
 
 (defn- start-session!
-  "A page connected: a new one, or the same page refreshed. Either way whatever was
-  running belongs to a session that is over.
-
-  The order matters. The previous session ends first, so that nothing it owned is
-  still waiting when its connection is replaced; then the new session is installed
-  whole, so no evaluation can see half of it."
+  "A page connected. It becomes the one evaluation targets, and NOTHING IS ENDED:
+  over a socket this is either a new tab, which has replaced nothing, or the second
+  half of a refresh whose first half already ended what the old page owned."
   [state conn]
-  (end-session! state broken)
   (:session
-   (swap! state
-          (fn [m]
-            (let [n (inc (or (:session m) 0))]
-              (assoc m
-                     :session n
-                     :conn    conn
-                     :reason  nil
-                     :pending nil
-                     :permit  (Semaphore. 1 true)   ; fair, so two callers keep their order
-                     :workers (ConcurrentHashMap/newKeySet)
-                     ;; named per session and numbered within it, so a stack dump
-                     ;; says which page an evaluation belonged to
-                     :threads (-> (Thread/ofVirtual)
-                                  (.name (str "cljs-eval-" n "-") 0)
-                                  (.factory))))))))
+   (swap! state (fn [m]
+                  (assoc m
+                         :conns   (conj (:conns m) conn)
+                         :conn    conn
+                         :reason  nil
+                         :session (inc (or (:session m) 0)))))))
 
 (defn- close-session!
-  "The page went away. Only the CURRENT one matters: an older connection closing is
-  a tab being tidied up, and its session ended when it stopped being current."
+  "A page went away.
+
+  The turn it owed ends either way - somebody is waiting on an answer that page was
+  going to produce. Everything ELSE ends only if it was the page evaluation
+  targeted, which is what makes closing a stale tab a non-event and a refresh the
+  end of the session."
   [state conn]
-  (when (identical? conn (:conn @state))
-    (end-session! state gone)
-    (swap! state assoc :conn nil)))
+  (let [target? (identical? conn (:conn @state))]
+    (when-let [^CompletableFuture p (get (:pending @state) conn)]
+      (.complete p gone))
+    (swap! state (fn [m]
+                   (let [conns (vec (remove #(identical? conn %) (:conns m)))]
+                     (assoc m :conns conns :conn (last conns)))))
+    (when target?
+      (end-turns! state gone))))
+
+;; --- one evaluation ---------------------------------------------------------
+
+(defn- start-turn!
+  "Register a turn for `conn` and write the script into its socket. Answers the
+  CompletableFuture the page's result will complete."
+  [state conn js]
+  (let [pending (CompletableFuture.)]
+    (swap! state assoc-in [:pending conn] pending)
+    (try
+      (.sendText ^WebSocketConnection conn js)
+      (catch Throwable t
+        (.complete pending {:status :error :phase :transport
+                            :value  (str "The runtime failed: " (ex-message t))})))
+    pending))
+
+(defn- finish-turn!
+  "Forget the turn, so that a result arriving after it ended is dropped rather than
+  taken by whatever asks next."
+  [state conn]
+  (swap! state update :pending dissoc conn))
+
+(defn- note-other-page!
+  [^Writer out r]
+  (locking out
+    (.write out (str ";; another connected page did not load this: " (:value r) "\n"))
+    (.flush out)))
 
 (defn- turn
-  "One evaluation, once it holds the permit: write the script into the socket and
-  wait for the frame that answers it.
+  "One evaluation, once it holds the permit: write the script into the socket - or
+  into every socket, when this is a load - and wait for the answers.
 
   TWO WAYS OUT WHERE THE LONG-POLL HAD THREE. Answered, which is the ordinary case.
-  Ended, because the session finished under it - and that arrives as a completion
-  rather than as an interrupt, so it is instant and carries its own reason. The
-  third, giving up because the page has said nothing for twenty seconds, is gone
+  Ended, because the page went away or was replaced - and that arrives as a
+  completion rather than an interrupt, so it is instant and carries its own reason.
+  The third, giving up because nothing has been heard for twenty seconds, is gone
   along with the thing that made it necessary: there is no waiting to find out
   whether anyone is there.
 
-  The wait is not bounded, and deliberately: an evaluation may legitimately take
-  minutes, and what ends it is evidence rather than a deadline."
-  [state session js]
-  (let [pending (CompletableFuture.)
-        {:keys [conn]} (swap! state (fn [m]
-                                      (if (= session (:session m))
-                                        (assoc m :pending pending)
-                                        m)))]
-    (if-not (= session (:session @state))
-      broken
-      (do
+  Only the target's answer is returned. The others are reported, for the reason
+  IJsRuntimes gives: a tab left open from yesterday failing to load something must
+  not be why your require says it failed."
+  [state ^Writer out js all?]
+  (let [{:keys [conns conn]} @state]
+    (if (nil? conn)
+      gone
+      (let [targets (if all? conns [conn])
+            turns   (mapv (fn [c] [c (start-turn! state c js)]) targets)]
         (try
-          (.sendText ^WebSocketConnection conn js)
-          (catch Throwable t
-            (.complete pending {:status :error :phase :transport
-                                :value  (str "The runtime failed: " (ex-message t))})))
-        (.get pending)))))
+          (let [mine (some (fn [[c ^CompletableFuture f]]
+                             (when (identical? c conn) (.get f)))
+                           turns)]
+            (doseq [[c ^CompletableFuture f] turns
+                    :when (not (identical? c conn))]
+              (let [r (try (.get f other-page-ms TimeUnit/MILLISECONDS)
+                           (catch TimeoutException _
+                             {:status :error
+                              :value  (str "it did not answer within "
+                                           other-page-ms "ms")}))]
+                (when (= :error (:status r))
+                  (note-other-page! out r))))
+            mine)
+          (finally
+            (doseq [[c _] turns] (finish-turn! state c))))))))
 
 (defn- evaluate!
   "Run `js` on a virtual thread of its own, one evaluation at a time, and wait for
-  the answer.
+  the answer. `all?` sends it to every connected page instead of only the one
+  evaluation targets.
 
   The thread is ours rather than the caller's, which is the property that makes
   ending a session safe: a refresh interrupts threads this namespace made, never one
   it was handed. Doing the work on the calling thread would be less machinery and
-  would put an interrupt on the REPL loop.
-
-  The session is re-checked AFTER the permit is taken. Waiting for it is exactly
-  the window in which a page can be replaced, and a thread that started before the
-  refresh must not go on to evaluate for the page that replaced it."
-  [state js]
-  (let [{:keys [session permit workers threads]} @state
+  would put an interrupt on the REPL loop."
+  [state ^Writer out js all?]
+  (let [{:keys [permit workers threads]} @state
         answer (CompletableFuture.)
         body   (fn []
                  (let [me (Thread/currentThread)]
@@ -381,9 +446,7 @@
                    (try
                      (.acquire ^Semaphore permit)
                      (try
-                       (.complete answer (if (= session (:session @state))
-                                           (turn state session js)
-                                           (or (:reason @state) broken)))
+                       (.complete answer (turn state out js all?))
                        (finally (.release ^Semaphore permit)))
                      (catch InterruptedException _
                        (.complete answer (or (:reason @state) broken)))
@@ -412,33 +475,25 @@
     (.flush out)))
 
 (defn- on-text!
-  "A frame from the page: the result of the script it was given, or something it
+  "A frame from a page: the result of the script it was given, or something it
   printed.
 
-  BOTH ARRIVE HERE, ON ONE THREAD, IN ORDER, which is the whole of what the socket
-  bought: a println inside a form and that form's value used to be two POSTs that
-  could land either way round.
+  BOTH ARRIVE HERE, ON THAT PAGE'S OWN THREAD, IN ORDER, which is the whole of what
+  the socket bought: a println inside a form and that form's value used to be two
+  POSTs that could land either way round.
 
-  A result is completed into the turn that asked for it, and a result that finds no
-  turn is dropped - the evaluation was ended by a refresh between the two halves,
-  and a value nobody is waiting for must not be left for the next one to take as
-  its own.
-
-  A RESULT IS ONLY TAKEN FROM THE PAGE THE SCRIPT WAS SENT TO; A PRINT IS TAKEN
-  FROM ANY OF THEM. The asymmetry is deliberate. A result answers a question this
-  JVM asked, and a page that was not asked has no standing to answer it. Output is
-  not an answer to anything - it is something that happened - and a tab left open
-  from before the refresh is still a page whose console someone may be watching,
-  so dropping what it says would lose information rather than prevent a mistake."
+  A result is completed into the turn THAT PAGE was given, and a result from a page
+  with no turn open is dropped - it answered late, or it answered something nobody
+  asked. A print is taken from any page at all, with or without a turn: output is
+  not an answer to anything, and a tab someone still has open is a console someone
+  may still be watching."
   [state ^Writer out conn text]
   (let [{:keys [type content]} (edn/read-string text)]
     (case type
-      :result (when (identical? conn (:conn @state))
-                (when-let [^CompletableFuture p (:pending @state)]
-                  (.complete p (edn/read-string content))))
+      :result (when-let [^CompletableFuture p (get (:pending @state) conn)]
+                (.complete p (edn/read-string content)))
       :print  (on-print! out content)
       nil)))
-
 
 ;; --- serving the output directory, continued -------------------------------
 
@@ -497,6 +552,17 @@
   (.delete f))
 
 
+(defn- nobody-connected
+  "The answer when there is no page, which is not an error to recover from and not
+  a wait: a REPL you started before you opened the browser is the normal way round,
+  and the useful answer is the URL. nil when a page IS connected."
+  [url state]
+  (when-not (:conn @state)
+    {:status :error
+     :value  (str "No browser is connected. Open " url " - or import "
+                  client-name " from it in a page of your own - and "
+                  "evaluate this again.")}))
+
 (defn browser-runtime
   "Serve `dir` over HTTP, listen for a websocket beside it, and evaluate in
   whatever browser connects.
@@ -529,7 +595,17 @@
   ([{:keys [dir port ws-port out] :or {port 0 ws-port 0 out *out*}}]
    (let [^File own (when-not dir (temp-dir))
          ^File dir (write-runtime! (or dir own))
-         srv       (atom {:session nil})
+         srv       (atom {:session nil
+                          :conns   []
+                          :conn    nil
+                          :pending {}
+                          ;; made once, with the runtime, not once per page - see
+                          ;; the note above broken
+                          :permit  (Semaphore. 1 true)   ; fair, so two callers keep their order
+                          :workers (ConcurrentHashMap/newKeySet)
+                          :threads (-> (Thread/ofVirtual)
+                                       (.name "cljs-eval-" 0)
+                                       (.factory))})
          token     (websocket/random-token)
          ws        (websocket/websocket-server
                     {:port     ws-port
@@ -553,25 +629,29 @@
      (reify
        repl/IJsRuntime
        (-evaluate [_ js]
-         (if-not (:conn @srv)
-           {:status :error
-            :value  (str "No browser is connected. Open " url " - or import "
-                         client-name " from it in a page of your own - and "
-                         "evaluate this again.")}
-           (evaluate! srv js)))
+         (or (nobody-connected url srv) (evaluate! srv out js false)))
+       repl/IJsRuntimes
+       ;; the load path. Every page gets the script; the one evaluation targets is
+       ;; the one whose answer is the answer. See this namespace's "who is
+       ;; connected" note and repl/IJsRuntimes.
+       (-evaluate-all [_ js]
+         (or (nobody-connected url srv) (evaluate! srv out js true)))
        clojure.lang.ILookup
        ;; :session is the one that is not a constant, and the one worth asking for:
        ;; it is nil until a page connects and a different number after a refresh,
        ;; so it is how anything holding this runtime can tell either apart.
        (valAt [this k] (.valAt ^clojure.lang.ILookup this k nil))
        (valAt [_ k not-found]
-         (if (= :session k)
-           (when (:conn @srv) (:session @srv))
+         (case k
+           :session     (when (:conn @srv) (:session @srv))
+           ;; every page holding a socket, oldest first - the last of them is the
+           ;; one an ordinary evaluation goes to
+           :connections (:conns @srv)
            (get props k not-found)))
        java.io.Closeable
        (close [_]
-         (end-session! srv gone)
-         (swap! srv assoc :conn nil)
+         (end-turns! srv gone)
+         (swap! srv assoc :conns [] :conn nil)
          (.close ws)
          (.stop server 0)
          (when own (delete-tree! own)))))))
