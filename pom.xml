@@ -224,8 +224,13 @@
                 <!-- src/clj FIRST, and this is load-bearing twice over: Maven copies it into
                      target/classes, where a stale copy would shadow the sources under test,
                      and the ClojureScript jar further down the path also provides cljs/core.cljc
-                     - core-test asserts ours is not the one that wins. -->
-                <argument>${project.basedir}/src/clj${path.separator}${project.basedir}/test-cljs${path.separator}${cljs-test.deps.classpath}</argument>
+                     - core-test asserts ours is not the one that wins.
+
+                     target/classes AFTER both source directories, and it is here for the
+                     COMPILED JAVA under src/java (clojure.cljs.ws) - there is no other way to
+                     reach a .class file. Its copy of the Clojure sources still loses to
+                     src/clj, which is the order the paragraph above depends on. -->
+                <argument>${project.basedir}/src/clj${path.separator}${project.basedir}/test-cljs${path.separator}${project.build.outputDirectory}${path.separator}${cljs-test.deps.classpath}</argument>
                 <argument>clojure.main</argument>
                 <argument>${project.basedir}/src/script/run_cljs_test.clj</argument>
               </arguments>
