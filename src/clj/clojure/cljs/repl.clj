@@ -21,7 +21,7 @@
                  protocol method (§6.1)
     node-runtime the R0 host: node dialled on a socket, no HTTP anywhere
     repl         read-eval-print over clojure.cljs.reader/read-one
-    the specials require, load-file, in-ns and remove-var, recognised in head
+    the specials require, load-file, in-ns, remove-var and pages, recognised in head
                  position of an input and never reaching the compiler
 
   ONE LOOP, TWO TRANSPORTS. `repl` does not know which runtime it is talking to,
@@ -100,7 +100,15 @@
     What the others answered is the runtime's business, not the REPL's - a tab
     left open from yesterday failing to load something must not be the reason
     your require reports a failure. A runtime that wants to say so writes it to
-    its own output."))
+    its own output.")
+  (-pages [this]
+    "Who is connected, oldest first: a vector of {:id :name :target?}. :id names
+    the page for -select-page! and never means two pages in one session; :name is
+    a guess at what it is, for a human choosing between them.")
+  (-select-page! [this id]
+    "Point evaluation at the page called `id`. False if there is no such page.
+
+    It moves where the NEXT evaluation goes and disturbs nothing in flight."))
 
 (defn- broadcast!
   "-evaluate-all where the runtime has it, -evaluate where it does not."
@@ -438,11 +446,52 @@
              (into (emitter/ns-prologue ns-sym)
                    [(emitter/delete-var ns-sym (symbol (name qsym)))]))])))
 
+(defn- pages-text
+  [pages]
+  (if (empty? pages)
+    "No page is connected."
+    (str/join "\n"
+              (for [{:keys [id name target?]} pages]
+                ;; the star is the only column that matters and it is the one you
+                ;; read first, so it goes on the left rather than in a note below
+                (str (if target? "* " "  ") id "  " name)))))
+
+(defn- do-pages
+  "(pages) - who is connected, and which of them an ordinary form is evaluated in.
+  (pages 2) - make page 2 that one.
+
+  THE ONE SPECIAL THAT IS NOT ABOUT NAMESPACES, and it exists because a socket let
+  more than one page connect at a time (doc/cljs-repl.md 6.3). A load already goes
+  to all of them; this is how you say which one a VALUE should come from - the
+  page you are looking at rather than the tab you opened last.
+
+  A runtime that cannot have more than one page says so instead of failing: node
+  is one runtime, and asking it which page to use is a reasonable question with a
+  short answer."
+  [_cenv runtime _opts args]
+  (let [id (first args)]
+    (cond
+      (not (satisfies? IJsRuntimes runtime))
+      {:status :success :value "This runtime has one page and it is that one."}
+
+      (and (some? id) (not (integer? id)))
+      {:status :error :phase :compile
+       :value  (str "(pages " (pr-str id) ") - a page is named by a number."
+                    " (pages) lists them.")}
+
+      (and (some? id) (not (-select-page! runtime id)))
+      {:status :error :phase :compile
+       :value  (str "There is no page " id ". (pages) lists them.")}
+
+      :else
+      {:status :success :value (pages-text (-pages runtime))})))
+
 (def ^:private specials
   {'require    do-require
    'load-file  do-load-file
    'in-ns      do-in-ns
-   'remove-var do-remove-var})
+   'remove-var do-remove-var
+   'pages      do-pages})
 
 (defn- symbolicated
   "`result`, with its stack trace read back as ClojureScript

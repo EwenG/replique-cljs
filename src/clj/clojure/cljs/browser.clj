@@ -334,18 +334,54 @@
   (doseq [^Thread t (:workers @state)]
     (.interrupt t)))
 
+(def ^:private browsers
+  "Enough of a table to say which page is which, in the order it must be tried:
+  Edge and Opera both claim to be Chrome, and Chrome claims to be Safari, so the
+  specific names come first and Safari - the only one that claims nothing - last."
+  [[#"Firefox/(\d+)" "Firefox"]
+   [#"Edg/(\d+)"     "Edge"]
+   [#"OPR/(\d+)"     "Opera"]
+   [#"Chrome/(\d+)"  "Chrome"]
+   [#"Version/(\d+).*Safari" "Safari"]
+   [#"Safari/(\d+)"  "Safari"]])
+
+(defn- page-name
+  "What to call the page that sent `req`, from its User-Agent - which the handshake
+  is the only place to get, since a websocket frame carries nothing but its payload.
+
+  A guess, and it says so when it is one: an agent this does not recognise is shown
+  truncated rather than labelled wrongly, and a page that sent none at all - which
+  is every non-browser client, node included - is \"unknown\"."
+  [req]
+  (let [ua (get-in req [:headers "user-agent"])]
+    (cond
+      (str/blank? ua) "unknown"
+      :else (or (some (fn [[re nm]]
+                        (when-let [m (re-find re ua)]
+                          (str nm " " (second m))))
+                      browsers)
+                (if (< (count ua) 40) ua (str (subs ua 0 37) "..."))))))
+
 (defn- start-session!
   "A page connected. It becomes the one evaluation targets, and NOTHING IS ENDED:
   over a socket this is either a new tab, which has replaced nothing, or the second
-  half of a refresh whose first half already ended what the old page owned."
-  [state conn]
+  half of a refresh whose first half already ended what the old page owned.
+
+  THE SESSION COUNTER IS ALSO THE PAGE'S NAME. It only ever goes up, so a number
+  never means two different pages in one REPL - which matters for (pages n), where
+  reusing 2 for a tab opened after the first one closed would be a way to evaluate
+  in the wrong place."
+  [state conn req]
   (:session
    (swap! state (fn [m]
-                  (assoc m
-                         :conns   (conj (:conns m) conn)
-                         :conn    conn
-                         :reason  nil
-                         :session (inc (or (:session m) 0)))))))
+                  (let [n (inc (or (:session m) 0))]
+                    (assoc m
+                           :conns   (conj (:conns m) conn)
+                           :conn    conn
+                           :reason  nil
+                           :session n
+                           :pages   (assoc (:pages m) conn
+                                           {:id n :name (page-name req)})))))))
 
 (defn- close-session!
   "A page went away.
@@ -360,7 +396,13 @@
       (.complete p gone))
     (swap! state (fn [m]
                    (let [conns (vec (remove #(identical? conn %) (:conns m)))]
-                     (assoc m :conns conns :conn (last conns)))))
+                     (assoc m
+                            :conns conns
+                            ;; WHICHEVER IS NEWEST, and only because the page that
+                            ;; was chosen has gone. A close is the one thing that
+                            ;; moves the target without being asked to.
+                            :conn  (last conns)
+                            :pages (dissoc (:pages m) conn)))))
     (when target?
       (end-turns! state gone))))
 
@@ -552,6 +594,28 @@
   (.delete f))
 
 
+(defn- pages-of
+  "Who is connected, oldest first, as repl/IJsRuntimes wants it: {:id :name
+  :target?}. Data rather than a table, because how to show it is the REPL's
+  business and who is there is this namespace's."
+  [state]
+  (let [{:keys [conns conn pages]} @state]
+    (mapv (fn [c] (assoc (get pages c) :target? (identical? c conn))) conns)))
+
+(defn- select-page!
+  "Point evaluation at the page called `id`. False if there is no such page.
+
+  IT DOES NOT DISTURB ANYTHING IN FLIGHT, and cannot: an evaluation binds to a
+  connection when it is sent, not when it is asked for, so a form already running
+  in the old page goes on running there and answers its own caller. What moves is
+  only where the NEXT one goes."
+  [state id]
+  (boolean
+   (when-let [c (some (fn [c] (when (= id (:id (get (:pages @state) c))) c))
+                      (:conns @state))]
+     (swap! state assoc :conn c)
+     true)))
+
 (defn- nobody-connected
   "The answer when there is no page, which is not an error to recover from and not
   a wait: a REPL you started before you opened the browser is the normal way round,
@@ -598,6 +662,7 @@
          srv       (atom {:session nil
                           :conns   []
                           :conn    nil
+                          :pages   {}
                           :pending {}
                           ;; made once, with the runtime, not once per page - see
                           ;; the note above broken
@@ -610,7 +675,7 @@
          ws        (websocket/websocket-server
                     {:port     ws-port
                      :token    token
-                     :on-open  (fn [conn] (start-session! srv conn))
+                     :on-open  (fn [conn req] (start-session! srv conn req))
                      :on-text  (fn [conn text] (on-text! srv out conn text))
                      :on-close (fn [conn _] (close-session! srv conn))})
          ;; A VIRTUAL THREAD PER REQUEST. Less load-bearing than it was - the
@@ -636,6 +701,8 @@
        ;; connected" note and repl/IJsRuntimes.
        (-evaluate-all [_ js]
          (or (nobody-connected url srv) (evaluate! srv out js true)))
+       (-pages [_] (pages-of srv))
+       (-select-page! [_ id] (select-page! srv id))
        clojure.lang.ILookup
        ;; :session is the one that is not a constant, and the one worth asking for:
        ;; it is nil until a page connects and a different number after a refresh,
@@ -651,7 +718,7 @@
        java.io.Closeable
        (close [_]
          (end-turns! srv gone)
-         (swap! srv assoc :conns [] :conn nil)
+         (swap! srv assoc :conns [] :conn nil :pages {})
          (.close ws)
          (.stop server 0)
          (when own (delete-tree! own)))))))

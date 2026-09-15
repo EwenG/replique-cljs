@@ -86,7 +86,7 @@
 (deftest test-open-and-close-are-both-reported
   (let [events (LinkedBlockingQueue.)]
     (with-open [srv (ws/websocket-server
-                     {:on-open  (fn [_] (.offer events :open))
+                     {:on-open  (fn [_ _] (.offer events :open))
                       :on-close (fn [_ code] (.offer events [:close code]))})]
       (let [[^WebSocket c] (client! (:port srv))]
         (is (= :open (took events)))

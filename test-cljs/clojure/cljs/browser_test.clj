@@ -141,23 +141,28 @@
   "A websocket that is not a page: it connects and queues the scripts it is handed
   instead of evaluating them, so a test can answer in its own time - or not at all.
 
+  `ua` is the User-Agent it claims, which is all the JVM ever learns about what a
+  page is.
+
   Answers [ws scripts]."
-  [rt]
-  (let [scripts (LinkedBlockingQueue.)
-        acc     (StringBuilder.)
-        l       (reify WebSocket$Listener
-                  (onText [_ socket data last?]
-                    (.append acc data)
-                    (when last?
-                      (.offer scripts (.toString acc))
-                      (.setLength acc 0))
-                    (.request ^WebSocket socket 1)
-                    nil))]
-    [(-> (HttpClient/newHttpClient)
-         (.newWebSocketBuilder)
-         (.buildAsync (URI/create (ws-url rt)) l)
-         (.get 10000 TimeUnit/MILLISECONDS))
-     scripts]))
+  ([rt] (fake-page! rt nil))
+  ([rt ua]
+   (let [scripts (LinkedBlockingQueue.)
+         acc     (StringBuilder.)
+         l       (reify WebSocket$Listener
+                   (onText [_ socket data last?]
+                     (.append acc data)
+                     (when last?
+                       (.offer scripts (.toString acc))
+                       (.setLength acc 0))
+                     (.request ^WebSocket socket 1)
+                     nil))]
+     [(-> (HttpClient/newHttpClient)
+          (.newWebSocketBuilder)
+          (cond-> ua (.header "User-Agent" ua))
+          (.buildAsync (URI/create (ws-url rt)) l)
+          (.get 10000 TimeUnit/MILLISECONDS))
+      scripts])))
 
 (defn- answer!
   "Send `edn` - itself the text of a result map, which is what a page sends: what
@@ -523,6 +528,89 @@
             (.abort a)
             (.abort b)))
         (finally (h/delete-tree! src))))))
+
+;; --- choosing which page answers --------------------------------------------
+
+(def ^:private chrome-ua
+  "What Chrome actually sends, which is four browsers' worth of history: it claims
+  to be Mozilla, KHTML, Safari and Chrome, and Edge and Opera claim to be Chrome on
+  top of that. The order browsers are matched in is the whole of the parsing."
+  (str "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"))
+
+(def ^:private firefox-ua
+  (str "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:143.0) Gecko/20100101 "
+       "Firefox/143.0"))
+
+(deftest test-pages-says-who-is-connected-and-who-answers
+  ;; (pages) is the one REPL special that is not about namespaces. It exists
+  ;; because a socket let more than one page connect at once (doc/cljs-repl.md
+  ;; 6.3) and evaluation has to go somewhere: without it the target is whichever
+  ;; tab you opened last, and the only way back to an earlier one is to close tabs
+  ;; until it is newest again.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [cenv (env/compile-env {:ns 'cljs.user})
+          run  #(first (repl/eval-src cenv rt % {:out-dir (:dir rt)}))]
+      (is (= "No page is connected." (:value (run "(pages)")))
+          "before anyone connects")
+      (let [[^WebSocket a as] (fake-page! rt chrome-ua)
+            _                 (wait-for #(:session rt))
+            [^WebSocket b bs] (fake-page! rt firefox-ua)]
+        (is (wait-for #(= 2 (count (:connections rt)))))
+        (is (= "  1  Chrome 140\n* 2  Firefox 143" (:value (run "(pages)")))
+            "named by what they said they were, newest targeted")
+        ;; move it, and the NEXT evaluation goes elsewhere
+        (is (= "* 1  Chrome 140\n  2  Firefox 143" (:value (run "(pages 1)"))))
+        (let [v (future (repl/eval-src cenv rt "(js* \"1 + 1\")" {:out-dir (:dir rt)}))]
+          (is (some? (took as)) "the page that was chosen got the script")
+          (is (nil? (.poll ^LinkedBlockingQueue bs 1000 TimeUnit/MILLISECONDS))
+              "and the one that was not, did not")
+          (answer! a "{:status :success :value \"2\"}")
+          (is (= ["2"] (mapv :value (deref v 10000 :never)))))
+        (.abort a)
+        (.abort b)))))
+
+(deftest test-choosing-a-page-that-is-not-there-says-so
+  (with-open [rt (browser/browser-runtime {})]
+    (let [cenv (env/compile-env {:ns 'cljs.user})
+          run  #(first (repl/eval-src cenv rt % {:out-dir (:dir rt)}))
+          [^WebSocket a _] (fake-page! rt chrome-ua)]
+      (is (wait-for #(:session rt)))
+      (let [r (run "(pages 9)")]
+        (is (= :error (:status r)))
+        (is (str/includes? (:value r) "There is no page 9")))
+      (let [r (run "(pages :chrome)")]
+        (is (= :error (:status r)))
+        (is (str/includes? (:value r) "a page is named by a number")))
+      (is (= "* 1  Chrome 140" (:value (run "(pages)")))
+          "and neither mistake moved anything")
+      (.abort a))))
+
+(deftest test-a-page-number-is-never-reused
+  ;; The session counter names the page, and it only goes up. If a closed tab's
+  ;; number were handed to the next one, (pages 2) would be a way to evaluate in a
+  ;; page you did not mean - and you would not find out from the number.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [cenv (env/compile-env {:ns 'cljs.user})
+          run  #(first (repl/eval-src cenv rt % {:out-dir (:dir rt)}))
+          [^WebSocket a _] (fake-page! rt chrome-ua)]
+      (is (wait-for #(:session rt)))
+      (.abort a)
+      (is (wait-for #(zero? (count (:connections rt)))))
+      (let [[^WebSocket b _] (fake-page! rt firefox-ua)]
+        (is (wait-for #(= 1 (count (:connections rt)))))
+        (is (= "* 2  Firefox 143" (:value (run "(pages)")))
+            "the second page is 2, not 1 again")
+        (.abort b)))))
+
+(h/deftest-when h/node? test-a-runtime-with-one-page-says-so
+  ;; node is one runtime and cannot be more, so it does not implement IJsRuntimes
+  ;; and the question has a short answer rather than an error.
+  (let [out (StringWriter.)]
+    (with-open [rt (repl/node-runtime {:out out})]
+      (is (= "This runtime has one page and it is that one."
+             (:value (first (repl/eval-src (env/compile-env {:ns 'cljs.user}) rt
+                                           "(pages)" {:out-dir (:dir rt)}))))))))
 
 ;; --- not sending what the browser already has -------------------------------
 

@@ -175,7 +175,7 @@
                             (start [this c]
                               (deliver ctx c)
                               (.put clients c s)
-                              (when on-open (on-open c))
+                              (when on-open (on-open c req))
                               this)
                             (onText [_ text]
                               (when on-text (on-text @ctx text)))
@@ -205,7 +205,10 @@
     :token     a secret the connect URL must carry as ?token=..., default none.
                random-token makes one. Without it any page on the internet may
                connect - see this namespace's docstring
-    :on-open   (fn [conn])           a page arrived
+    :on-open   (fn [conn req])       a page arrived; `req` is what it sent to get
+                                     in - {:target, :headers} - which is where a
+                                     User-Agent comes from, the handshake being
+                                     the only time a page says what it is
     :on-text   (fn [conn text])      it said something
     :on-close  (fn [conn code])      it went away; 1006 means it never said so
 
