@@ -501,13 +501,28 @@
   ;;
   ;; It also pins :core-macros defaulting to cljs.core (env/compile-env): a REPL
   ;; that cannot expand defn is not one.
-  (let [out (StringWriter.)]
-    (repl/node-repl {:in  (StringReader. "(defn twice [x] (* 2 x))
+  ;;
+  ;; ON A BARE THREAD, AND THAT IS THE POINT OF THE THREAD. env/*current-ns* moves
+  ;; by set!, which needs a binding to move; h/cursor gives every test one, and a
+  ;; user calling (repl/node-repl) from a plain Clojure REPL has none - so node-repl
+  ;; has to establish its own. When it did not, that call threw "Can't
+  ;; change/establish root binding" on the first line while this test, wrapped in
+  ;; the fixture's binding, passed. A future would convey the caller's bindings and
+  ;; hide it again; a Thread conveys none, which is the situation being tested.
+  (let [out   (StringWriter.)
+        threw (atom nil)
+        t     (Thread.
+               #(try
+                  (repl/node-repl {:in  (StringReader. "(defn twice [x] (* 2 x))
                                           (twice 21)
                                           {:a [1 2] :b :c}
                                           (reduce + (map inc (range 4)))")
-                     :out out
-                     :program-out program-out})
+                                   :out out
+                                   :program-out program-out})
+                  (catch Throwable e (reset! threw e))))]
+    (.start t)
+    (.join t 180000)
+    (is (nil? @threw) (some-> ^Throwable @threw .getMessage))
     (let [s (str out)]
       ;; a macro expanded, a var was defined and called
       (is (str/includes? s "42") s)

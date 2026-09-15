@@ -1,0 +1,12 @@
+;; For consumers that use the Clojure CLI: `{:local/root "../replique-cljs"}` puts
+;; the source on their classpath directly, with no `mvn install` step in between,
+;; so an edit here is picked up by their next REPL.
+;;
+;; The Maven build (pom.xml) is the one that runs the tests and builds a jar; this
+;; file exists only so tools.deps can see the source tree.
+;;
+;; NO :deps HERE, deliberately. The one dependency is replique-clj, and it is the
+;; CONSUMER that must name it, because it stands in for org.clojure/clojure - which
+;; the Clojure CLI's root deps.edn always puts on the classpath, and which only the
+;; consuming project can override.
+{:paths ["src/clj"]}

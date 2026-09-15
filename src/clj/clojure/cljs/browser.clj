@@ -667,14 +667,16 @@
   ([] (browser-repl nil))
   ([{:keys [dir port source-paths ns in out program-out]
      :or   {ns 'cljs.user in *in* out *out*}}]
-   (let [^File own (when-not dir (temp-dir))
-         ^File d   (io/file (or dir own))
-         cenv      (env/compile-env)]
-     (try
-       (with-open [rt (browser-runtime {:dir d :port port :out (or program-out out)})]
-         (doto ^Writer out
-           (.write (str "Waiting for a browser on " (:url rt) "\n"))
-           (.flush))
-         (repl/repl cenv rt {:ns ns :in in :out out
-                             :out-dir d :source-paths source-paths}))
-       (finally (when own (delete-tree! own)))))))
+   ;; The cursor is established here, for the reason repl/node-repl says.
+   (env/with-current-ns ns
+     (let [^File own (when-not dir (temp-dir))
+           ^File d   (io/file (or dir own))
+           cenv      (env/compile-env {:ns ns})]
+       (try
+         (with-open [rt (browser-runtime {:dir d :port port :out (or program-out out)})]
+           (doto ^Writer out
+             (.write (str "Waiting for a browser on " (:url rt) "\n"))
+             (.flush))
+           (repl/repl cenv rt {:ns ns :in in :out out
+                               :out-dir d :source-paths source-paths}))
+         (finally (when own (delete-tree! own))))))))

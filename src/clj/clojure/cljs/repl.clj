@@ -694,13 +694,19 @@
   ([] (node-repl nil))
   ([{:keys [dir source-paths ns in out program-out]
      :or   {ns 'cljs.user in *in* out *out*}}]
-   (let [^File own (when-not dir (temp-dir))
-         ^File d   (io/file (or dir own))
-         ;; :core-macros, because cljs.core is vendored now and a REPL that cannot
-         ;; expand defn is not one
-         cenv      (env/compile-env {:core-macros 'cljs.core})]
-     (try
-       (with-open [rt (node-runtime {:dir d :out (or program-out out)})]
-         (repl cenv rt {:ns ns :in in :out out
-                        :out-dir d :source-paths source-paths}))
-       (finally (when own (delete-tree! own)))))))
+   ;; THE CURSOR IS ESTABLISHED HERE, before anything that moves it. env/compile-env
+   ;; positions itself with set-current-ns!, which is a set! and so needs a binding
+   ;; to move - and this is the outermost thing a caller runs, so this is where the
+   ;; binding belongs. Without it, the very first call into this namespace from a
+   ;; plain REPL throws "Can't change/establish root binding".
+   (env/with-current-ns ns
+     (let [^File own (when-not dir (temp-dir))
+           ^File d   (io/file (or dir own))
+           ;; :core-macros, because cljs.core is vendored now and a REPL that cannot
+           ;; expand defn is not one
+           cenv      (env/compile-env {:ns ns :core-macros 'cljs.core})]
+       (try
+         (with-open [rt (node-runtime {:dir d :out (or program-out out)})]
+           (repl cenv rt {:ns ns :in in :out out
+                          :out-dir d :source-paths source-paths}))
+         (finally (when own (delete-tree! own))))))))
