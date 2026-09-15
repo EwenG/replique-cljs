@@ -6,58 +6,66 @@
 ;   the terms of this license.
 ;   You must not remove this notice, or any other, from this software.
 
-(ns ^{:doc "The browser runtime: an asset server, a long-poll, and the same
-  IJsRuntime the node transport implements. doc/cljs-repl.md R1.
 
-  A browser cannot be dialled, so it dials out and holds a request open; the JVM
-  answers that request when it has something to evaluate, and the answer to the
-  NEXT request carries the result. That is Replique's transport, kept for the
-  reason doc/cljs-repl.md 6 gives - the polling is not the valuable part, the
-  failure semantics are:
+(ns ^{:doc "The browser runtime: an asset server, a websocket, and the same
+  IJsRuntime the node transport implements. doc/cljs-repl.md 6.
 
-    SESSION NUMBERING, so a page refresh invalidates the evaluations the previous
-    page never answered. A refresh is not a disconnection a socket would notice:
-    the old page simply stops polling, and without a number the JVM would wait for
-    an answer that no longer has anyone to produce it.
+  A browser cannot be dialled, so it dials out - and what it opens now is a
+  socket, where it used to be a request held open. The JVM writes a script into
+  that socket and the page writes back the result.
 
-    EVERY EVALUATION ENDED when the session that owns it does, so that a blocked
-    caller gets \"Connection broken\" rather than hanging. Replique reaches this
-    with shutdown-eval-executor - interrupt the running task, then hand back the
-    queued ones and run them yourself with a dynamic var bound. Here an evaluation
-    is a virtual thread holding a permit, so waiting and working are the same
-    thing and interrupting them all is the whole of it.
+  TWO LISTENERS, WHICH IS NOT A COMPROMISE BUT THE SHAPE OF THE PROBLEM.
+  com.sun.net.httpserver frames every response itself and will not hand back a
+  connection, and the bytes it has already buffered past the request headers are
+  exactly the first websocket frame - so the socket cannot be a handler on it. It
+  gets a listener of its own (clojure.cljs.websocket), and the asset server stays
+  what it was, because serving a compiled program with an ETag and a 304 has
+  nothing to gain from a socket.
 
-  WHAT IS NOT KEPT, and each because §3.1 removed the need rather than because it
-  was skipped: goog/base.js, cljs_deps.js and the bootstrap - ES modules are the
-  dependency graph; the pending-eval/after-load handshake in Replique's client -
-  loading is an expression here (§5), so a turn is one promise; and every
-  cljs.closure call, because the driver already wrote the files this serves.
+  WHAT THE SOCKET DELETED, all of it machinery that existed to imitate one:
 
-  DEFERRED, and named so that their absence is a decision: source-mapped stacktraces
-  belong with R2. Replique's timeout-before-submitted is NOT on that list any more -
-  a tooling request that must not block on an absent runtime is tryAcquire with a
-  timeout, so R3 gets it for the price of a call rather than of a mechanism.
+    SESSION NUMBERING. A refresh closes the old socket before opening the new one,
+    so the two can never be confused and no number has to tell them apart. A
+    session is still counted - :session below - but only so that a caller can SEE
+    that a page was replaced; nothing on the wire carries it.
+
+    THE SILENCE THRESHOLD, the 5-second :alive ping and the :bye beacon. A closed
+    socket reports itself, at once and with a code; a page that dies without
+    closing is found by the websocket ping instead of by 20 seconds of quiet.
+
+    THE POLL, its 20-second heartbeat, and the requirement that a request be in
+    flight for the JVM to have anywhere to write.
+
+  WHAT IT FIXED. A print and the value of the form that printed it used to be two
+  POSTs on two connections, ordered by luck. They are now two frames on one
+  socket, delivered to one callback thread in the order they were sent.
+
+  WHAT IS UNCHANGED, because it was never about the transport: evaluations are
+  serialised by a permit, each runs on a virtual thread of its own, and ending a
+  session interrupts them all so that a blocked caller gets an answer rather than
+  a wait.
 
   Two entry points, mirroring the node pair in clojure.cljs.repl:
 
-    browser-runtime  the server plus the IJsRuntime over it, Closeable
+    browser-runtime  the servers plus the IJsRuntime over them, Closeable
     browser-repl     that, an output directory, and the loop over both"}
   clojure.cljs.browser
   (:require [clojure.cljs.env :as env]
             [clojure.cljs.output :as output]
             [clojure.cljs.repl :as repl]
+            [clojure.cljs.websocket :as websocket]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str])
-  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+  (:import [clojure.cljs.ws WebSocketConnection]
+           [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
            [java.io File Writer]
            [java.net InetSocketAddress URLDecoder]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files LinkOption]
            [java.nio.file.attribute BasicFileAttributes FileAttribute]
-           [java.util.concurrent CompletableFuture ExecutionException Executors
-            Semaphore SynchronousQueue ThreadFactory TimeUnit]
-           [java.util.concurrent ConcurrentHashMap]))
+           [java.util.concurrent CompletableFuture ConcurrentHashMap
+            ExecutionException Executors Semaphore ThreadFactory TimeUnit]))
 
 ;; --- what a browser runtime is run beside -----------------------------------
 
@@ -223,42 +231,19 @@
     (send! ex 200 ctype body revalidate)
     (send! ex 304 ctype (byte-array 0) revalidate)))
 
-;; --- how long anything waits ------------------------------------------------
+;; --- where the page is told to dial ----------------------------------------
 
-(def ^:private heartbeat-ms
-  "How long a poll is held before it is answered with 204 and the browser asks
-  again. It exists so that an idle REPL is not one request that has been open for
-  an hour: proxies and fetch implementations both have opinions about those, and a
-  request that ends on purpose beats one that ends by timing out."
-  20000)
+(def ^:private info-name
+  "Written into the output directory, which the asset server serves, so that a
+  page can find the socket from the URL it imported the client from. A file rather
+  than something interpolated into runtime_browser.js, so that the client stays
+  the bytes on the classpath and editing it needs no restart."
+  "cljs-repl.json")
 
-(def ^:private liveness-tick-ms
-  "How often an evaluation waiting for its answer looks up to see whether the page
-  has gone quiet. Not a deadline and not a delay: a result that arrives wakes the
-  wait immediately, and this only sets the resolution at which silence-ms below is
-  noticed. Coarse on purpose - a second's granularity against a twenty-second
-  threshold is as fine as it can matter."
-  1000)
-
-(def ^:private offer-ms
-  "How long a script waits for a poll to carry it. A live page always has one in
-  flight or one arriving - it re-polls the instant it has answered - so nothing but
-  an absent runtime waits this long."
-  30000)
-
-(def ^:private silence-ms
-  "How long the JVM waits to hear ANYTHING from a page that owes it a result before
-  deciding the page is gone.
-
-  This is the number that makes a long-poll behave like a socket. A closed socket
-  reports itself; a long-poll that has been answered has nothing left open to
-  break, and writing a script into a dead connection succeeds - the bytes reach the
-  kernel and no error is ever raised. So the page says it is still there every 5
-  seconds while it evaluates, and this is the silence that means it is not.
-
-  Comfortably above the client's 5s ping and below the 20s idle heartbeat, because
-  the two windows do not overlap: a page that owes a result is not polling."
-  20000)
+(defn- write-connect-info!
+  [^File dir ws-port ^String token]
+  (spit (File. dir info-name)
+        (str "{\"ws\": \"ws://127.0.0.1:" ws-port "/?token=" token "\"}\n")))
 
 ;; --- serializing evaluations -----------------------------------------------
 ;;
@@ -283,80 +268,97 @@
 
 (def ^:private broken
   "Replique's wording, for Replique's case: the evaluation was interrupted because
-  the session ended under it."
+  the session ended under it - which now means another page connected."
   {:status :error :value "Connection broken"})
 
-(def ^:private expired
-  "Handed to a held poll to tell it its session is over.
-
-  It travels on js-queue, which otherwise carries only scripts - strings - so a
-  keyword there is unambiguous by construction.
-
-  The queue being a SynchronousQueue is what makes this safe as well as useful:
-  offer with no timeout succeeds ONLY when a consumer is already waiting, so this
-  either reaches a held poll or does nothing at all. It can never be left sitting
-  in the queue for the next session's poll to pick up, because a SynchronousQueue
-  holds nothing."
-  ::expired)
-
-(def ^:private silent
-  "The other case, and a different sentence because it is a different fact: nothing
-  interrupted anything, the page simply stopped answering."
+(def ^:private gone
+  "The other case, and a different sentence because it is a different fact: the
+  page did not lose a race, it left."
   {:status :error
-   :value  "The browser stopped answering - it was closed, reloaded or crashed."})
+   :value  "The browser is gone - it was closed, reloaded or crashed."})
 
-(defn- touch!
-  "Note that `n`'s page was heard from. Every message does this, which is what makes
-  silence mean something."
-  [state n]
-  (when (= n (:session @state))
-    (swap! state assoc :last-seen (System/currentTimeMillis))))
+(defn- end-session!
+  "End every evaluation belonging to the session that is finishing, and say why.
 
-(defn- silent?
-  [state n]
-  (and (= n (:session @state))
-       (< silence-ms (- (System/currentTimeMillis) (or (:last-seen @state) 0)))))
+  THREE THINGS ARE DONE AND THEY ARE NOT THE SAME. The reason is recorded first, so
+  that whatever wakes next reports the right one. The turn in flight is COMPLETED,
+  which is how the thread waiting on it returns at once rather than by being
+  interrupted out of a wait. And every worker is interrupted, which is for the ones
+  parked on the permit that have no future to complete yet - though the guarantee
+  for those is really the session re-check each makes on its way in.
 
-(defn- gone!
-  "Mark the session over because the page stopped answering, so that the NEXT
-  evaluation says there is no browser instead of waiting to find out again.
+  One call where a single-thread executor needed two mechanisms and a dynamic var:
+  an evaluation that has not started is a thread parked on acquire, not a Runnable
+  in a queue somebody has to run by hand."
+  [state reason]
+  (swap! state assoc :reason reason)
+  (when-let [^CompletableFuture p (:pending @state)]
+    (.complete p reason))
+  (doseq [^Thread t (:workers @state)]
+    (.interrupt t)))
 
-  It does not shut the executor down: this runs ON the executor, and a task cannot
-  drain the queue it is standing in. The next :ready replaces it whole."
-  [state n]
-  (swap! state (fn [m] (if (= n (:session m)) (assoc m :state :stopped) m))))
+(defn- start-session!
+  "A page connected: a new one, or the same page refreshed. Either way whatever was
+  running belongs to a session that is over.
 
-(defn- release-polls!
-  "Wake every poll held for the CURRENT session and tell it the session is over.
+  The order matters. The previous session ends first, so that nothing it owned is
+  still waiting when its connection is replaced; then the new session is installed
+  whole, so no evaluation can see half of it."
+  [state conn]
+  (end-session! state broken)
+  (:session
+   (swap! state
+          (fn [m]
+            (let [n (inc (or (:session m) 0))]
+              (assoc m
+                     :session n
+                     :conn    conn
+                     :reason  nil
+                     :pending nil
+                     :permit  (Semaphore. 1 true)   ; fair, so two callers keep their order
+                     :workers (ConcurrentHashMap/newKeySet)
+                     ;; named per session and numbered within it, so a stack dump
+                     ;; says which page an evaluation belonged to
+                     :threads (-> (Thread/ofVirtual)
+                                  (.name (str "cljs-eval-" n "-") 0)
+                                  (.factory))))))))
 
-  Loops because a page could in principle have more than one request in flight, and
-  stops the moment an offer fails - which is the moment no one is left waiting."
-  [state]
-  (when-let [q (:js-queue @state)]
-    (loop []
-      (when (.offer ^SynchronousQueue q expired)
-        (recur)))))
+(defn- close-session!
+  "The page went away. Only the CURRENT one matters: an older connection closing is
+  a tab being tidied up, and its session ended when it stopped being current."
+  [state conn]
+  (when (identical? conn (:conn @state))
+    (end-session! state gone)
+    (swap! state assoc :conn nil)))
 
 (defn- turn
-  "One evaluation, once it holds the permit: hand the script to whichever poll is
-  waiting, then wait for the answer the next poll brings.
+  "One evaluation, once it holds the permit: write the script into the socket and
+  wait for the frame that answers it.
 
-  THREE WAYS OUT, and the third is the one a socket would not have needed.
-  Interrupted, because the session ended under it. Answered, which is the ordinary
-  case. Or given up on, because the page has said nothing for silence-ms - and that
-  wait is not bounded by a deadline, since an evaluation may legitimately take
-  minutes; it is bounded by evidence that no one is evaluating."
+  TWO WAYS OUT WHERE THE LONG-POLL HAD THREE. Answered, which is the ordinary case.
+  Ended, because the session finished under it - and that arrives as a completion
+  rather than as an interrupt, so it is instant and carries its own reason. The
+  third, giving up because the page has said nothing for twenty seconds, is gone
+  along with the thing that made it necessary: there is no waiting to find out
+  whether anyone is there.
+
+  The wait is not bounded, and deliberately: an evaluation may legitimately take
+  minutes, and what ends it is evidence rather than a deadline."
   [state session js]
-  (let [{:keys [js-queue result-queue]} @state]
-    (if-not (.offer ^SynchronousQueue js-queue js offer-ms TimeUnit/MILLISECONDS)
-      (do (gone! state session) silent)
-      (loop []
-        (if-let [r (.poll ^SynchronousQueue result-queue
-                          liveness-tick-ms TimeUnit/MILLISECONDS)]
-          r
-          (if (silent? state session)
-            (do (gone! state session) silent)
-            (recur)))))))
+  (let [pending (CompletableFuture.)
+        {:keys [conn]} (swap! state (fn [m]
+                                      (if (= session (:session m))
+                                        (assoc m :pending pending)
+                                        m)))]
+    (if-not (= session (:session @state))
+      broken
+      (do
+        (try
+          (.sendText ^WebSocketConnection conn js)
+          (catch Throwable t
+            (.complete pending {:status :error :phase :transport
+                                :value  (str "The runtime failed: " (ex-message t))})))
+        (.get pending)))))
 
 (defn- evaluate!
   "Run `js` on a virtual thread of its own, one evaluation at a time, and wait for
@@ -381,9 +383,10 @@
                      (try
                        (.complete answer (if (= session (:session @state))
                                            (turn state session js)
-                                           broken))
+                                           (or (:reason @state) broken)))
                        (finally (.release ^Semaphore permit)))
-                     (catch InterruptedException _ (.complete answer broken))
+                     (catch InterruptedException _
+                       (.complete answer (or (:reason @state) broken)))
                      (catch Throwable t
                        (.complete answer {:status :error :phase :transport
                                           :value (str "The runtime failed: "
@@ -400,95 +403,7 @@
         {:status :error :phase :transport
          :value  (str "The runtime failed: " (ex-message (or (ex-cause e) e)))}))))
 
-(defn- stop-evaluations!
-  "End every evaluation belonging to the session that is finishing.
-
-  TWO THINGS DO THIS, and they are not the same thing. For the evaluation holding
-  the permit the interrupt is the mechanism: it is parked in `turn`, waiting for a
-  poll or for an answer, and nothing else would end that. For the ones waiting on
-  the permit it is only a shortcut - the guarantee is the session re-check in
-  `evaluate!`, which each of them makes on the way in as the permit comes free.
-  Interrupting them as well is insurance against a future release path that is not
-  instant, and it costs a loop.
-
-  Either way it is one call where a single-thread executor needed two mechanisms,
-  and no dynamic var: an evaluation that has not started is a thread parked on
-  acquire, not a Runnable in a queue somebody has to run by hand."
-  [state]
-  (doseq [^Thread t (:workers @state)]
-    (.interrupt t)))
-
-;; --- the handlers -----------------------------------------------------------
-
-(defn- on-ready!
-  "A runtime announcing itself: a new page, or the same page refreshed. Either way
-  the previous session is over.
-
-  The order matters. :state goes to :stopped first, so nothing new is submitted to
-  an executor that is about to be shut down; then the previous page's held poll is
-  released, so it learns its session is over rather than waiting to notice; then the
-  old executor is drained, which is what unblocks anyone waiting on that page; then
-  the new session is installed whole."
-  [state]
-  (let [session (:session @state)
-        n (inc (or session 0))]
-    (swap! state assoc :state :stopped)
-    (release-polls! state)
-    (stop-evaluations! state)
-    (swap! state assoc
-           :state        :started
-           :session      n
-           :last-seen    (System/currentTimeMillis)
-           :permit       (Semaphore. 1 true)   ; fair, so two callers keep their order
-           :workers      (ConcurrentHashMap/newKeySet)
-           ;; named per session and numbered within it, so a stack dump says which
-           ;; page an evaluation belonged to
-           :threads      (-> (Thread/ofVirtual) (.name (str "cljs-eval-" n "-") 0) (.factory))
-           :js-queue     (SynchronousQueue.)
-           :result-queue (SynchronousQueue.))
-    n))
-
-(defn- on-poll!
-  "A runtime reporting the previous script's result, if it had one, and asking for
-  the next.
-
-  Delivering the result and taking the next script are one request because that is
-  what a long-poll is: the runtime is never without a request in flight, so the JVM
-  is never without somewhere to send a script.
-
-  The result is OFFERED rather than put: the evaluation that asked for it may have
-  been interrupted by a refresh between the two halves of this turn, and a result
-  nobody is waiting for must be dropped rather than left to be taken by the next
-  evaluation as its own answer."
-  [state n content ^HttpExchange ex]
-  (let [{:keys [session js-queue result-queue]} @state]
-    (if (not= n session)
-      (send-text! ex 409 "text/plain" "Session expired")
-      (do
-        (when content
-          (.offer ^SynchronousQueue result-queue (edn/read-string content)
-                  5000 TimeUnit/MILLISECONDS))
-        ;; ONE park, for the whole heartbeat. This used to wake every 250ms to
-        ;; re-read the session number - eighty times per idle heartbeat, per page,
-        ;; to notice something that happens once - and the answer is to be TOLD
-        ;; rather than to look: whatever ends a session hands this queue a
-        ;; sentinel, which arrives here as an ordinary wake-up. It is also faster
-        ;; where it matters, since a refresh now ends the old page's poll at once
-        ;; instead of up to a tick later.
-        (let [js (.poll ^SynchronousQueue js-queue heartbeat-ms TimeUnit/MILLISECONDS)]
-          (cond
-            (nil? js)         (send! ex 204 "text/plain" (byte-array 0))
-            (= expired js)    (send-text! ex 409 "text/plain" "Session expired")
-            :else
-            (try
-              (send-text! ex 200 "text/javascript" js)
-              (catch Exception e
-                ;; the script was taken off the queue and never reached anyone.
-                ;; The evaluation waiting for it has to be told, or it waits for
-                ;; an answer that cannot come.
-                (.offer ^SynchronousQueue result-queue broken
-                        5000 TimeUnit/MILLISECONDS)
-                (throw e)))))))))
+;; --- what the page says -----------------------------------------------------
 
 (defn- on-print!
   [^Writer out content]
@@ -496,36 +411,36 @@
     (.write out ^String content)
     (.flush out)))
 
-(defn- on-bye!
-  "The page said it was leaving - a closed tab, or a navigation away. A refresh says
-  it too, and its :bye carries the session the following :ready has already
-  replaced, which is why this checks the number before acting on it.
+(defn- on-text!
+  "A frame from the page: the result of the script it was given, or something it
+  printed.
 
-  Worth having even though silence would find the same thing out: closing a tab is
-  the common case, and 20 seconds of a REPL that answers nothing is a long time to
-  spend rediscovering something the browser was willing to tell us."
-  [state n]
-  (when (= n (:session @state))
-    (swap! state assoc :state :stopped)
-    (release-polls! state)
-    (stop-evaluations! state)))
+  BOTH ARRIVE HERE, ON ONE THREAD, IN ORDER, which is the whole of what the socket
+  bought: a println inside a form and that form's value used to be two POSTs that
+  could land either way round.
 
-(defn- handle-post
-  [state ^Writer out ^HttpExchange ex]
-  (let [body (slurp (.getRequestBody ex) :encoding "UTF-8")
-        {:keys [type session content]} (edn/read-string body)
-        _    (touch! state session)
-        ack  #(send! ex 200 "text/plain" (byte-array 0))]
+  A result is completed into the turn that asked for it, and a result that finds no
+  turn is dropped - the evaluation was ended by a refresh between the two halves,
+  and a value nobody is waiting for must not be left for the next one to take as
+  its own.
+
+  A RESULT IS ONLY TAKEN FROM THE PAGE THE SCRIPT WAS SENT TO; A PRINT IS TAKEN
+  FROM ANY OF THEM. The asymmetry is deliberate. A result answers a question this
+  JVM asked, and a page that was not asked has no standing to answer it. Output is
+  not an answer to anything - it is something that happened - and a tab left open
+  from before the refresh is still a page whose console someone may be watching,
+  so dropping what it says would lose information rather than prevent a mistake."
+  [state ^Writer out conn text]
+  (let [{:keys [type content]} (edn/read-string text)]
     (case type
-      :ready  (send-text! ex 200 "application/json"
-                          (str "{\"session\": " (on-ready! state) "}"))
-      :poll   (on-poll! state session nil ex)
-      :result (on-poll! state session content ex)
-      :print  (do (when (= session (:session @state)) (on-print! out content))
-                  (ack))
-      :alive  (ack)                    ; touch! above was the whole of it
-      :bye    (do (on-bye! state session) (ack))
-      (send-text! ex 400 "text/plain" (str "Unknown message type: " (pr-str type))))))
+      :result (when (identical? conn (:conn @state))
+                (when-let [^CompletableFuture p (:pending @state)]
+                  (.complete p (edn/read-string content))))
+      :print  (on-print! out content)
+      nil)))
+
+
+;; --- serving the output directory, continued -------------------------------
 
 (defn- handle-get
   [^File dir ^String path ^HttpExchange ex]
@@ -533,6 +448,15 @@
         path (if (= "/" path) "/index.html" path)
         f    (under dir path)]
     (cond
+      ;; THE ONE FILE THAT MUST NOT BE REMEMBERED, and the only no-store left on
+      ;; this server now that the wire is not on it. It carries the socket's port
+      ;; and its token, and both are new every time the REPL starts - a page that
+      ;; answered from cache would dial a port nobody is listening on, with a
+      ;; secret that is no longer a secret. The client asks no-store too; this is
+      ;; the half that does not depend on the client being the one we wrote.
+      (and f (= (str "/" info-name) path))
+      (send! ex 200 "application/json" (Files/readAllBytes (.toPath ^File f)) no-store)
+
       f (let [tag (etag f)]
           (send-asset! ex (content-type path) tag
                        (when-not (fresh? ex tag) (Files/readAllBytes (.toPath f)))))
@@ -540,7 +464,9 @@
       :else (send-text! ex 404 "text/plain" (str "No " path " here.")))))
 
 (defn- handler
-  [state ^File dir out]
+  "GET and nothing else. The transport used to arrive here as POSTs; it is a socket
+  on its own port now, and what is left is the output directory."
+  [^File dir]
   (reify HttpHandler
     (handle [_ ex]
       (try
@@ -548,15 +474,17 @@
               method (.getRequestMethod ex)
               path   (.getPath (.getRequestURI ex))]
           (case method
+            ;; If-None-Match is not a CORS-safelisted request header, so a page on
+            ;; the application's own origin preflights its conditional fetches
             "OPTIONS" (send! ex 204 "text/plain" (byte-array 0))
-            "POST"    (handle-post state out ex)
             "GET"     (handle-get dir path ex)
             (send-text! ex 405 "text/plain" "Method not allowed")))
         (catch Throwable _
-          ;; the browser went away mid-response, or the body was not a message.
-          ;; Either way this connection is over and the next poll starts a new one.
+          ;; the browser went away mid-response. This connection is over and the
+          ;; next request starts a new one.
           nil)
         (finally (.close ^HttpExchange ex))))))
+
 
 ;; --- the runtime ------------------------------------------------------------
 
@@ -568,58 +496,64 @@
     (run! delete-tree! (.listFiles f)))
   (.delete f))
 
+
 (defn browser-runtime
-  "Serve `dir` over HTTP and evaluate in whatever browser connects to it.
+  "Serve `dir` over HTTP, listen for a websocket beside it, and evaluate in
+  whatever browser connects.
 
-    :dir      the output directory to serve, and the one the driver compiles into -
-              a temp directory by default
-    :port     what to listen on, default 0, which is an ephemeral port
-    :out      where the runtime's own output is written, default *out*
-    :out      where the page's console output is written, default *out*
+    :dir       the output directory to serve, and the one the driver compiles into -
+               a temp directory by default
+    :port      what the asset server listens on, default 0, an ephemeral port
+    :ws-port   what the socket listens on, default 0. A second port, for the reason
+               this namespace's docstring gives
+    :out       where the page's console output is written, default *out*
 
-  Closeable, and closing it stops the server and unblocks any evaluation still
+  Closeable, and closing it stops both servers and unblocks any evaluation still
   waiting on the page.
 
-  The returned object answers (:url rt), which is what to open, (:port rt), (:dir
-  rt) - which is what the driver has to compile into - and (:session rt), which is
-  nil until a page connects and a different number after every refresh.
+  The returned object answers (:url rt), which is what to open, (:port rt),
+  (:ws-port rt), (:dir rt) - which is what the driver has to compile into - and
+  (:session rt), which is nil until a page connects and a different number after
+  every refresh.
+
+  A TOKEN GUARDS THE SOCKET, and the asset server is how a page learns it: the
+  connect info is written into the output directory, so anything served from here
+  can read it and anything that was not cannot. A websocket is not subject to the
+  same-origin policy - any page anywhere may open one to this machine - and a REPL
+  that accepted such a connection would evaluate your forms in a stranger's page.
 
   Evaluating before a browser has connected is not an error and not a wait: it
   answers with what to do about it. That is Replique's behaviour and it is the
   right one for a REPL you started before you opened the page."
   ([] (browser-runtime nil))
-  ([{:keys [dir port out] :or {port 0 out *out*}}]
+  ([{:keys [dir port ws-port out] :or {port 0 ws-port 0 out *out*}}]
    (let [^File own (when-not dir (temp-dir))
          ^File dir (write-runtime! (or dir own))
-         srv       (atom {:state :stopped :session 0})
-         ;; A VIRTUAL THREAD PER REQUEST, which is what this server is shaped for:
-         ;; every held poll is a thread parked for up to 20 seconds doing nothing,
-         ;; and that is the case thread-per-request was made cheap for.
-         ;;
-         ;; Not for speed - measured, it is a wash: virtual threads start ~20x
-         ;; cheaper and block ~20% dearer, and a pool was already amortising the
-         ;; first away. It is for what stops being true. There is no pool, so no
-         ;; unbounded growth and no keepalive to know about (a cached pool's
-         ;; threads are non-daemon and linger a minute past the work, which is why
-         ;; the eval executor below still asks for daemon ones). And no thread is
-         ;; reused between requests, so nothing thread-local can survive from one
-         ;; to the next - which for Clojure means a dynamic binding left unwound.
-         ;;
-         ;; Checked rather than assumed, because a pinned carrier would serialise
-         ;; the polls and this server would quietly hold one page at a time: with
-         ;; the scheduler cut to a single carrier, two held requests still run
-         ;; concurrently, so neither the exchange I/O nor SynchronousQueue pins.
+         srv       (atom {:session nil})
+         token     (websocket/random-token)
+         ws        (websocket/websocket-server
+                    {:port     ws-port
+                     :token    token
+                     :on-open  (fn [conn] (start-session! srv conn))
+                     :on-text  (fn [conn text] (on-text! srv out conn text))
+                     :on-close (fn [conn _] (close-session! srv conn))})
+         ;; A VIRTUAL THREAD PER REQUEST. Less load-bearing than it was - the
+         ;; twenty-second held poll it was chosen for is gone - but still right for
+         ;; a server with no pool: no unbounded growth, no keepalive, and no thread
+         ;; reused between requests, so nothing thread-local can survive from one to
+         ;; the next, which for Clojure means a dynamic binding left unwound.
          server    (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" (int port)) 0)
                      (.setExecutor (Executors/newVirtualThreadPerTaskExecutor))
-                     (.createContext "/" (handler srv dir out))
+                     (.createContext "/" (handler dir))
                      (.start))
          port      (.getPort (.getAddress server))
          url       (str "http://127.0.0.1:" port "/")
-         props     {:url url :port port :dir dir}]
+         props     {:url url :port port :ws-port (:port ws) :dir dir}]
+     (write-connect-info! dir (:port ws) token)
      (reify
        repl/IJsRuntime
        (-evaluate [_ js]
-         (if (not= :started (:state @srv))
+         (if-not (:conn @srv)
            {:status :error
             :value  (str "No browser is connected. Open " url " - or import "
                          client-name " from it in a page of your own - and "
@@ -632,26 +566,24 @@
        (valAt [this k] (.valAt ^clojure.lang.ILookup this k nil))
        (valAt [_ k not-found]
          (if (= :session k)
-           (let [{:keys [state session]} @srv]
-             (if (= :started state) session nil))
+           (when (:conn @srv) (:session @srv))
            (get props k not-found)))
        java.io.Closeable
        (close [_]
-         (swap! srv assoc :state :stopped)
-         (stop-evaluations! srv)
-         ;; a held poll would otherwise sit out the rest of its heartbeat on a
-         ;; server that is already gone
-         (release-polls! srv)
+         (end-session! srv gone)
+         (swap! srv assoc :conn nil)
+         (.close ws)
          (.stop server 0)
          (when own (delete-tree! own)))))))
 
 (defn browser-repl
-  "A ClojureScript REPL in a browser: an output directory, an HTTP server over it,
-  and the loop over both. Blocks until the input runs out.
+  "A ClojureScript REPL in a browser: an output directory, the two servers over it,
+  and the loop over all of them. Blocks until the input runs out.
 
     :dir           the output directory - a temporary one, removed on exit, if none
                    is given
-    :port          what to listen on, default 0
+    :port          what the asset server listens on, default 0
+    :ws-port       what the socket listens on, default 0
     :source-paths  where .cljs files are found, default the classpath directories
     :ns            the namespace to start in, default cljs.user
     :in :out       as clojure.cljs.repl/repl takes them
@@ -665,7 +597,7 @@
   evaluated before a page connects says so and the REPL goes on, which is what lets
   you start the REPL first and open the page when you get to it."
   ([] (browser-repl nil))
-  ([{:keys [dir port source-paths ns in out program-out]
+  ([{:keys [dir port ws-port source-paths ns in out program-out]
      :or   {ns 'cljs.user in *in* out *out*}}]
    ;; The cursor is established here, for the reason repl/node-repl says.
    (env/with-current-ns ns
@@ -673,10 +605,13 @@
            ^File d   (io/file (or dir own))
            cenv      (env/compile-env {:ns ns})]
        (try
-         (with-open [rt (browser-runtime {:dir d :port port :out (or program-out out)})]
+         (with-open [rt (browser-runtime (cond-> {:dir d :out (or program-out out)}
+                                           port    (assoc :port port)
+                                           ws-port (assoc :ws-port ws-port)))]
            (doto ^Writer out
              (.write (str "Waiting for a browser on " (:url rt) "\n"))
              (.flush))
            (repl/repl cenv rt {:ns ns :in in :out out
                                :out-dir d :source-paths source-paths}))
          (finally (when own (delete-tree! own))))))))
+

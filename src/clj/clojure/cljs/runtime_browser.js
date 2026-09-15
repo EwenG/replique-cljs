@@ -1,23 +1,33 @@
-// The browser half of the REPL transport. doc/cljs-repl.md §6: the runtime cannot
-// be dialled, so it dials out and holds the request open - the JVM answers it when
-// it has something to evaluate, and the answer to the NEXT request carries the
-// result. One request in flight is one REPL turn.
+// The browser half of the REPL transport. doc/cljs-repl.md §6: a websocket, which
+// the JVM writes to when it has something to evaluate and this answers on.
 //
 // It is a separate file from runtime.js on purpose, and the same separation node
 // makes: runtime.js is the prelude and the evaluator, which every host shares;
 // this is one host's way of being reached.
 //
-// The wire, adapted from Replique's and keeping its message shape:
+// The wire:
 //
-//   here -> JVM   an EDN map, {:type :ready/:poll/:result/:print/:alive/:bye
-//                 :session n :content "..."}, as the POST body
-//   JVM -> here   the script to evaluate, as the response body - or JSON, for the
-//                 one response that is not a script (:ready, which assigns the
-//                 session number)
+//   here -> JVM   an EDN map, {:type :result/:print :content "..."}
+//   JVM -> here   the script to evaluate, as the frame's text, and nothing else
 //
 // Neither side parses its own hard format: the JVM reads EDN with clojure.edn and
-// this reads JSON with JSON.parse. The rule node's transport follows, in the other
-// direction.
+// this writes it with JSON.stringify, whose string escapes EDN understands. The
+// rule node's transport follows, in the other direction.
+//
+// WHAT A SOCKET REMOVED, all of it machinery that existed to imitate one:
+//
+//   the poll, the 204 heartbeat and the request that had to be in flight for the
+//   JVM to have somewhere to write;
+//
+//   the session number, because the connection is the session - a refresh closes
+//   this socket before it opens the next one, so the two can never be confused;
+//
+//   the 5-second :alive ping and the :bye beacon, because a socket that closes
+//   says so, and one that dies without closing is found by the JVM's ping.
+//
+// WHAT IT FIXED. A print and the result of the form that printed it used to be two
+// POSTs on two connections, in no particular order; they are now two messages on
+// one socket, in the order they happened.
 //
 // WHY THIS IS SO MUCH SMALLER THAN REPLIQUE'S CLIENT. Replique needs a
 // pending-eval/after-load-hook handshake because a goog.require injects a <script>
@@ -29,8 +39,8 @@ import { evaluate, print as printValue } from "./runtime.js";
 
 // --- the connection ---------------------------------------------------------
 
-let url = null;
-let session = null;
+let base = null;
+let socket = null;
 let stopped = false;
 
 // JSON.stringify of a string is a valid EDN string literal - the escapes EDN knows
@@ -38,60 +48,19 @@ let stopped = false;
 // an EDN map without a second escaping scheme.
 function message(type, content) {
   return "{:type :" + type +
-    (session === null ? "" : " :session " + session) +
     (content === undefined ? "" : " :content " + JSON.stringify(content)) + "}";
 }
 
-// text/plain rather than application/edn, so that this stays a CORS "simple
-// request" and a page served from the application's own origin can talk to the
-// REPL without a preflight round trip on every turn.
-function post(body) {
-  return fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain" },
-    body: body,
-  });
+function send(s) {
+  // A socket that closed between the print and this is not an error worth
+  // raising: the REPL will have been told by the close itself.
+  try {
+    if (socket && socket.readyState === 1) socket.send(s);
+  } catch (e) { /* gone */ }
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// --- saying we are still here -----------------------------------------------
-//
-// THE ONE THING LONG-POLLING COSTS. A socket that closes tells the other end so;
-// a long-poll has nothing open to break. Between the moment this page is handed a
-// script and the moment it posts the result there is no request in flight at all,
-// so a page that is closed, crashed or navigated away during an evaluation leaves
-// the JVM waiting for an answer that has no one left to produce it - and waiting
-// is exactly what it should do otherwise, because an evaluation may legitimately
-// take minutes.
-//
-// So the liveness a socket would have given for free is sent by hand, and only in
-// that window, where nothing else is being sent anyway.
-
-const ALIVE_MS = 5000;
-
-async function evaluateAlive(js) {
-  const ping = setInterval(() => { post(message("alive")).catch(() => {}); },
-                           ALIVE_MS);
-  try {
-    return await evaluate(js);
-  } finally {
-    clearInterval(ping);
-  }
-}
-
-// And the clean case says so at once rather than being noticed by silence.
-// sendBeacon is the one request a browser will still send while tearing the page
-// down; a refresh fires this too, and the :bye that arrives late carries the old
-// session number, which the JVM has already replaced and therefore ignores.
-function sayGoodbye() {
-  try {
-    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-      navigator.sendBeacon(url, message("bye"));
-    }
-  } catch (e) { /* leaving is not a thing that can fail */ }
 }
 
 // --- printing ---------------------------------------------------------------
@@ -102,21 +71,11 @@ function sayGoodbye() {
 // replaced, because the devtools console is where a browser user looks first and
 // taking it away to feed a REPL would be a poor trade.
 //
-// Queued and sent one at a time: printing must not interleave two POSTs onto one
-// connection, and it must never be awaited by the turn that caused it.
-
-const printQueue = [];
-let flushing = false;
-
-function flushPrints() {
-  const s = printQueue.shift();
-  if (s === undefined) { flushing = false; return; }
-  post(message("print", s)).catch(() => {}).then(flushPrints);
-}
+// No queue any more. Two POSTs needed one, because they were two connections that
+// could arrive in either order; two frames on one socket cannot.
 
 export function sendPrint(s) {
-  printQueue.push(s);
-  if (!flushing) { flushing = true; flushPrints(); }
+  send(message("print", s));
 }
 
 function teeConsole() {
@@ -136,41 +95,47 @@ function teeConsole() {
 
 // --- the loop ---------------------------------------------------------------
 
-// A dropped request ends the session rather than being retried, and that is a
-// decision rather than laziness: the JVM offers the result to a waiting evaluation
-// the moment the POST arrives, so a request that failed on the way back has
-// already been delivered - re-sending it would answer the NEXT evaluation with the
-// previous one's value, and the REPL would print every answer one turn late
-// forever. Reconnecting says the honest thing instead: this session is over, and
-// the JVM unblocks whoever was waiting with "Connection broken".
-async function reconnect() {
-  if (stopped) return;
-  await sleep(1000);
-  if (!stopped) connect(url);
+// One script at a time, and the chain is what guarantees it: the JVM serialises
+// evaluations at its end, so nothing should overlap here either - but a socket
+// will happily deliver a second frame while the first is still being awaited, and
+// two evaluations interleaved would answer each other's turns.
+let turn = Promise.resolve();
+
+function onScript(js) {
+  turn = turn.then(async () => {
+    let content;
+    try {
+      content = await evaluate(js);
+    } catch (e) {
+      // evaluate() answers errors rather than throwing them, so reaching here
+      // means the transport itself broke. Say so rather than leaving the JVM to
+      // wait for an answer that is not coming.
+      content = '{:status :error :value "' + String(e && e.message) + '"}';
+    }
+    send(message("result", content));
+  });
 }
 
-async function run(mySession) {
-  let content;                  // undefined on the first turn: nothing to report
-  while (!stopped && session === mySession) {
-    let res;
-    try {
-      res = await post(message(content === undefined ? "poll" : "result", content));
-    } catch (e) {
-      return reconnect();
-    }
-    content = undefined;
-    if (res.status === 409) {
-      // another page took the session over. Retrying would be two runtimes
-      // fighting over one REPL, so this one steps aside and says how to come back.
-      stopped = true;
-      console.log("ClojureScript REPL: this page's session expired. To reconnect:"
-                  + '\n  (await import("' + url + 'runtime_browser.js")).connect()');
-      return;
-    }
-    if (res.status === 204) continue;   // the idle heartbeat: no work yet
-    if (!res.ok) return reconnect();
-    content = await evaluateAlive(await res.text());
-  }
+// Where to dial. The output directory is served by the asset server and this file
+// came from it, so the module's own URL locates a small file the JVM wrote there
+// with the socket's port and the token that gets past it.
+async function wsUrl() {
+  const res = await fetch(new URL("cljs-repl.json", base).href, { cache: "no-store" });
+  if (!res.ok) throw new Error("no REPL info at " + base);
+  return (await res.json()).ws;
+}
+
+function open(url) {
+  socket = new WebSocket(url);
+  socket.onmessage = (e) => onScript(e.data);
+  socket.onclose = () => {
+    socket = null;
+    // RECONNECTING IS SAFE HERE IN A WAY IT WAS NOT OVER THE LONG-POLL, where a
+    // request that failed on the way back might already have been delivered and
+    // re-sending would have answered the next evaluation with this one's value.
+    // A close loses nothing: the JVM ends every evaluation the connection owned.
+    if (!stopped) sleep(1000).then(() => { if (!stopped) connect(base); });
+  };
 }
 
 // The URL defaults to the directory this module was served from, which is the
@@ -178,22 +143,13 @@ async function run(mySession) {
 // network needs no configuration at all, and a page on the application's own
 // origin needs no more than the import.
 export async function connect(u) {
-  url = u || new URL(".", import.meta.url).href;
+  base = u || new URL(".", import.meta.url).href;
   stopped = false;
-  session = null;
   teeConsole();
-  if (!globalThis.__cljsGoodbye__ && typeof addEventListener === "function") {
-    globalThis.__cljsGoodbye__ = true;
-    addEventListener("pagehide", sayGoodbye);
-  }
   for (;;) {
     try {
-      const res = await post(message("ready"));
-      if (res.ok) {
-        session = (await res.json()).session;
-        run(session);
-        return url;
-      }
+      open(await wsUrl());
+      return base;
     } catch (e) { /* the JVM is not listening yet */ }
     await sleep(1000);
   }
@@ -201,6 +157,8 @@ export async function connect(u) {
 
 export function disconnect() {
   stopped = true;
+  if (socket) socket.close(1000, "disconnect");
+  socket = null;
 }
 
 globalThis.$CLJS.connect = connect;

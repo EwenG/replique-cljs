@@ -6,17 +6,25 @@
 ;   the terms of this license.
 ;   You must not remove this notice, or any other, from this software.
 
-(ns ^{:doc "The browser runtime: the asset server, the long-poll and its failure
-  semantics.
+
+(ns ^{:doc "The browser runtime: the asset server, the websocket, and what each
+  way of leaving means.
 
   THE PAGE IS A NODE PROCESS HERE, and the substitution is exact in the half these
   tests are about and inexact in the half they are not. runtime_browser.js is
-  loaded and run unmodified - it needs fetch and eval and nothing else a browser
-  has that node lacks - so the wire, the session numbering and the print channel
-  are the real ones. What node does differently is where $CLJS.require finds a
-  module: relative to runtime.js's own URL, which is a file under node and an HTTP
-  origin in a browser. That path is tested from the other end instead, by fetching
-  the same files over HTTP and comparing them to what the driver wrote.
+  loaded and run unmodified - it needs fetch, WebSocket and eval, and nothing else
+  a browser has that node lacks - so the wire and the print channel are the real
+  ones. What node does differently is where $CLJS.require finds a module: relative
+  to runtime.js's own URL, which is a file under node and an HTTP origin in a
+  browser. That path is tested from the other end instead, by fetching the same
+  files over HTTP and comparing them to what the driver wrote.
+
+  Some tests speak the socket by hand instead, with the JDK's own websocket
+  client. Those are the ones about timing - what is held, what is released, what
+  answers whom - where a real page's turn-taking would hide the thing under test.
+
+  The framing itself is not re-checked here; it has its own tests in ws-test, and
+  who may open a socket at all has its own in websocket-test.
 
   Skipped when node is not on PATH."}
   clojure.cljs.browser-test
@@ -30,7 +38,9 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]])
   (:import [java.io File StringWriter]
-           [java.net HttpURLConnection URL]))
+           [java.net HttpURLConnection URI URL]
+           [java.net.http HttpClient WebSocket WebSocket$Listener]
+           [java.util.concurrent ExecutionException LinkedBlockingQueue TimeUnit]))
 
 (use-fixtures :each h/cursor)
 
@@ -116,6 +126,47 @@
 (defn- values
   [rt ns-sym src]
   (mapv :value (repl/eval-src (env/compile-env {:ns ns-sym}) rt src)))
+
+
+;; --- a page, spoken by hand -------------------------------------------------
+
+(defn- ws-url
+  "Where the page is told to dial, read from the file the JVM wrote into the output
+  directory - which is how a real page finds it too."
+  [rt]
+  (second (re-find #"\"ws\": \"([^\"]+)\""
+                   (slurp (File. ^File (:dir rt) "cljs-repl.json")))))
+
+(defn- fake-page!
+  "A websocket that is not a page: it connects and queues the scripts it is handed
+  instead of evaluating them, so a test can answer in its own time - or not at all.
+
+  Answers [ws scripts]."
+  [rt]
+  (let [scripts (LinkedBlockingQueue.)
+        acc     (StringBuilder.)
+        l       (reify WebSocket$Listener
+                  (onText [_ socket data last?]
+                    (.append acc data)
+                    (when last?
+                      (.offer scripts (.toString acc))
+                      (.setLength acc 0))
+                    (.request ^WebSocket socket 1)
+                    nil))]
+    [(-> (HttpClient/newHttpClient)
+         (.newWebSocketBuilder)
+         (.buildAsync (URI/create (ws-url rt)) l)
+         (.get 10000 TimeUnit/MILLISECONDS))
+     scripts]))
+
+(defn- answer!
+  "Send `edn` - itself the text of a result map, which is what a page sends: what
+  runtime.js printed, JSON.stringify'd."
+  [^WebSocket ws edn]
+  (.get (.sendText ws (str "{:type :result :content " (pr-str edn) "}") true)
+        10000 TimeUnit/MILLISECONDS))
+
+(defn- took [^LinkedBlockingQueue q] (.poll q 10000 TimeUnit/MILLISECONDS))
 
 ;; --- the asset server -------------------------------------------------------
 
@@ -219,6 +270,24 @@
     (values rt 'browser-out.core "(js* \"console.log('hello from the page'), 1\")")
     (is (wait-for #(str/includes? (str out) "hello from the page")))))
 
+
+(h/deftest-when h/node? test-a-print-arrives-before-the-value-of-the-form-that-printed-it
+  ;; THE BUG THE SOCKET FIXED, and the only one of these tests that could not have
+  ;; passed before. A print and the result of the form that printed it used to be
+  ;; two POSTs on two connections, ordered by whichever the kernel got to first;
+  ;; the REPL could print a form's value above the output that form produced.
+  ;;
+  ;; They are now two frames on one socket, handed to one callback thread in order,
+  ;; and the print is written before the result is completed - so by the time
+  ;; -evaluate has returned at all, the output is already there. No waiting, which
+  ;; is the point: a wait here would pass under the old transport too.
+  (with-page [rt out log]
+    (let [v (values rt 'browser-order.core
+                    "(js* \"console.log('printed first'), 42\")")]
+      (is (= ["42"] v))
+      (is (str/includes? (str out) "printed first")
+          "already written when the value came back"))))
+
 ;; --- loading ----------------------------------------------------------------
 
 (def ^:private two-files
@@ -267,127 +336,6 @@
           (.destroy ^Process a)
           (.destroy ^Process b))))))
 
-(h/deftest-when h/node? test-the-page-that-lost-the-session-steps-aside
-  ;; Two runtimes polling one REPL would take alternate turns and answer each
-  ;; other's questions, so the one whose session expired stops - and says how to
-  ;; come back, because it is a page someone may still be looking at.
-  (let [out (StringWriter.) log (StringBuffer.)]
-    (with-open [rt (browser/browser-runtime {:out out})]
-      (with-core! rt)
-      (let [[a n] (connected! rt log)
-            [b _] (connected! rt log n)]
-        (is (wait-for #(str/includes? (str log) "session expired")))
-        (.destroy ^Process a)
-        (.destroy ^Process b)))))
-
-;; --- what a page that just goes away does -----------------------------------
-
-(defn- POST
-  "[status body] for a POST of the EDN `msg` on `rt` - a runtime message, sent by
-  hand rather than by a page."
-  [rt ^String msg]
-  (let [^HttpURLConnection c (doto ^HttpURLConnection (.openConnection (URL. (:url rt)))
-                              (.setRequestMethod "POST")
-                              (.setDoOutput true))]
-    (with-open [o (.getOutputStream c)]
-      (.write o (.getBytes msg "UTF-8")))
-    [(.getResponseCode c) (try (slurp (.getInputStream c)) (catch Exception _ nil))]))
-
-(h/deftest-when h/node? test-a-page-that-stops-answering-does-not-hang-the-repl
-  ;; THE ONE THING LONG-POLLING COSTS (doc/cljs-repl.md 6.1). A socket that closes
-  ;; reports itself; a long-poll that has already been answered has nothing open to
-  ;; break, and writing a script into a dead connection SUCCEEDS - the bytes reach
-  ;; the kernel and no error is ever raised. So a page killed between being handed a
-  ;; script and answering it used to leave the REPL waiting forever, which is the
-  ;; failure this transport must not have.
-  ;;
-  ;; The two waits are shortened here rather than waited out: what is under test is
-  ;; that silence ends the wait, not how long the silence is. With the real numbers
-  ;; a page pings every 5s while it evaluates and 20s of nothing means it is gone.
-  (with-redefs [browser/silence-ms 1000
-                browser/offer-ms   1000]
-    (let [out (StringWriter.) log (StringBuffer.)]
-      (with-open [rt (browser/browser-runtime {:out out})]
-        (let [[p _] (connected! rt log)]
-          (is (= "1" (:value (repl/-evaluate rt "(async function () { return 1; })()"))))
-          ;; killed outright: no unload handler runs, nothing is sent, and the held
-          ;; poll's socket dies without the JVM being able to notice
-          (.destroyForcibly ^Process p)
-          (.waitFor ^Process p)
-          ;; the script is handed to the dead poll and the answer never comes
-          (let [r (deref (future (repl/-evaluate rt "(async function () { return 1; })()"))
-                         20000 :hung)]
-            (is (= :error (:status r)))
-            (is (str/includes? (:value r) "stopped answering")))
-          ;; and the session is over, so the next one says so at once rather than
-          ;; discovering it again
-          (let [r (deref (future (repl/-evaluate rt "(async function () { return 1; })()"))
-                         20000 :hung)]
-            (is (= :error (:status r)))
-            (is (str/includes? (:value r) "No browser is connected"))))))))
-
-(h/deftest-when h/node? test-a-page-that-says-goodbye-is-believed-at-once
-  ;; Silence finds the same thing out, but closing a tab is the common case and
-  ;; twenty seconds of a REPL answering nothing is a long time to spend
-  ;; rediscovering something the browser was willing to say. A real page sends this
-  ;; from pagehide with sendBeacon, the one request a browser still sends while it
-  ;; tears the page down.
-  (let [out (StringWriter.) log (StringBuffer.)]
-    (with-open [rt (browser/browser-runtime {:out out})]
-      (let [[p n] (connected! rt log)]
-        (is (= 200 (first (POST rt (str "{:type :bye :session " n "}")))))
-        (is (nil? (:session rt)) "the session is over")
-        (let [r (repl/-evaluate rt "(async function () { return 1; })()")]
-          (is (str/includes? (:value r) "No browser is connected")))
-        (.destroyForcibly ^Process p)))))
-
-(h/deftest-when h/node? test-a-goodbye-from-the-page-a-refresh-replaced-is-ignored
-  ;; A refresh fires pagehide too, and its beacon can arrive AFTER the new page's
-  ;; :ready. It carries the session number the :ready already replaced, which is
-  ;; the whole reason this checks the number before acting on it - a late goodbye
-  ;; from the previous page must not end the session that succeeded it.
-  (let [out (StringWriter.) log (StringBuffer.)]
-    (with-open [rt (browser/browser-runtime {:out out})]
-      (with-core! rt)
-      (let [[a n1] (connected! rt log)
-            [b n2] (connected! rt log n1)]
-        (POST rt (str "{:type :bye :session " n1 "}"))
-        (is (= n2 (:session rt)) "the new session stands")
-        (is (= ["2"] (values rt 'late-bye.core "(js* \"1 + 1\")")))
-        (.destroyForcibly ^Process a)
-        (.destroyForcibly ^Process b)))))
-
-;; --- being told, rather than looking ----------------------------------------
-
-(deftest test-a-held-poll-is-released-the-moment-its-session-ends
-  ;; A held poll used to wake every 250ms to re-read the session number - eighty
-  ;; times per idle heartbeat, per page, to notice something that happens once.
-  ;; Now whatever ends a session hands the queue a sentinel and the poll is simply
-  ;; told, so this test is also the proof that it is: nothing else wakes a held
-  ;; poll early any more, so a 409 arriving in well under the 20s heartbeat can
-  ;; only have come from the sentinel.
-  ;;
-  ;; No page here at all - the protocol is spoken by hand, which is what makes the
-  ;; timing readable.
-  (with-open [rt (browser/browser-runtime {})]
-    (let [n    (:session (do (POST rt "{:type :ready}") rt))
-          held (future (POST rt (str "{:type :poll :session " n "}")))]
-      (is (nil? (deref held 1000 nil)) "the poll is held, not answered")
-      (let [t0 (System/currentTimeMillis)
-            _  (POST rt "{:type :ready}")         ; a refresh: session n+1
-            r  (deref held 10000 :never-released)
-            ms (- (System/currentTimeMillis) t0)]
-        (is (= 409 (first r)) "the held poll was told its session is over")
-        (is (< ms 2000) (str "released promptly, took " ms "ms")))
-      ;; and the sentinel did not outlive the session that sent it: a poll on the
-      ;; NEW session is held like any other rather than being handed a stale one.
-      ;; SynchronousQueue makes that true by construction - an offer with no
-      ;; timeout stores nothing - and this is the observation of it.
-      (let [n2   (:session rt)
-            next (future (POST rt (str "{:type :poll :session " n2 "}")))]
-        (is (not= n n2) "the refresh moved the session on")
-        (is (nil? (deref next 1500 nil)) "the new session's poll is held")))))
-
 (h/deftest-when h/node? test-a-refresh-ends-the-evaluations-that-never-started-either
   ;; The half a single-thread executor needed a second mechanism for. Replique's
   ;; shutdownNow interrupts the RUNNING task and hands back the ones still queued,
@@ -418,34 +366,91 @@
           (.destroy ^Process a)
           (.destroy ^Process b))))))
 
-(defn- result-msg
-  "A :result message carrying `edn` - itself the EDN text of a result map, which is
-  how a page sends one: JSON.stringify of what runtime.js printed."
-  [n edn]
-  (str "{:type :result :session " n " :content " (pr-str edn) "}"))
+
+;; --- what a page that goes away does ----------------------------------------
+
+(h/deftest-when h/node? test-a-page-that-is-killed-ends-its-evaluations-at-once
+  ;; WHAT THE SOCKET IS FOR. Over the long-poll this was the expensive case: a page
+  ;; killed between being handed a script and answering it had nothing open to
+  ;; break, and writing into a dead connection SUCCEEDS - the bytes reach the kernel
+  ;; and no error is raised - so the JVM could only find out by not being spoken to
+  ;; for twenty seconds. It needed a 5-second liveness ping from the page, a
+  ;; silence threshold, and a :bye beacon on pagehide to make the common case
+  ;; bearable.
+  ;;
+  ;; All three are gone. The socket closes when the process dies, the JVM is told,
+  ;; and the evaluation ends. The assertion is therefore not "it eventually ends"
+  ;; but that it ends in well under the twenty seconds it used to take.
+  (let [out (StringWriter.) log (StringBuffer.)]
+    (with-open [rt (browser/browser-runtime {:out out})]
+      (let [[p _]   (connected! rt log)
+            hung    (future (repl/-evaluate
+                             rt "(async function () { return new Promise(function () {}); })()"))
+            _       (is (nil? (deref hung 500 nil)) "waiting on the page")
+            t0      (System/currentTimeMillis)
+            _       (.destroyForcibly ^Process p)
+            _       (.waitFor ^Process p)
+            r       (deref hung 20000 :hung)
+            elapsed (- (System/currentTimeMillis) t0)]
+        (is (= :error (:status r)))
+        (is (str/includes? (:value r) "browser is gone"))
+        (is (< elapsed 5000) (str "told rather than timed out, took " elapsed "ms"))
+        ;; and the session is over, so the next evaluation says so at once rather
+        ;; than discovering it again
+        (is (nil? (:session rt)))
+        (is (str/includes? (:value (repl/-evaluate rt "1")) "No browser is connected"))))))
+
+(deftest test-an-older-page-is-still-heard-even-though-it-is-not-asked
+  ;; A REFRESH USED TO EVICT THE PAGE IT REPLACED - it was told 409 and stepped
+  ;; aside, because two runtimes polling one REPL would take alternate turns and
+  ;; answer each other's questions. A socket makes that restriction unnecessary:
+  ;; scripts go to one connection by name, so an older page cannot take a turn that
+  ;; was not offered to it, and there is no reason to hang up on it.
+  ;;
+  ;; What it may still do is print. Output is not an answer to anything, and a tab
+  ;; left open is a tab whose console someone may be watching - so it is forwarded,
+  ;; where a result from the same page would be ignored.
+  (let [out (StringWriter.)]
+    (with-open [rt (browser/browser-runtime {:out out})]
+      (let [[^WebSocket a _] (fake-page! rt)
+            first-session    (wait-for #(:session rt))
+            [^WebSocket b _] (fake-page! rt)]
+        (is (some? first-session))
+        (is (wait-for #(when-let [n (:session rt)] (when (not= n first-session) n)))
+            "the second page took the REPL over")
+        (.get (.sendText a "{:type :print :content \"from the old page\\n\"}" true)
+              10000 TimeUnit/MILLISECONDS)
+        (is (wait-for #(str/includes? (str out) "from the old page"))
+            "the page that lost the REPL is still heard")
+        (.abort a)
+        (.abort b)))))
+
+
+;; --- one script at a time ---------------------------------------------------
 
 (deftest test-two-evaluations-each-get-their-own-answer
   ;; What serializing is FOR, and it is not fairness. Two evaluations in flight at
-  ;; once would both hand a script to the page and both wait on the result queue,
-  ;; and nothing says the answer to the first is taken by the thread that asked for
-  ;; it - the REPL would print one form's value under another form's prompt.
+  ;; once would both write a script into the socket and both wait for a result, and
+  ;; nothing says the answer to the first is taken by the thread that asked for it -
+  ;; the REPL would print one form's value under another form's prompt.
   ;;
   ;; The page is spoken by hand here, one turn at a time, which is the shape a real
-  ;; page has: it never has two requests in flight.
+  ;; page has: runtime_browser.js chains its evaluations on one promise.
   (with-open [rt (browser/browser-runtime {})]
-    (POST rt "{:type :ready}")
-    (let [n  (:session rt)
-          a  (future (repl/-evaluate rt "SCRIPT-A"))
-          b  (future (repl/-evaluate rt "SCRIPT-B"))
-          ;; one script at a time: the second is not handed out until the first has
-          ;; been answered, which is the permit doing its job
-          [_ js1] (POST rt (str "{:type :poll :session " n "}"))
-          [_ js2] (POST rt (result-msg n "{:status :success :value \"1\"}"))]
-      (is (= #{"SCRIPT-A" "SCRIPT-B"} #{js1 js2}) "each got exactly one turn")
-      ;; nothing waits on the answer to the last one
-      (future (POST rt (result-msg n "{:status :success :value \"2\"}")))
-      (is (= #{"1" "2"} #{(:value (deref a 5000 :never)) (:value (deref b 5000 :never))})
-          "and each got its own answer, not the other's"))))
+    (let [[^WebSocket ws scripts] (fake-page! rt)]
+      (is (some? (wait-for #(:session rt))) "connected")
+      (let [a   (future (repl/-evaluate rt "SCRIPT-A"))
+            b   (future (repl/-evaluate rt "SCRIPT-B"))
+            js1 (took scripts)]
+        (is (nil? (.poll scripts 500 TimeUnit/MILLISECONDS))
+            "the second script is not sent until the first is answered")
+        (answer! ws "{:status :success :value \"1\"}")
+        (let [js2 (took scripts)]
+          (is (= #{"SCRIPT-A" "SCRIPT-B"} #{js1 js2}) "each got exactly one turn"))
+        (answer! ws "{:status :success :value \"2\"}")
+        (is (= #{"1" "2"} #{(:value (deref a 10000 :never)) (:value (deref b 10000 :never))})
+            "and each got its own answer, not the other's")
+        (.abort ws)))))
 
 ;; --- not sending what the browser already has -------------------------------
 
@@ -495,17 +500,39 @@
               (is (str/includes? (:body after) "987654321"))))))
       (finally (h/delete-tree! src)))))
 
-(deftest test-the-transport-is-never-cached
-  ;; Assets are revalidated; the wire is not cached at all. A poll response held in
-  ;; a cache would be a script handed out twice, which is a different kind of wrong
-  ;; from a stale file.
+
+;; --- who may open the socket ------------------------------------------------
+
+(deftest test-the-socket-is-not-open-to-anyone-who-finds-the-port
+  ;; A websocket is not subject to the same-origin policy: any page anywhere may
+  ;; open one to this machine, with an Origin header it writes itself and no
+  ;; preflight to refuse. A REPL that accepted such a connection would evaluate the
+  ;; developer's forms in a stranger's page and hand back what they printed.
+  ;;
+  ;; So the connect info is served out of the output directory - reachable by
+  ;; anything this server served, and by nothing else - and the token in it is
+  ;; checked before the upgrade. websocket-test covers the check itself; this is
+  ;; the wiring, that browser-runtime actually turns it on.
   (with-open [rt (browser/browser-runtime {})]
-    (let [^HttpURLConnection c (.openConnection (URL. (:url rt)))]
-      (.setUseCaches c false)
-      (.setRequestMethod c "POST")
-      (.setDoOutput c true)
-      (with-open [o (.getOutputStream c)]
-        (.write o (.getBytes "{:type :ready}" "UTF-8")))
-      (is (= 200 (.getResponseCode c)))
-      (is (= "no-store" (.getHeaderField c "Cache-Control")))
-      (is (nil? (.getHeaderField c "ETag"))))))
+    (let [url (ws-url rt)]
+      (is (str/includes? url "token="))
+      (is (thrown? ExecutionException
+                   (-> (HttpClient/newHttpClient)
+                       (.newWebSocketBuilder)
+                       (.buildAsync (URI/create (str/replace url #"token=.*" "token=guess"))
+                                    (reify WebSocket$Listener))
+                       (.get 10000 TimeUnit/MILLISECONDS)))
+          "the port alone is not enough")
+      (is (nil? (:session rt)) "and nothing connected"))))
+
+(deftest test-the-connect-info-is-never-cached
+  ;; Assets are revalidated; this one file is not cached at all. It carries the
+  ;; socket's port and token, both new on every start, and a page that answered
+  ;; from cache would dial a port nobody is listening on.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [r (fetch rt "/cljs-repl.json")]
+      (is (= 200 (:status r)))
+      (is (= "no-store" (:cache r)))
+      (is (nil? (:etag r)) "nothing to revalidate against")
+      (is (str/includes? (:body r) "\"ws\": \"ws://")))))
+
