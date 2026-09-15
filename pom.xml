@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- A ClojureScript compiler and REPL, written against replique-clj's two-world reader and
+       namespace registry. See doc/cljs-compiler.md and doc/cljs-repl.md.
+
+       NO JAVA AND NO AOT, which is the whole reason this is a project of its own: everything
+       here is Clojure source plus vendored ClojureScript and Closure files, and the three
+       pieces of Java it leans on - NamespaceWorld, LispReader's :cljs feature and the
+       Compiler's position recording - are in replique-clj, where the vendored Clojure test
+       suite is the oracle for them. -->
+  <groupId>replique-cljs</groupId>
+  <artifactId>clojurescript</artifactId>
+  <name>replique-cljs</name>
+  <packaging>jar</packaging>
+  <version>0.1.0-SNAPSHOT</version>
+
+  <description>A ClojureScript front end for replique-clj: analyzer, emitter, driver and REPL.</description>
+
+  <licenses>
+    <license>
+      <name>Eclipse Public License 1.0</name>
+      <url>http://opensource.org/licenses/eclipse-1.0.php</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>21</maven.compiler.release>
+  </properties>
+
+  <dependencies>
+    <!-- THE FORK, not org.clojure:clojure. Its artifactId is `clojure` on purpose, so this is a
+         substitution rather than an addition - nothing here would work on stock Clojure, which
+         has no NamespaceWorld and whose reader has no :cljs feature.
+
+         Built and installed from ../replique-clj with `mvn -o install -DskipTests`. -->
+    <dependency>
+      <groupId>replique-clj</groupId>
+      <artifactId>clojure</artifactId>
+      <version>1.12.5-r1</version>
+    </dependency>
+
+    <!-- Only cljs.analyzer is wanted, as an AST oracle; nothing is ever compiled with it.
+         ClojureScript's transitive dependencies are therefore excluded wholesale and the two
+         the analyzer actually needs are named below: cljs.env reaches for
+         com.google.javascript.jscomp.CompilerOptions at load time, and that wants Guava.
+
+         ALSO THE VENDORING ORACLE. src/clj/cljs holds our copies of core.cljc, core.cljs and
+         friends; core-test diffs them against this jar, which is why the version is pinned to
+         the one they were taken from. -->
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>clojurescript</artifactId>
+      <version>1.12.145</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>com.google.javascript</groupId>
+      <artifactId>closure-compiler-unshaded</artifactId>
+      <version>v20240317</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>31.0.1-android</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <!-- Not compiled against and not shipped: the goog subset under src/clj/clojure/cljs/goog
+         is vendored INTO this repo, and this jar is here so clojure.cljs.goog-test can diff the
+         nine vendored files against it byte for byte. The version is the one ClojureScript
+         1.12.145 pins, so "unmodified" is checked against the same source cljs.core was written
+         for. -->
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>google-closure-library</artifactId>
+      <version>0.0-20250515-f04e4c0e</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <!-- The test runner walks test-cljs/ for namespaces. In replique-clj this arrived
+         transitively, through test.generative; named here because nothing else brings it. -->
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>tools.namespace</artifactId>
+      <version>1.5.0</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <!-- clojure.test.check, for the generative properties in calling-convention-test. -->
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>test.check</artifactId>
+      <version>1.1.1</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <!-- No Java sources. The directory is named so Maven does not invent one. -->
+    <sourceDirectory>src/java</sourceDirectory>
+
+    <resources>
+      <!-- Everything ships as source: the .clj compiler namespaces, the vendored .cljc/.cljs,
+           the goog subset and the three runtime .js files, which clojure.cljs.output reads
+           back through io/resource. -->
+      <resource>
+        <directory>src/clj</directory>
+      </resource>
+    </resources>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>attach-sources</id>
+            <phase>package</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Resolves the test-scoped dependency jars into ${cljs-test.deps.classpath} so the
+           forked JVM below can be handed an explicit -classpath: the suite needs src/clj and
+           test-cljs as DIRECTORIES, ahead of any jar. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <id>cljs-test-deps-classpath</id>
+            <phase>process-test-classes</phase>
+            <goals>
+              <goal>build-classpath</goal>
+            </goals>
+            <configuration>
+              <includeScope>test</includeScope>
+              <outputProperty>cljs-test.deps.classpath</outputProperty>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- The suite, on the default `test` phase: it is the only one this project has.
+           node on PATH and the ClojureScript jar are each optional - a test that wants one
+           and does not find it skips itself (h/deftest-when) - so neither is a build
+           dependency. Run with: mvn -o test -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.2.0</version>
+        <executions>
+          <execution>
+            <id>run-cljs-tests</id>
+            <phase>test</phase>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <executable>${java.home}/bin/java</executable>
+              <classpathScope>test</classpathScope>
+              <!-- run_cljs_test.clj scans (File. "test-cljs") for namespaces, and
+                   test-harness reads src/clj/cljs/core.cljs by relative path. -->
+              <workingDirectory>${project.basedir}</workingDirectory>
+              <arguments>
+                <argument>-classpath</argument>
+                <!-- src/clj FIRST, and this is load-bearing twice over: Maven copies it into
+                     target/classes, where a stale copy would shadow the sources under test,
+                     and the ClojureScript jar further down the path also provides cljs/core.cljc
+                     - core-test asserts ours is not the one that wins. -->
+                <argument>${project.basedir}/src/clj${path.separator}${project.basedir}/test-cljs${path.separator}${cljs-test.deps.classpath}</argument>
+                <argument>clojure.main</argument>
+                <argument>${project.basedir}/src/script/run_cljs_test.clj</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
