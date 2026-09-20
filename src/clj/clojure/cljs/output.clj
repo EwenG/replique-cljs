@@ -13,6 +13,7 @@
       <out>/runtime.js        the prelude
       <out>/ns/app/core.js    app.core
       <out>/ns/my-lib/core.js my-lib.core   - NOT my_lib
+      <out>/npm/react.js      the module (:require [\"react\" :as React]) names
 
   Three decisions, taken in doc/cljs-output-layout.md and each of them load-bearing
   somewhere:
@@ -45,6 +46,11 @@
   computes a URL from a name with nothing to ask the JVM (doc/cljs-repl.md 7.2), so
   runtime.js states the same rule in JavaScript. output-test runs the two against
   each other rather than trusting them to stay in step.
+
+  ONE OF THOSE TREES IS NOT OURS TO WRITE. npm/ is built by a bundler out of
+  node_modules, one file per specifier; what this namespace owns is the NAME each
+  specifier is filed under (js->path), which the compiler emits imports against
+  and reports as a list for the bundler to build. See doc/cljs-npm.md.
 
   Nothing durable records a path - no deps file, no manifest, no load-time ordering
   on the JVM (7.3) - so changing the layout makes an output directory stale rather
@@ -83,6 +89,82 @@
     ;; state both branches without a manifest.
     (goog/ns->path (str ns-sym))
     (str ns-dir "/" (str/replace (str ns-sym) "." "/") ".js")))
+
+(def js-dir
+  "The directory a JavaScript module a string require names is fetched from, beside
+  ns-dir and the goog tree.
+
+  ITS CONTENTS ARE NOT OURS TO WRITE. Everything else under an output root is
+  emitted by this compiler; this one is built by a bundler from node_modules, one
+  file per specifier, and all the compiler owns is the NAME each specifier is
+  filed under - which is js->path below, and which the bundler is told rather than
+  asked. doc/cljs-advanced.md 3 is why: a bundler is not vendored and not made
+  mandatory, so what crosses the line is a mapping and a list."
+  "npm")
+
+(defn js->path
+  "The file a string require names, relative to the output root: \"react\" ->
+  npm/react.js, \"@visx/scale\" -> npm/@visx/scale.js.
+
+  THE SPECIFIER IS THE PATH, with .js appended and nothing escaped. That is what
+  makes it injective without a table - distinct specifiers differ somewhere, and
+  appending a constant to each keeps them differing - and it is also what makes
+  the mapping legible in a stack trace and computable in JavaScript, where
+  runtime.js states it a second time (urlForJs) for the script path.
+
+  A sub-path becomes a sub-directory, so react-dom/client is npm/react-dom/client.js
+  and every date-fns locale lands under npm/date-fns/locale. A scope keeps its @.
+
+  THE .js IS APPENDED UNCONDITIONALLY, so \"sse.js\" - a real package - is
+  npm/sse.js.js. Skipping it for a specifier that already ends in .js would be the
+  collision this function exists not to have: \"sse\" and \"sse.js\" are two
+  packages, and both would then be npm/sse.js.
+
+  What is refused is what could not be a file under this root, or could be the
+  wrong one: a relative or absolute specifier (a different feature - a file beside
+  the source rather than a package), a . or .. segment, an empty segment, a
+  trailing slash, and anything a URL cannot carry unescaped. js-alias is called
+  for its preconditions besides, so a specifier that cannot be a JavaScript name
+  is refused here rather than at emission - exactly as ns->path calls ns-alias.
+
+  Two specifiers differing only in case would be one file on macOS, as two
+  namespaces would (doc/cljs-output-layout.md 4). Not detected here: npm names
+  are lower-case by policy, so the collision this rules out for namespaces has no
+  way to arise - and if one ever does, the check is the same one."
+  [specifier]
+  (let [bad (fn [why]
+              (throw (ex-info (str "Bad JavaScript module specifier: "
+                                   (pr-str specifier) " - " why)
+                              {:specifier specifier})))]
+    (when-not (and (string? specifier) (not (str/blank? specifier)))
+      (bad "a string require names a module, and an empty name names nothing."))
+    (when (re-find #"[\s\\\"?#]" specifier)
+      (bad (str "a specifier is a file name under " js-dir
+                "/ and a URL besides, so it cannot hold a space, a backslash, a"
+                " quote, a ? or a #.")))
+    (when (or (str/starts-with? specifier ".") (str/starts-with? specifier "/"))
+      (bad (str "it names a path rather than a package. A string require names a"
+                " module resolved from node_modules; a file beside the source is"
+                " not something this compiler resolves.")))
+    (when (str/ends-with? specifier "/")
+      (bad "a specifier names a module, and a trailing slash names a directory."))
+    ;; "date-fns/sub$default". ClojureScript reads a $ in a string require as a
+    ;; property path into the module, because its mechanism had no other way to
+    ;; ask for one - and a package name never contains one. Here there IS another
+    ;; way, so this is refused rather than resolved: taken literally it would name
+    ;; a file no bundler builds, and a 404 at load is a worse answer than the
+    ;; sentence that says what to write instead.
+    (when (str/includes? specifier "$")
+      (bad (str "a $ in a specifier names something INSIDE the module - write"
+                " [\"" (first (str/split specifier #"\$")) "\" :default x] or"
+                " :refer [x] instead.")))
+    (when (some #{"" "." ".."} (str/split specifier #"/" -1))
+      (bad "every segment of it has to be a name."))
+    ;; LAST, not first as ns->path calls ns-alias: the checks above say what is
+    ;; wrong with a path, and this one says only that the result is not a
+    ;; JavaScript name - so asking it last is what puts the sharper message first.
+    (names/js-alias specifier)
+    (str js-dir "/" specifier ".js")))
 
 (defn specifier
   "How a module compiled from `from-ns` names `to-path`, which is relative to the

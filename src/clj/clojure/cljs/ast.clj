@@ -21,7 +21,8 @@
   :invoke :let :letfn :local :loop :map :new :quote :recur :set :set! :the-var
   :throw :try :var :vector :with-meta :binding :case-test :case-then :host-call
   :host-field - with ours added where the target differs: :js :js-var :js-array
-  :js-object :goog-ns :goog-var :deftype :ns :qualified-method.
+  :js-object :goog-ns :goog-var :js-module :js-module-var :deftype :ns
+  :qualified-method.
 
   WHY VENDORED AND NOT DEPENDED ON. tools.analyzer has no dependencies of its own,
   so the usual objection does not apply; the one that does is ours. This jar's

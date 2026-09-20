@@ -298,7 +298,9 @@
            ;; never happens and this is the only one that can.
            _     (when (:out-dir opts) (output/ensure-goog! (:out-dir opts) reqs))
            chunk (emitter/script
-                  (into (emitter/script-prologue nsym reqs) body)
+                  (into (emitter/script-prologue nsym reqs
+                                                 (env/js-requires cenv nsym))
+                        body)
                   (str base ".js")
                   ;; a bare name, so it resolves against the script's own URL the
                   ;; way a module's does against the module's (driver/map-name)

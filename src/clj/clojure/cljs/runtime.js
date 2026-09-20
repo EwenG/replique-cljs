@@ -119,6 +119,29 @@ export function urlFor(name) {
   return "./ns/" + name.replace(/\./g, "/") + ".js";
 }
 
+// The same rule for a JavaScript module a string require named, and the second
+// statement of clojure.cljs.output/js->path - stated here for urlFor's reason, and
+// kept in step with the JVM half by the same test. The specifier IS the path: what
+// npm calls react is npm/react.js here, and react-dom/client is a file two levels
+// down. Nothing is escaped, because a specifier is already a path made of names -
+// output/js->path refuses one that is not.
+export function urlForJs(specifier) {
+  return "./npm/" + specifier + ".js";
+}
+
+// What a MODULE spells as `import * as react$js from "../../npm/react.js"`, for a
+// script, which may contain no import declaration. It returns the module namespace
+// object, which is what the import statement binds - so the two bind the same name
+// to the same thing and the body between them is identical (doc/cljs-repl.md §4).
+//
+// No bookkeeping of its own, unlike require_ below. A namespace can be redefined at
+// a REPL and must not be fetched back over the top; an npm module is built by a
+// bundler and is never redefined from here, so the module system's own cache - one
+// evaluation per URL - is the whole of what is needed.
+function requireJs_(specifier) {
+  return import(urlForJs(specifier));
+}
+
 // TWO FACTS, TWO SETS, and telling them apart is what keeps a reload from
 // undoing itself:
 //
@@ -151,8 +174,10 @@ function require_(name) {
 }
 
 $CLJS.urlFor = urlFor;
+$CLJS.urlForJs = urlForJs;
 $CLJS.fetch = fetch_;
 $CLJS.require = require_;
+$CLJS.requireJs = requireJs_;
 
 // --- printing ---------------------------------------------------------------
 //

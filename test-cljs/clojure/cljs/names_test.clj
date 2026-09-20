@@ -131,7 +131,9 @@
                         :let [js (names/var-fn-name n b)]
                         :when js]
                     js)
-          all     (concat locals temps selfs aliases (distinct quals)
+          modules (map names/js-alias ["t" "ns" "fn" "core" "app.core" "t.1"
+                                       "a-b" "a_b" "@x/y" "x/y"])
+          all     (concat locals temps selfs aliases (distinct quals) modules
                           ["$ns" "$CLJS" "truth_"])]
       (is (< 400 (count all)))
       (is (= (count all) (count (distinct all)))
@@ -181,6 +183,63 @@
   (is (thrown? Exception (names/ns-alias (symbol "1a.core"))))
   ;; while a numeric segment after the first is fine: t$1$ns is a legal name
   (is (= "t$1$ns" (names/ns-alias 't.1))))
+
+(deftest test-a-module-alias-is-what-the-import-binds
+  ;; the fifth shape: a string require names a module, and the module is bound to
+  ;; this name once - whatever the ns form went on to ask of it
+  (are [specifier expected] (= expected (names/js-alias specifier))
+    "react"                 "react$js"
+    ;; a hyphen is the common case and stays legible, exactly as in a namespace
+    "react-dom"             "react_dom$js"
+    ;; a sub-path is not a path here: / is a character like any other, and it is
+    ;; escaped like any other
+    "react-dom/client"      "react_dom$SLASH$client$js"
+    "@visx/scale"           "$CIRCA$visx$SLASH$scale$js"
+    ;; a DOT, which is the one character munge lets through, because a namespace
+    ;; name is spelled with them and a variable cannot hold one. sse.js is a real
+    ;; package and date-fns/locale/en-GB is a real file
+    "sse.js"                "sse$DOT$js$js"
+    "date-fns/locale/en-GB" "date_fns$SLASH$locale$SLASH$en_GB$js"
+    ;; npm allows a leading digit and JavaScript does not: one $ in front, which
+    ;; nothing else can produce because every code is a $ and then a CAPITAL
+    "3d-view"               "$3d_view$js"))
+
+(deftest test-module-aliases-are-injective
+  ;; by sweep, over the characters a specifier actually holds - the property the
+  ;; $-delimited codes exist for, restated one escape wider than munge's
+  (let [pieces ["a" "a-b" "a_b" "a.b" "@a" "a$b" "3a" "a/b"]
+        specs  (concat pieces
+                       (for [x pieces y pieces] (str x y))
+                       (for [x pieces y pieces] (str x "/" y)))
+        as     (map names/js-alias specs)]
+    (is (< 120 (count specs)))
+    (is (= (count as) (count (distinct as)))
+        (str "collisions: "
+             (pr-str (->> (map vector specs as)
+                          (group-by second)
+                          (filter #(< 1 (count (val %))))
+                          (take 5)))))
+    ;; and never one of the other shapes: always ends in $js, never in $ns or $fn,
+    ;; never __<digits>
+    (is (every? #(and (str/ends-with? % "$js")
+                      (not (str/ends-with? % "$ns"))
+                      (not (str/ends-with? % "$fn"))
+                      (not (re-matches #".*__\d+" %)))
+                as))))
+
+(deftest test-a-specifier-that-cannot-be-a-name
+  ;; nothing names nothing - and "$js" on its own would have been a legal
+  ;; identifier, which is what makes this a check rather than a formality
+  (are [specifier] (thrown? Exception (names/js-alias specifier))
+    ""
+    "   "
+    nil
+    'react           ; a symbol is a namespace; a module is written as a string
+    "a b"
+    "a(b)")
+  ;; a module alias and a namespace alias can never collide, whatever they are
+  ;; named for: one ends in $js and the other in $ns
+  (is (not= (names/js-alias "app") (names/ns-alias 'app))))
 
 (deftest test-a-name-we-own-must-be-spellable
   ;; every character a symbol may hold is munged except the dot, which separates

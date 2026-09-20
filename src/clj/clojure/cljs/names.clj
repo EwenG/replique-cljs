@@ -32,15 +32,16 @@
   see code-map, where the obvious attempt is recorded along with the test that
   disproved it.
 
-  The four kinds of name we own that share one JavaScript scope are then kept
+  The five kinds of name we own that share one JavaScript scope are then kept
   apart BY SHAPE, so no two can ever be equal:
 
     local        <munged>__<n>     ends in digits, always contains __
     temporary    t$<n>             ends in digits, never contains __
     ns alias     <munged>$…$ns     ends in `ns`
     fn self-name <munged>$fn       ends in `fn`
+    js module    <munged>$js       ends in `js`
 
-  A fifth is not a variable but a PROPERTY, so it shares a scope with none of
+  A sixth is not a variable but a PROPERTY, so it shares a scope with none of
   those - what it must not collide with is another property of the same object:
 
     protocol     <ns-path>$$<Proto>[$<munged method>$arity$<n>]
@@ -357,6 +358,57 @@
   shape; everything else about it is ns-path."
   [ns-sym]
   (str (ns-path ns-sym) "$ns"))
+
+;; --- the name of a JavaScript module -----------------------------------------
+
+(def ^:private specifier-code-map
+  "code-map, with the dot mapped as well.
+
+  A namespace name is spelled with dots and so is many a specifier - \"sse.js\" is
+  a package, \"date-fns/locale/en-GB\" is a file - so the one character munge lets
+  through has to be escaped here, where the result is a variable rather than a
+  path. $DOT$ is a code like every other, so code-map's decodability argument is
+  untouched: a $ still delimits a code, and the set of codes merely gained one."
+  (assoc code-map \. "$DOT$"))
+
+(defn js-alias
+  "The name bound to the module a STRING require names: \"react\" -> react$js,
+  \"react-dom/client\" -> react_dom$SLASH$client$js.
+
+  A FIFTH VARIABLE SHAPE, and the fifth entry of this namespace's table. It ends
+  in `js`, so it is no local (digits), no temporary (digits), no alias (`ns`) and
+  no fn self-name (`fn`) - and two specifiers give two names, because
+  specifier-code-map is injective for the reason code-map is.
+
+  A module is a namespace object here, exactly as a Closure provide is and as a
+  ClojureScript namespace is: the import binds the module's namespace object, and
+  every reference through it is a property read off that object (react$js.useState).
+  One import per specifier, whatever the ns form asked of it - :as, :refer or
+  :default - which is what lets the module path and the REPL's script path bind the
+  same name and share one body (doc/cljs-repl.md §4).
+
+  Not a path: clojure.cljs.output/js->path is where a specifier becomes a file, and
+  the two escape different things because one has to be a JavaScript name and the
+  other has to be a URL."
+  [specifier]
+  (when-not (and (string? specifier) (not (str/blank? specifier)))
+    (throw (ex-info (str "Bad JavaScript module specifier: " (pr-str specifier)
+                         " - a string require names a module, and an empty name"
+                         " names nothing.")
+                    {:specifier specifier})))
+  (let [munged (apply str (map #(get specifier-code-map % %) specifier))
+        ;; A PACKAGE MAY BEGIN WITH A DIGIT - 3d-view is on npm - and a JavaScript
+        ;; name may not. One $ in front fixes it and forges nothing: every code is
+        ;; a $ followed by a capital, so a $ followed by a digit can only have come
+        ;; from this rule, and the result stays injective.
+        head   (if (re-find #"^[0-9]" munged) (str "$" munged) munged)
+        js     (str head "$js")]
+    (when-not (re-matches identifier-re js)
+      (throw (ex-info (str "Cannot use " (pr-str specifier) " as a module"
+                           " specifier: it spells " js ", which is not a"
+                           " JavaScript name.")
+                      {:specifier specifier})))
+    js))
 
 ;; --- the protocol calling convention ----------------------------------------
 

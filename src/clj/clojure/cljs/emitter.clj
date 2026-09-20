@@ -230,6 +230,28 @@
   [specifier]
   (str "import \"" specifier "\";"))
 
+(defn js-import
+  "The import a module carries for a JavaScript module it requires:
+
+      import * as react$js from \"../../npm/react.js\";
+
+  `binding` is clojure.cljs.names/js-alias of the specifier and `specifier` is how
+  this module reaches the file, which is the output layout's to compute - the same
+  split the two imports above make.
+
+  ALWAYS `import * as`, whatever the ns form asked for. :as names the module, :refer
+  names an export and :default names the export called `default`, and all three are
+  properties of the module's namespace object - so one import serves them all and a
+  reference through any of them is a property read, exactly as a var of ours is a
+  property of a namespace object and a goog var is a property of its provide. The
+  alternative - a named import per :refer - would bind a second kind of name in
+  module scope, and could not be spelled at all by the script counterpart below,
+  which is the half of doc/cljs-repl.md §4 that keeps one body running two ways.
+
+  Its script counterpart is the await $CLJS.requireJs of script-prologue."
+  [binding specifier]
+  (str "import * as " binding " from \"" specifier "\";"))
+
 (def runtime-globals
   "The line an evaluated script opens with, where runtime-import's is the line a
   module opens with.
@@ -1377,6 +1399,21 @@
   [qsym]
   (str (names/ns-alias (namespace qsym)) "." (names/host-name (name qsym))))
 
+(defn- js-module-var-name
+  "The JavaScript for a name drawn out of a JavaScript module: a property of the
+  object the import bound - react$js.useState.
+
+  The same three-part rule as goog-var-name, and for the same reasons. The object
+  is named by clojure.cljs.names/js-alias rather than ns-alias, because a module is
+  reached through an import binding rather than through $ns; the property is spelled
+  the HOST's way, because the export is JavaScript's name and not ours (§5.3); and
+  the analyzer has already refused anything that would not be a name here.
+
+  `default` needs no case of its own. It is a reserved word and a perfectly good
+  property name, so the export :default asks for is read like any other."
+  [specifier export]
+  (str (names/js-alias specifier) "." (names/host-name export)))
+
 (defn- js-global
   "The JavaScript name of a js/foo reference.
 
@@ -1594,6 +1631,16 @@
       :goog-ns
       (args-result (emit head) rs (fn [f as] (str f "(" (join as) ")")))
 
+      ;; an export of a JavaScript module, called: react$js.useState(x). Emitted as
+      ;; the method call it is, for the goog case's reasons and one more of its own -
+      ;; a package bundled from CommonJS is a rewritten object literal, and a function
+      ;; on it may well read `this`. Nothing is gained by detaching it from its
+      ;; module, and correctness can be lost.
+      :js-module-var
+      (args-result (->result [] (names/js-alias (:specifier head))) rs
+                   (fn [o as] (str o "." (names/host-name (:export head))
+                                   "(" (join as) ")")))
+
       ;; the arity property is appended by the COMBINING function, not made part
       ;; of the head expression, for the reason the js/ case above spells out: if
       ;; an argument contributes statements, in-order spills what it is given, and
@@ -1669,6 +1716,14 @@
     ;; goog.math.Long names the class itself, not a var in it: base.js registers a
     ;; provide under its own name as well as under its container's
     :goog-ns  (no-effect (->result [] (names/ns-alias (:name node))))
+    ;; a JavaScript module and a name in one. Both are property reads off an object
+    ;; the prologue bound, so both are dropped as statements like a var is - the
+    ;; import cannot fail here, because a module that would not load threw before
+    ;; this body ran at all
+    :js-module (no-effect (->result [] (names/js-alias (:specifier node))))
+    :js-module-var (no-effect
+                    (->result [] (js-module-var-name (:specifier node)
+                                                     (:export node))))
     :quote  (emit (:expr node))
     :try    (emit-try node)
     :throw  (emit-throw node)
@@ -1779,12 +1834,24 @@
   `foo$baz.helper is not a function`.
 
   await, so the requires have completed before the body runs; legal because the
-  script is an async function (5)."
-  ([ns-sym] (script-prologue ns-sym nil))
-  ([ns-sym required]
-   (into (mapv #(str "await $CLJS.require(\"" % "\");")
-               (other-namespaces ns-sym required))
-         (ns-prologue ns-sym required))))
+  script is an async function (5).
+
+  A JAVASCRIPT MODULE IS AWAITED AND BOUND, where a namespace is only awaited: a
+  namespace's vars are reached through $ns, which needs no import to name them,
+  while a module's exports are properties of the object the import statement binds
+  - so the script has to bind the same name js-import does, and binds it to what
+  $CLJS.requireJs resolves. The line count is why they interleave the way they do:
+  one line per specifier either way, so a body sits at the same line number in the
+  module and in the script that reloads it (see `script`)."
+  ([ns-sym] (script-prologue ns-sym nil nil))
+  ([ns-sym required] (script-prologue ns-sym required nil))
+  ([ns-sym required js-required]
+   (-> (mapv #(str "await $CLJS.require(\"" % "\");")
+             (other-namespaces ns-sym required))
+       (into (map #(str "const " (names/js-alias %)
+                        " = await $CLJS.requireJs(\"" % "\");"))
+             js-required)
+       (into (ns-prologue ns-sym required)))))
 
 (defn emit-top-lines
   "Emit `node` as a top-level unit: the statements it needs, then `f` applied to

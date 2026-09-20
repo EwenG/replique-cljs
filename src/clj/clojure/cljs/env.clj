@@ -292,6 +292,78 @@
   (alter-meta! (cljs-ns cenv ns-sym) update ::requires (fnil conj #{}) required)
   required)
 
+;; --- what a STRING require records -------------------------------------------
+;;
+;; Three entries, on the same metadata and for the same reason as ::imports above.
+;; They are kept apart from ::requires, and that separation is the whole of the
+;; model: a JavaScript module is not a namespace. It has no Namespace object, no
+;; vars, no source to compile and no place in the dependency graph the driver
+;; walks - so a specifier in the requires set would send that driver looking for
+;; react.cljs, and would make resolve-ns answer for a name that has nothing to
+;; answer with.
+;;
+;; What they hold, all keyed by the namespace that wrote the ns form:
+;;
+;;   ::js-requires  the specifiers, which is what a module imports and what a
+;;                  script awaits - one import per specifier, however many names
+;;                  the ns form drew out of it
+;;   ::js-aliases   {alias specifier}, for (:require ["react" :as React]) and the
+;;                  React/createElement that follows
+;;   ::js-refers    {name [specifier export]}, for :refer and :default, which
+;;                  bring a BARE name into scope the way a :refer of a var does
+
+(defn add-js-require!
+  "Record that `ns-sym` requires the JavaScript module `specifier`.
+
+  Nothing is created and nothing is checked: there is no module to make and no way
+  to ask a JavaScript file what it exports. The specifier's SHAPE was checked when
+  the ns form was read (clojure.cljs.output/js->path), and whether the file is
+  there is answered by the bundler that builds npm/ - a question this compiler
+  reports on rather than settles."
+  [^CompileEnv cenv ns-sym specifier]
+  (alter-meta! (cljs-ns cenv ns-sym) update ::js-requires (fnil conj #{}) specifier)
+  specifier)
+
+(defn js-requires
+  "Every JavaScript module `ns-sym` requires, sorted.
+
+  SORTED, where `requires` is not: every caller of that one sorts at the point of
+  use (driver/module-text does), and this has one shape of caller - a list of
+  import lines, or of awaits - so the order belongs here rather than at each of
+  them. Alphabetical rather than as-written, because a set does not remember how it
+  was written: an import list that moved when a line of the ns form moved would be
+  a changed file to whatever is watching the output directory."
+  [^CompileEnv cenv ns-sym]
+  (sort (::js-requires (meta (cljs-ns cenv ns-sym)) #{})))
+
+(defn add-js-alias!
+  "Record that `ns-sym` named the module `specifier` `alias`."
+  [^CompileEnv cenv ns-sym alias specifier]
+  (alter-meta! (cljs-ns cenv ns-sym) update ::js-aliases assoc alias specifier)
+  alias)
+
+(defn js-aliases
+  "What `ns-sym` called the JavaScript modules it required: {React \"react\"}."
+  [^CompileEnv cenv ns-sym]
+  (::js-aliases (meta (some-> (find-cljs-ns cenv ns-sym))) {}))
+
+(defn add-js-refers!
+  "Record the bare names `ns-sym` drew out of JavaScript modules: `m` is
+  {name [specifier export]}."
+  [^CompileEnv cenv ns-sym m]
+  (alter-meta! (cljs-ns cenv ns-sym) update ::js-refers merge m)
+  m)
+
+(defn js-refers
+  "The bare names `ns-sym` drew out of JavaScript modules: {useState [\"react\"
+  \"useState\"]}.
+
+  :refer and :default are one thing here, differing only in the export named -
+  which is what they are in JavaScript too, where `default` is an export like any
+  other with a name that happens to be a keyword."
+  [^CompileEnv cenv ns-sym]
+  (::js-refers (meta (some-> (find-cljs-ns cenv ns-sym))) {}))
+
 (defn all-cljs-ns
   "Every ClojureScript namespace in this environment."
   [^CompileEnv cenv]
@@ -382,7 +454,8 @@
       (.removeAlias view alias))
     (doseq [[sym _] (.getMappings view)]
       (.unmap view sym))
-    (alter-meta! ns dissoc ::requires ::excludes ::global-refers ::imports)
+    (alter-meta! ns dissoc ::requires ::excludes ::global-refers ::imports
+                 ::js-requires ::js-aliases ::js-refers)
     ns-sym))
 
 (defn excluded?

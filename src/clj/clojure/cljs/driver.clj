@@ -144,11 +144,20 @@
   is what compile-source! turns into the map beside it."
   [cenv ns-sym body]
   (let [required (env/requires cenv ns-sym)
-        imports  (into [(emitter/runtime-import
-                         (output/specifier ns-sym output/prelude-name))]
-                       (map #(emitter/ns-import
-                              (output/specifier ns-sym (output/ns->path %))))
-                       (sort (disj (set required) ns-sym)))]
+        imports  (-> [(emitter/runtime-import
+                       (output/specifier ns-sym output/prelude-name))]
+                     (into (map #(emitter/ns-import
+                                  (output/specifier ns-sym (output/ns->path %))))
+                           (sort (disj (set required) ns-sym)))
+                     ;; and one per JavaScript module, which is the other half of
+                     ;; what a module's ns form can require. Last, so a specifier
+                     ;; appearing or disappearing does not move the namespace
+                     ;; imports above it - a module is rewritten when its text
+                     ;; changed, and a shuffled import list is a changed text.
+                     (into (map #(emitter/js-import
+                                  (names/js-alias %)
+                                  (output/specifier ns-sym (output/js->path %))))
+                           (env/js-requires cenv ns-sym)))]
     ;; sm/join and not str/join: the body lines carry where they came from, and
     ;; joining them with clojure.string would flatten that back to a string.
     (sm/cat (sm/join "\n" (into imports
@@ -253,7 +262,8 @@
    (emitter/script
     (-> [(str "if (!$CLJS.fetched.has(\"" ns-sym "\")) return $CLJS.fetch(\""
               ns-sym "\");")]
-        (into (emitter/script-prologue ns-sym (env/requires cenv ns-sym)))
+        (into (emitter/script-prologue ns-sym (env/requires cenv ns-sym)
+                                       (env/js-requires cenv ns-sym)))
         (into body))
     (output/ns->path ns-sym)
     (map-name ns-sym))))
@@ -485,7 +495,23 @@
     (env/with-current-ns env/*current-ns*
       (binding [emitter/*static-dispatch* (boolean (:static-dispatch opts))
                 cgoog/*closure-library* (cgoog/library-option opts)]
-        (let [result (select-keys (f opts) [:compiled :written :scripts])]
+        (let [result (select-keys (f opts) [:compiled :written :scripts])
+              ;; THE BUNDLER'S INPUT, and the reason this is reported rather than
+              ;; acted on. Everything else under the output root is written here;
+              ;; npm/ is built by a bundler from node_modules, and
+              ;; doc/cljs-advanced.md §3 says not to vendor one or make one
+              ;; mandatory. So what crosses the line is this list and the mapping
+              ;; beside it (clojure.cljs.output/js->path) - which is a better input
+              ;; than scanning sources for string requires, because it is what the
+              ;; compiler actually resolved rather than what a regex found.
+              ;;
+              ;; EVERY NAMESPACE IN THE ENVIRONMENT, for ensure-goog!'s reason
+              ;; below: a compile env outlives an output directory, and a run that
+              ;; compiled nothing still has to say what the program needs.
+              js-req (into (sorted-set)
+                           (mapcat #(env/js-requires
+                                     cenv (.getName ^clojure.lang.Namespace %)))
+                           (env/all-cljs-ns cenv))]
           ;; AFTER, not before: which Closure files have to be on disk is decided by
           ;; what was compiled, and the prelude runs before anything is. Every module
           ;; this run wrote imports its goog requires by path, so this is what makes
@@ -500,7 +526,7 @@
           (output/ensure-goog! (:out-dir opts)
                                (mapcat #(env/requires cenv (.getName ^clojure.lang.Namespace %))
                                        (env/all-cljs-ns cenv)))
-          result)))))
+          (assoc result :js-requires (vec js-req)))))))
 
 (defn compile-namespace!
   "Compile `ns-sym` and everything it requires into an output directory.
@@ -516,7 +542,12 @@
     :compiled  the namespaces
     :written   the files that actually changed on disk
     :scripts   [ns script] pairs - each namespace's body as the REPL would ship it,
-               which is the same body the module holds under the other prologue"
+               which is the same body the module holds under the other prologue
+
+  And one thing that is about the whole environment rather than this run:
+
+    :js-requires  every specifier a string require named, sorted - what a bundler
+                  has to build npm/ out of. See run!*."
   [cenv ns-sym opts]
   (run!* cenv opts #(ensure! cenv % (seed-state cenv %) ns-sym)))
 

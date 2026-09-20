@@ -38,6 +38,49 @@
     '.a
     'a..b))
 
+(deftest test-a-specifier-becomes-a-file-under-npm
+  (are [specifier path] (= path (output/js->path specifier))
+    "react"                 "npm/react.js"
+    ;; a sub-path IS a path here, unlike in the alias: it becomes directories, so
+    ;; the tree under npm/ looks like node_modules does
+    "react-dom/client"      "npm/react-dom/client.js"
+    "@visx/scale"           "npm/@visx/scale.js"
+    "date-fns/locale/en-GB" "npm/date-fns/locale/en-GB.js"
+    ;; .js appended even when the specifier already ends in one, because "sse" and
+    ;; "sse.js" are two packages and skipping it would give them one file
+    "sse.js"                "npm/sse.js.js"))
+
+(deftest test-the-specifier-path-is-injective
+  (let [specs ["react" "react-dom" "react-dom/client" "sse" "sse.js"
+               "@visx/scale" "@visx/shape" "date-fns/sub" "date-fns/locale/da"]]
+    (is (= (count specs) (count (set (map output/js->path specs)))))))
+
+(deftest test-what-is-not-a-package
+  ;; each refused for a reason of its own, and none of them is "unsupported": a
+  ;; relative specifier is a different feature, and the rest could not be a file
+  ;; under the output root at all
+  (are [specifier] (thrown? Exception (output/js->path specifier))
+    ""
+    "./beside-the-source.js"
+    "../up.js"
+    "/absolute"
+    "react/"
+    "react//dom"
+    "react/../dom"
+    "a b"
+    "a\"b"
+    "a?b"
+    "a#b"
+    ;; the ClojureScript spelling of an export, which this compiler has an option
+    ;; for - so taking it literally would name a file no bundler builds
+    "date-fns/sub$default"))
+
+(deftest test-the-dollar-suffix-says-what-to-write-instead
+  ;; 28 of one real application's 94 specifiers are written this way today, so the
+  ;; message is the migration
+  (is (re-find #":default x\] or :refer"
+               (or (h/message #(output/js->path "react-useportal$default")) ""))))
+
 (deftest test-a-module-names-another-file-relatively
   (are [from to spec] (= spec (output/specifier from to))
     'app.core "runtime.js"        "../../runtime.js"
@@ -64,6 +107,18 @@
                    "].map((n) => $CLJS.urlFor(n))));")]
     ;; a JSON array of strings reads as a Clojure vector of strings
     (is (= (mapv #(str "./" (output/ns->path %)) names)
+           (read-string (h/run-js js))))))
+
+(h/deftest-when h/node? test-the-two-implementations-of-the-npm-path-agree
+  ;; the same standoff one tree over: $CLJS.requireJs computes a URL from a
+  ;; specifier, so runtime.js states js->path a second time and this is what keeps
+  ;; the two from drifting apart
+  (let [specs ["react" "react-dom/client" "@visx/scale" "sse.js"
+               "date-fns/locale/en-GB"]
+        js    (str "console.log(JSON.stringify(["
+                   (str/join ", " (map #(str "\"" % "\"") specs))
+                   "].map((n) => $CLJS.urlForJs(n))));")]
+    (is (= (mapv #(str "./" (output/js->path %)) specs)
            (read-string (h/run-js js))))))
 
 (deftest test-the-prelude-is-written-with-its-package-json

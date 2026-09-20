@@ -38,6 +38,11 @@
             [clojure.cljs.goog :as goog]
             [clojure.cljs.macroexpand :as mx]
             [clojure.cljs.names :as names]
+            ;; for js->path alone, and for its preconditions rather than its
+            ;; value: a string require names a file under the output root, so what
+            ;; may be written in one is the output layout's rule and is asked
+            ;; where the ns form is read (plan-js-require)
+            [clojure.cljs.output :as output]
             ;; for JSValue alone: #js is a data reader, so what the reader hands
             ;; back for #js [1 2] is a marker type someone has to interpret, and
             ;; the reader's own docstring says that someone is not the reader
@@ -709,8 +714,15 @@
     ;; of window/self/global the target has.
     (when-not (#{:var :js-var :goog-var :host-field} (:op tnode))
       (throw (ex-info (str "Cannot set! " (pr-str target)
-                           (if (= :local (:op tnode))
-                             " - a local is immutable"
+                           (case (:op tnode)
+                             :local " - a local is immutable"
+                             ;; NOT an oversight and not ours to relax: an ES
+                             ;; module's exports are read-only bindings in the
+                             ;; importer, so the assignment would be a TypeError
+                             ;; in the host rather than a rule of this compiler's.
+                             (:js-module :js-module-var)
+                             (str " - a JavaScript module's exports are read-only"
+                                  " bindings where it is imported")
                              " - a set! target must be a var or a property access"))
                       {:form form})))
     (if (and (= :var (:op tnode))
@@ -1132,19 +1144,29 @@
      :children [:test :nodes :default]}))
 
 (defn- libspec
-  "One entry of a :require / :use / :require-macros list, as [namespace opts]."
+  "One entry of a :require / :use / :require-macros list, as [target opts].
+
+  The target is a SYMBOL for a namespace and a STRING for a JavaScript module -
+  [\"react\" :as React] - which is the one place those two worlds are told apart,
+  and the reason they can be: a namespace name is a symbol everywhere else in
+  Clojure, so a string in that position can only mean the other thing. It is
+  ClojureScript's own spelling and shadow-cljs's, so a file written for either
+  reads here unchanged."
   [kind spec]
   (cond
     (symbol? spec) [spec {}]
+    (string? spec) [spec {}]
 
-    (and (vector? spec) (symbol? (first spec)) (even? (count (rest spec))))
+    (and (vector? spec) (or (symbol? (first spec)) (string? (first spec)))
+         (even? (count (rest spec))))
     [(first spec) (apply hash-map (rest spec))]
 
     :else
     (analysis-error
      spec
      (str "Bad " kind " spec: " (pr-str spec)
-          ". Write a namespace name, or [namespace :as alias :refer [...]]."
+          ". Write a namespace name, or [namespace :as alias :refer [...]],"
+          " or [\"module\" :as alias] for a JavaScript module."
           ;; the shape of the mistake, named: a prefix list is what someone
           ;; reaching for Clojure's ns writes, and ClojureScript has never had them
           (when (and (vector? spec) (some coll? (rest spec)))
@@ -1302,7 +1324,14 @@
                          ;; cljs/ns_test/foo.cljs writes [made.up.lib :as-alias lib]
                          ;; and there is no made/up/lib.cljs anywhere, which is the
                          ;; point of the test.
-                         :when (not (or (goog/goog-ns? target)
+                         ;; A STRING IS NOT IN HERE EITHER, and for goog's reason
+                         ;; one world over: a JavaScript module has no .cljs to
+                         ;; find, is not compiled, and is fetched from npm/ rather
+                         ;; than emitted. It reaches the module's imports through
+                         ;; env/js-requires, as goog reaches them through
+                         ;; env/requires.
+                         :when (not (or (string? target)
+                                        (goog/goog-ns? target)
                                         (alias-only? opts)))]
                      target)))))
 
@@ -1405,9 +1434,101 @@
                                 (pr-str rename))))
   (or rename {}))
 
-(defn- plan-require
-  "One (:require ...) or (:use ...) entry, checked and turned into what applying it
-  needs. Changes nothing.
+(def ^:private js-export-re
+  "One JavaScript identifier - the shape an export name has to have once spelled
+  the host's way. js-path-re below is the same thing with dots allowed, and the
+  difference is the point: an export is a single property of a module object."
+  #"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+(defn- check-js-export!
+  "`sym` is a name a string require asks to be given, so it has to be a simple
+  symbol AND to spell a property a JavaScript module could export.
+
+  Unchecked beyond that, and it cannot be otherwise: a JavaScript file is never
+  analysed here, so which names it exports is not a question this compiler can
+  ask. Exactly the position a goog var is in (goog-var-node), and the same answer -
+  a name that is not there surfaces when it runs."
+  [spec sym what]
+  (when-not (simple-symbol? sym)
+    (analysis-error spec (str what " takes a simple symbol, got " (pr-str sym))))
+  (when-not (re-matches js-export-re (names/host-name (name sym)))
+    (analysis-error spec (str "Cannot draw " sym " out of a JavaScript module: it"
+                              " spells " (names/host-name (name sym))
+                              ", which is not a name there.")))
+  sym)
+
+(defn- plan-js-require
+  "One (:require [\"react\" :as React :refer [useState] :default React]) entry,
+  checked and turned into what applying it needs. Changes nothing.
+
+  Three options, and they are shadow-cljs's three because a project moving between
+  the two compilers should not have to rewrite its ns forms:
+
+    :as       names the module, so React/createElement is a property of it
+    :refer    names exports, so useState is a bare name in this namespace
+    :default  names the export called `default`, which is what a CommonJS package
+              bundled to ESM puts its single value on - and it is why
+              \"date-fns/sub$default\" was ever written as a specifier. The suffix
+              was a way of asking for a property through a mechanism that had no
+              way to say so; this is the way to say so.
+
+  :rename renames a :refer, as it does for a namespace - a refer under another
+  name, and the name it replaces is not also referred (check-renames!). The map is
+  built here rather than by that function because there is no var to check.
+
+  WHAT IS REFUSED, each because it means nothing rather than because it is
+  unsupported. :use, which needs :only and whose whole point is referring vars.
+  :as-alias, which registers a Clojure-side name for a namespace that need not
+  exist - a module is not a namespace and has no ::keyword to expand. And the
+  macro options, which name a JVM namespace: there is no react.clj.
+
+  A SPECIFIER IS CHECKED BY THE THING THAT TURNS IT INTO A FILE, which is
+  clojure.cljs.output/js->path - called here for its preconditions, the way
+  parse-ns calls names/ns-alias for its own. A mistake in it is then reported
+  against the ns form that holds it rather than at emission."
+  [kind spec]
+  (let [[specifier opts] (libspec kind spec)]
+    (when (= kind :use)
+      (analysis-error spec (str "Cannot :use " (pr-str specifier)
+                                ": a JavaScript module has no vars to refer."
+                                " Write :require with :refer.")))
+    ;; BEFORE check-opts!, which would refuse it as merely unsupported: it is one
+    ;; of the two options a namespace has and a module cannot, so it gets the
+    ;; sentence that says which.
+    (when (contains? opts :as-alias)
+      (analysis-error spec (str "Cannot :as-alias " (pr-str specifier)
+                                ": :as-alias names a namespace that need not"
+                                " exist, and a JavaScript module is not a"
+                                " namespace. Write :as.")))
+    (check-opts! kind specifier opts #{:as :refer :default :rename})
+    (check-alias! (:as opts))
+    (let [refer  (:refer opts)
+          rename (or (:rename opts) {})]
+      (when-not (or (nil? refer) (and (sequential? refer) (every? symbol? refer)))
+        (analysis-error spec (str ":refer takes a vector of symbols, got "
+                                  (pr-str refer))))
+      (when-not (and (map? rename) (every? simple-symbol? (mapcat identity rename)))
+        (analysis-error spec (str ":rename takes a map of simple symbols, got "
+                                  (pr-str (:rename opts)))))
+      (doseq [[from _] rename]
+        (when-not (some #{from} refer)
+          (analysis-error spec (str ":rename names " from ", which is not in"
+                                    " :refer " (pr-str (vec refer)) "."))))
+      (output/js->path specifier)
+      (when-let [d (:default opts)] (check-js-export! spec d :default))
+      (run! #(check-js-export! spec % :refer) refer)
+      {:specifier specifier
+       :as (:as opts)
+       ;; {name export}, where the export is what JavaScript calls it and the name
+       ;; is what this namespace calls it. A rename moves the key and leaves the
+       ;; export where it was, which is the whole of what renaming means.
+       :refers (into (if-let [d (:default opts)] {d "default"} {})
+                     (map (fn [sym] [(get rename sym sym) (name sym)]))
+                     refer)})))
+
+(defn- plan-ns-require
+  "One (:require ...) or (:use ...) entry naming a NAMESPACE, checked and turned
+  into what applying it needs. Changes nothing.
 
   :as and :refer are the ClojureScript side; :include-macros and :refer-macros
   reach the JVM namespace of the same name, which is how a .cljs file gets at the
@@ -1481,6 +1602,18 @@
             (env/macro-ns target (into (vec (:refers macros)) (vals m-ren))))
           {:target target :as (:as opts) :also-as (when stands-for written)
            :refers refers :renames v-ren :macros macros})))))
+
+(defn- plan-require
+  "One (:require ...) or (:use ...) entry, whichever kind it is.
+
+  A STRING SPEC IS A JAVASCRIPT MODULE and shares nothing with the other but the
+  ns form it was written in - no namespace, no alias on a Namespace, no vars to
+  refer, no macro side. Told apart here rather than by a branch in each step, so
+  that every rule in plan-ns-require can go on being about namespaces."
+  [cenv kind spec]
+  (if (string? (if (vector? spec) (first spec) spec))
+    (plan-js-require kind spec)
+    (plan-ns-require cenv kind spec)))
 
 (defn- plan-import
   "One (:import ...) entry: [goog.string StringBuffer], or the class written out as
@@ -1684,7 +1817,28 @@
                           (str ":refer-clojure :rename names cljs.core/" from
                                ", which does not exist.")))))))
 
-(defn- apply-require!
+(defn- apply-js-require!
+  "A string require applied: the specifier recorded, the alias recorded, and the
+  referred names recorded. No namespace is created, nothing is interned and no
+  Namespace alias is added - there is nothing on the other end to point at.
+
+  ONE NAME CANNOT MEAN TWO THINGS. A Namespace refuses a second, different target
+  for an alias it already has, and that check cannot see these, so the two
+  directions are asked here and in apply-require!. Without them
+  (:require [\"react\" :as r] [app.r :as r]) would take whichever branch the
+  resolver asks first, silently."
+  [cenv this-ns {:keys [specifier as refers]}]
+  (env/add-js-require! cenv this-ns specifier)
+  (when as
+    (when (.lookupAlias ^Namespace (env/cljs-ns cenv this-ns) as)
+      (analysis-error as (str as " already names a namespace in " this-ns
+                              " - a JavaScript module needs an alias of its own.")))
+    (env/add-js-alias! cenv this-ns as specifier))
+  (env/add-js-refers! cenv this-ns
+                      (into {} (map (fn [[sym export]] [sym [specifier export]]))
+                            refers)))
+
+(defn- apply-ns-require!
   [cenv this-ns {:keys [target as also-as refers renames macros alias-only]}]
   ;; :as-alias alone: the alias below and nothing else. NOT add-require!, which is
   ;; what puts a namespace in the module's imports and the prologue - and there is
@@ -1703,6 +1857,13 @@
     ;; names/ns-alias of the TARGET - so it needs no JavaScript spelling and gets
     ;; no check for one. Namespace.addAlias refuses a second, different target for
     ;; a name already aliased, which is the check that matters.
+    ;;
+    ;; It cannot see a JavaScript module's alias, which lives on the namespace's
+    ;; metadata rather than in the alias table, so that half is asked here - the
+    ;; other direction of the check apply-js-require! makes.
+    (when (contains? (env/js-aliases cenv this-ns) a)
+      (analysis-error a (str a " already names a JavaScript module in " this-ns
+                             " - a namespace needs an alias of its own.")))
     (.addAlias ^Namespace (env/cljs-ns cenv this-ns) a
                ^Namespace (env/cljs-ns cenv target)))
   (let [^Namespace from (env/cljs-ns cenv target)
@@ -1717,6 +1878,19 @@
     (env/require-macros! cenv this-ns (:target macros)
                          :as (:as macros) :refer (:refers macros)
                          :rename (:renames macros))))
+
+(defn- apply-require!
+  "One planned require applied, whichever kind it is. A plan carrying a
+  :specifier came from a string spec and names a JavaScript module; every other
+  one names a ClojureScript namespace.
+
+  One function rather than two lists in the plan, because both of its callers -
+  parse-ns and require-libs! - apply what they planned in the order it was
+  WRITTEN, and an ns form is free to interleave the two kinds."
+  [cenv this-ns plan]
+  (if (:specifier plan)
+    (apply-js-require! cenv this-ns plan)
+    (apply-ns-require! cenv this-ns plan)))
 
 (defn- parse-ns
   "The ns form: the only place a namespace's requires, aliases and refers are
@@ -2003,6 +2177,34 @@
   ([env sym form]
    {:op :goog-ns :form form :env env :children [] :name sym}))
 
+(defn- js-module-node
+  "React, where the ns form said (:require [\"react\" :as React]) - the module
+  object itself, which is what `import * as` bound.
+
+  The counterpart of goog-ns-node one world over, and it exists for the same
+  reason: a module is a VALUE as well as a place to read names out of, and a
+  program passing one along - to a framework, to console.log - has written
+  something that means exactly that."
+  [env specifier form]
+  {:op :js-module :form form :env env :children [] :specifier specifier})
+
+(defn- js-module-var-node
+  "React/createElement, or a bare useState the ns form :referred - an export of a
+  JavaScript module.
+
+  UNCHECKED, like a goog var and for a stronger version of its reason. A goog file
+  at least sits on the classpath and could in principle be read; the file behind a
+  specifier is built by a bundler out of node_modules and need not exist yet when
+  this compiles. What is checked is that the name can be spelled at all.
+
+  `export` is a String and not a symbol: it is JavaScript's name for the thing,
+  which is why :rename can change what this namespace calls it without changing
+  this."
+  [env specifier export form]
+  (check-js-name! (symbol export))
+  {:op :js-module-var :form form :env env :children []
+   :specifier specifier :export export})
+
 (def ^:private removed-core-vars
   "Names upstream cljs.core has that this fork's core.cljs does not, and why.
 
@@ -2275,6 +2477,28 @@
                                   " and that name is not in it. To get it: "
                                   (goog/get-real-closure)))))
 
+      ;; React/createElement - an export of a JavaScript module this namespace
+      ;; required under that name. Asked after the goog branches, which cannot
+      ;; overlap with it (a goog name has a dot in it and an alias does not), and
+      ;; before every reading below, because an alias is a DECLARATION: a name the
+      ;; ns form said stands for a module is that module, whatever else the
+      ;; session happens to hold under it.
+      (contains? (env/js-aliases cenv env/*current-ns*) nsym)
+      (let [specifier (get (env/js-aliases cenv env/*current-ns*) nsym)
+            nm        (name sym)
+            dot       (.indexOf nm ".")]
+        (if (pos? dot)
+          ;; React/Children.map - the export Children, property map. The rewriting
+          ;; the namespace branch below does, for the same reason: a dot in the
+          ;; NAME half splits a value from its properties, and an export named
+          ;; `Children.map` is not a thing JavaScript can have.
+          (analyze cenv env
+                   (reduce (fn [t p] (list '. t (symbol (str "-" p))))
+                           (with-meta (symbol (str nsym) (subs nm 0 dot))
+                             (meta sym))
+                           (rest (clojure.string/split nm #"\."))))
+          (js-module-var-node env specifier nm form)))
+
       ;; PersistentVector/EMPTY - the namespace part names a VAR rather than a
       ;; namespace, so the whole symbol is that value and a property of it. Asked
       ;; after `target`, so a real namespace or alias of the same name wins.
@@ -2488,9 +2712,26 @@
       ;; and the fourteen cljs.core protocols defrecord extends in its expansion
       ;; are what happens when the two disagree.
       (let [^Namespace here (env/cljs-ns cenv)
-            ^Var v (env/resolve-var cenv sym)]
+            ^Var v (env/resolve-var cenv sym)
+            ;; (:require ["react" :refer [useState]]) - a bare name drawn out of a
+            ;; JavaScript module. {name [specifier export]}, or nil.
+            js-ref (get (env/js-refers cenv env/*current-ns*) sym)
+            ;; is `v` a mapping of THIS namespace - a def, or a :refer of a var -
+            ;; rather than the cljs.core one resolve-var falls back to? That is the
+            ;; whole of the ordering question below, and asking it costs one lookup
+            ;; in the only case that can be in doubt.
+            mine?  (fn [] (instance? Var (.getMapping here sym)))]
         (cond
-          (some? v) (var-node env v sym)
+          ;; A JS REFER IS A REFER, so it sits exactly where a cljs one does: below
+          ;; anything this namespace defines or refers itself, and ABOVE the
+          ;; implicit refer of cljs.core (doc/cljs-compiler.md §5.12). Without the
+          ;; second half, (:require ["react-dom" :refer [render]]) would resolve to
+          ;; nothing at all today and to cljs.core/render the day core grew one,
+          ;; which is a name silently changing meaning under a program.
+          (and (some? v) (or (nil? js-ref) (mine?))) (var-node env v sym)
+
+          (some? js-ref)
+          (js-module-var-node env (first js-ref) (second js-ref) sym)
 
           ;; (:refer-global :only [Object]) - a bare name this namespace said is
           ;; the host's. AFTER the var, which is what makes it a refer rather than
@@ -2516,6 +2757,12 @@
           ;; the provide, so a bare StringBuffer is that class. Aliases are looked
           ;; up AFTER vars: a def of the same name in this namespace wins, which is
           ;; the reading every other shadowing rule here has.
+          ;; (:require ["react" :as React]) then React alone - the module object
+          ;; itself. Beside the :import alias below, and read the same way: a name
+          ;; the ns form gave to something, used as a value.
+          (contains? (env/js-aliases cenv env/*current-ns*) sym)
+          (js-module-node env (get (env/js-aliases cenv env/*current-ns*) sym) sym)
+
           :else
           (if-let [^Namespace aliased (.lookupAlias here sym)]
             (if (goog/goog-ns? (.getName aliased))

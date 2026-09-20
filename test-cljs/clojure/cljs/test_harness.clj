@@ -132,8 +132,16 @@
                        (emitter/emit-top (top (last forms))
                                          #(str "console.log(" % ");")))
            nsym  env/*current-ns*]
-       (str/join "\n" (into (emitter/ns-prologue nsym (env/requires cenv nsym))
-                            body))))))
+       ;; the program lands at the ROOT of the runtime directory, so a module it
+       ;; requires is ./npm/<specifier>.js from where it sits. Import lines rather
+       ;; than a prologue: this is the module path, and run-js prepends its own
+       ;; imports above these (an import declaration is hoisted either way).
+       (str/join "\n"
+                 (-> (mapv #(emitter/js-import (names/js-alias %)
+                                               (str "./" (output/js->path %)))
+                           (env/js-requires cenv nsym))
+                     (into (emitter/ns-prologue nsym (env/requires cenv nsym)))
+                     (into body)))))))
 
 (defn script
   "The same source as the unit a REPL evaluates (doc/cljs-repl.md \u00a75): one async
@@ -152,7 +160,8 @@
            tail  (emitter/emit-top-lines (top (last forms)) emitter/return-value)
            nsym  env/*current-ns*]
        (emitter/script
-        (into (emitter/script-prologue nsym (env/requires cenv nsym))
+        (into (emitter/script-prologue nsym (env/requires cenv nsym)
+                                       (env/js-requires cenv nsym))
               (into head tail)))))))
 
 ;; --- running ----------------------------------------------------------------
@@ -265,12 +274,35 @@
       (.mkdirs (.getParentFile f))
       (.deleteOnExit f)
       (spit f (str/join "\n"
-                        (into [(emitter/runtime-import
-                                (output/specifier nsym output/prelude-name))]
-                              (into (emitter/ns-prologue nsym
-                                                         (env/requires cenv nsym))
-                                    body))))
+                        (-> [(emitter/runtime-import
+                              (output/specifier nsym output/prelude-name))]
+                            (into (map #(emitter/js-import
+                                         (names/js-alias %)
+                                         (output/specifier nsym
+                                                           (output/js->path %))))
+                                  (env/js-requires cenv nsym))
+                            (into (emitter/ns-prologue nsym
+                                                       (env/requires cenv nsym)))
+                            (into body))))
       f)))
+
+(defn write-npm!
+  "Write `sources` - {specifier source} - into the runtime directory at the paths
+  clojure.cljs.output/js->path gives them, so that a program compiled with string
+  requires can be run beside them.
+
+  A stand-in for the bundler, and deliberately a dumb one: npm/ is the one tree
+  under an output root this compiler does not write, so a test that needed it
+  built by anything of ours would be testing the wrong thing. Both paths reach it
+  from here - a module by the relative specifier the driver computes, a script by
+  the URL $CLJS.requireJs computes from runtime.js's own."
+  [sources]
+  (doseq [[specifier src] sources]
+    (let [f (File. ^File @runtime-dir ^String (output/js->path specifier))]
+      (.mkdirs (.getParentFile f))
+      (.deleteOnExit f)
+      (spit f src)))
+  @runtime-dir)
 
 (def core-module
   "cljs.core, compiled and written into the runtime directory, and the compile
