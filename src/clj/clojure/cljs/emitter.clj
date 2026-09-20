@@ -1410,7 +1410,13 @@
   the analyzer has already refused anything that would not be a name here.
 
   `default` needs no case of its own. It is a reserved word and a perfectly good
-  property name, so the export :default asks for is read like any other."
+  property name, so the export :default asks for is read like any other.
+
+  Neither does a DOTTED export, which is what the $ sugar in a specifier produces:
+  [\"date-fns/sub$default\" :as sub] gives the export path `default`, and host-name
+  leaves the dots between segments alone because a dot is not a character it
+  maps. One property read or three is a difference JavaScript makes and this does
+  not."
   [specifier export]
   (str (names/js-alias specifier) "." (names/host-name export)))
 

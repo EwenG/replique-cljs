@@ -75,11 +75,17 @@
     ;; for - so taking it literally would name a file no bundler builds
     "date-fns/sub$default"))
 
-(deftest test-the-dollar-suffix-says-what-to-write-instead
-  ;; 28 of one real application's 94 specifiers are written this way today, so the
-  ;; message is the migration
-  (is (re-find #":default x\] or :refer"
-               (or (h/message #(output/js->path "react-useportal$default")) ""))))
+(deftest test-the-dollar-suffix-is-not-part-of-the-file-name
+  ;; a $ is the sugar for a property path INTO the module (doc/cljs-npm.md 4), and
+  ;; the analyzer splits it off where the ns form is read - so what names a file is
+  ;; the module half, and one arriving here unsplit is a bug rather than a package.
+  ;; The message names the module it would have meant.
+  (let [msg (or (h/message #(output/js->path "react-useportal$default")) "")]
+    (is (re-find #"names a path INSIDE the module" msg))
+    (is (re-find #"\"react-useportal\"" msg)))
+  ;; and the two halves of one do name the same file as the module alone, which is
+  ;; why they are one import between them
+  (is (= "npm/date-fns/sub.js" (output/js->path "date-fns/sub"))))
 
 (deftest test-a-module-names-another-file-relatively
   (are [from to spec] (= spec (output/specifier from to))

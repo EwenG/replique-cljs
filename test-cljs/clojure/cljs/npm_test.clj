@@ -61,7 +61,8 @@
   (let [cenv (ns-env '(ns app.core (:require ["react" :as React]
                                              [goog.object :as gobj])))]
     (is (= ["react"] (env/js-requires cenv 'app.core)))
-    (is (= '{React "react"} (env/js-aliases cenv 'app.core)))
+    ;; {alias [specifier path]} - the path is the $ sugar, and nil here
+    (is (= '{React ["react" nil]} (env/js-aliases cenv 'app.core)))
     ;; and NOT in the namespace requires, which is the separation the model rests
     ;; on: a module has no Namespace, no vars and no place in the compile graph
     (is (= '#{cljs.core goog.object} (env/requires cenv 'app.core)))
@@ -79,7 +80,7 @@
                                   ["@visx/scale" :refer [scaleLinear]
                                                  :rename {scaleLinear linear}])))]
     (is (= ["@visx/scale" "date-fns/sub" "react"] (env/js-requires cenv 'app.core)))
-    (is (= '{React "react"} (env/js-aliases cenv 'app.core)))
+    (is (= '{React ["react" nil]} (env/js-aliases cenv 'app.core)))
     ;; {name [specifier export]} - and :default is a :refer of the export called
     ;; `default`, which is what it is in JavaScript too
     (is (= '{useState  ["react" "useState"]
@@ -88,6 +89,35 @@
              ;; a rename moves the NAME and leaves the export where it was
              linear    ["@visx/scale" "scaleLinear"]}
            (env/js-refers cenv 'app.core)))))
+
+(deftest test-a-dollar-names-a-path-into-the-module
+  ;; shadow-cljs's other spelling of :default, and of a property path besides. The
+  ;; three options above apply to whatever the SPECIFIER named, and a specifier is
+  ;; free to have named a property rather than the module itself.
+  (let [cenv (ns-env '(ns app.core
+                        (:require ["date-fns/sub$default" :as sub]
+                                  ;; the same module, once with a path and once
+                                  ;; without - and ONE import between them, because
+                                  ;; the path is no part of any file name
+                                  ["date-fns/sub" :as whole]
+                                  ["a$b.c" :refer [d] :default e])))]
+    (is (= ["a" "date-fns/sub"] (env/js-requires cenv 'app.core)))
+    (is (= '{sub   ["date-fns/sub" "default"]
+             whole ["date-fns/sub" nil]}
+           (env/js-aliases cenv 'app.core)))
+    ;; and every option reads from where the $ pointed, :default included
+    (is (= '{d ["a" "b.c.d"] e ["a" "b.c.default"]}
+           (env/js-refers cenv 'app.core)))))
+
+(deftest test-the-split-is-at-the-first-dollar
+  ;; shadow-cljs's rule (a split with a limit of 2) rather than ClojureScript's,
+  ;; whose lib&sublib regex is greedy and takes the LAST. The two agree on every
+  ;; specifier with one $ in it and disagree on a$b$c, where the second $ can only
+  ;; be part of the property name: $ is legal in a JavaScript name and not in a
+  ;; package name, so the first one is the one that can be the delimiter.
+  (let [cenv (ns-env '(ns app.core (:require ["a$b$c" :as x])))]
+    (is (= ["a"] (env/js-requires cenv 'app.core)))
+    (is (= '{x ["a" "b$c"]} (env/js-aliases cenv 'app.core)))))
 
 (deftest test-what-a-string-spec-refuses
   ;; each of these means nothing rather than being unsupported, and the message
@@ -105,7 +135,14 @@
     '(ns app.core (:require ["./beside.js" :as b]))    #"names a path rather than a package"
     '(ns app.core (:require ["" :as b]))               #"empty name"
     ;; an export that could not be a property of anything
-    '(ns app.core (:require ["react" :refer [a.b]]))   #"not a name there"))
+    '(ns app.core (:require ["react" :refer [a.b]]))   #"not a name there"
+    ;; and the $ sugar's half of the same question
+    '(ns app.core (:require ["a$" :as x]))             #"nothing after it"
+    '(ns app.core (:require ["$b" :as x]))             #"no module before it"
+    '(ns app.core (:require ["a$b..c" :as x]))         #"not a name in JavaScript"
+    ;; NOT munged, where a :refer of the symbol b-c would be: a specifier is a
+    ;; string, and a string in an ns form is the host's spelling throughout
+    '(ns app.core (:require ["a$b-c" :as x]))          #"spelled the way JavaScript"))
 
 (deftest test-one-name-cannot-mean-two-things
   ;; a Namespace refuses a second target for an alias it holds, and cannot see a
@@ -137,7 +174,7 @@
     (is (= ["react"] (env/js-requires cenv 'app.core)))
     (h/analyze cenv '(ns app.core (:require ["preact" :as React])))
     (is (= ["preact"] (env/js-requires cenv 'app.core)))
-    (is (= '{React "preact"} (env/js-aliases cenv 'app.core)))))
+    (is (= '{React ["preact" nil]} (env/js-aliases cenv 'app.core)))))
 
 (deftest test-a-repl-require-adds-one
   ;; (require '["react" :as React]) typed at a REPL: the same planning, adding to
@@ -145,7 +182,7 @@
   (let [cenv (ns-env '(ns app.core (:require ["preact" :as P])))]
     (ana/require-libs! cenv '[["react" :as React :refer [useState]]])
     (is (= ["preact" "react"] (env/js-requires cenv 'app.core)))
-    (is (= '{P "preact" React "react"} (env/js-aliases cenv 'app.core)))))
+    (is (= '{P ["preact" nil] React ["react" nil]} (env/js-aliases cenv 'app.core)))))
 
 ;; --- resolution -------------------------------------------------------------
 
@@ -171,6 +208,20 @@
     (is (= "react$js.Children.map" (emitted cenv 'React/Children.map)))
     ;; and the export is spelled the HOST's way, because the name is JavaScript's
     (is (= "react$js.some_fn" (emitted cenv 'React/some-fn)))))
+
+(deftest test-a-dollar-alias-names-what-the-path-points-at
+  (let [cenv (ns-env '(ns app.core (:require ["date-fns/sub$default" :as sub]
+                                             ["lib$a.b" :as deep])))]
+    ;; the value the path points at - which is what every one of the 33 such
+    ;; requires in one real application is for, a $default read and then called
+    (is (= "date_fns$SLASH$sub$js.default" (emitted cenv 'sub)))
+    (is (= "date_fns$SLASH$sub$js.default(\"x\")" (emitted cenv '(sub "x"))))
+    ;; and it is a place to read names out of besides, so the alias goes on being
+    ;; an alias: the path only moves where the reading starts
+    (is (= "date_fns$SLASH$sub$js.default.foo" (emitted cenv 'sub/foo)))
+    (is (= "lib$js.a.b.c" (emitted cenv 'deep/c)))
+    ;; a dot in the NAME half still splits a value from its properties
+    (is (= "lib$js.a.b.c.d" (emitted cenv 'deep/c.d)))))
 
 (deftest test-a-refer-is-a-bare-name
   (let [cenv (ns-env '(ns app.core (:require ["react" :as React
@@ -277,10 +328,11 @@
              '{probe.core "(ns probe.core
                              (:require [\"greeter\" :as g :refer [shout]]
                                        [\"greeter/loud\" :default loud]
+                                       [\"greeter/loud$default\" :as loud2]
                                        [\"@scope/pkg\" :refer [answer]]))
                            (defn run []
                              (str (g/hello \"a\") \"|\" (shout \"b\") \"|\"
-                                  (loud \"c\") \"|\" answer))"})
+                                  (loud \"c\") \"|\" (loud2 \"d\") \"|\" answer))"})
         out (h/temp-dir)]
     (try
       (let [cenv   (env/compile-env {:ns 'cljs.user})
@@ -295,7 +347,9 @@
                                   {:out-dir out :source-paths [src]})))
             result @box
             entry  (io/file out "check.mjs")]
-        ;; what a bundler has to build, reported rather than acted on
+        ;; what a bundler has to build, reported rather than acted on - and THREE
+        ;; of them for four specs, because the $ spelling and the :default one name
+        ;; the same module and share its one import
         (is (= ["@scope/pkg" "greeter" "greeter/loud"] (:js-requires result)))
         ;; and nothing was looked for on the source path: a specifier is not a
         ;; namespace, so the graph the driver walked holds only these two
@@ -304,7 +358,7 @@
         (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
                          "import \"./ns/probe/core.js\";\n"
                          "console.log($ns(\"probe.core\").run());\n"))
-        (is (= "hello a|B|c!|42" (node entry))))
+        (is (= "hello a|B|c!|d!|42" (node entry))))
       (finally (h/delete-tree! src) (h/delete-tree! out)))))
 
 (h/deftest-when h/node? test-the-script-path-fetches-them-too

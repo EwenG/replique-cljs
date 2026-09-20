@@ -307,10 +307,12 @@
 ;;   ::js-requires  the specifiers, which is what a module imports and what a
 ;;                  script awaits - one import per specifier, however many names
 ;;                  the ns form drew out of it
-;;   ::js-aliases   {alias specifier}, for (:require ["react" :as React]) and the
-;;                  React/createElement that follows
+;;   ::js-aliases   {alias [specifier path]}, for (:require ["react" :as React])
+;;                  and the React/createElement that follows - the path being the
+;;                  $ sugar, nil whenever the alias names the module itself
 ;;   ::js-refers    {name [specifier export]}, for :refer and :default, which
-;;                  bring a BARE name into scope the way a :refer of a var does
+;;                  bring a BARE name into scope the way a :refer of a var does -
+;;                  the export being a dotted path when the $ sugar named one
 
 (defn add-js-require!
   "Record that `ns-sym` requires the JavaScript module `specifier`.
@@ -337,13 +339,20 @@
   (sort (::js-requires (meta (cljs-ns cenv ns-sym)) #{})))
 
 (defn add-js-alias!
-  "Record that `ns-sym` named the module `specifier` `alias`."
-  [^CompileEnv cenv ns-sym alias specifier]
-  (alter-meta! (cljs-ns cenv ns-sym) update ::js-aliases assoc alias specifier)
+  "Record that `ns-sym` named `alias` for the module `specifier`, or - when `path`
+  is not nil - for what sits at that property path inside it."
+  [^CompileEnv cenv ns-sym alias specifier path]
+  (alter-meta! (cljs-ns cenv ns-sym) update ::js-aliases assoc alias [specifier path])
   alias)
 
 (defn js-aliases
-  "What `ns-sym` called the JavaScript modules it required: {React \"react\"}."
+  "What `ns-sym` called the JavaScript modules it required: {React [\"react\" nil]}.
+
+  [specifier path], where the path is nil for a plain (:require [\"react\" :as
+  React]) and a dotted string for the $ sugar - [\"date-fns/sub$default\" :as sub]
+  gives {sub [\"date-fns/sub\" \"default\"]}. Both halves of a $ specifier are one
+  import of the module, so what is recorded here is the module and a way into it,
+  which is also the shape js-refers has."
   [^CompileEnv cenv ns-sym]
   (::js-aliases (meta (some-> (find-cljs-ns cenv ns-sym))) {}))
 

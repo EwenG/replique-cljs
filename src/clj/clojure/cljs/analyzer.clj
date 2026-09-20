@@ -1457,6 +1457,68 @@
                               ", which is not a name there.")))
   sym)
 
+(defn- split-js-specifier
+  "\"date-fns/sub$default\" -> [\"date-fns/sub\" \"default\"], and \"react\" ->
+  [\"react\" nil]. `spec` is the whole libspec, so that a bad one is reported
+  against what was written.
+
+  THE $ NAMES A PATH INTO THE MODULE, and nothing after it is part of any file
+  name: a $ specifier is ONE import of the module half, and the path is a property
+  read off the object that import bound. \"date-fns/sub$default\" and
+  \"date-fns/sub\" in the same ns form are one import between them.
+
+  SPLIT HERE AND NOWHERE ELSE, which is what the sugar costs. The plan this
+  function feeds carries the two halves apart, so clojure.cljs.env, the emitter,
+  the output layout, the driver and the missing-package report each go on seeing a
+  module and only a module - one specifier, one file, one binding, as before. A $
+  reaching clojure.cljs.output/js->path is a bug, and is refused there as one.
+
+  AT THE FIRST $, which is shadow-cljs's rule (shadow.build.js-support splits with
+  a limit of 2) rather than ClojureScript's, whose lib&sublib regex is greedy and
+  takes the LAST. The two agree on every specifier with one $ in it and disagree
+  on a$b$c; the first $ is the one that can be the delimiter, because $ is legal
+  in a JavaScript property name and not in a package name. See doc/cljs-npm.md §4.1.
+
+  Beyond the split this is the check js->path is for the other half: what follows
+  the $ has to be a dotted path of names JavaScript could have, because that is
+  what it is emitted as."
+  [spec specifier]
+  (if-not (and (string? specifier) (clojure.string/includes? specifier "$"))
+    [specifier nil]
+    (let [[module path] (clojure.string/split specifier #"\$" 2)]
+      (when (clojure.string/blank? module)
+        (analysis-error spec (str "Bad JavaScript module specifier: "
+                                  (pr-str specifier) " - a $ names something"
+                                  " inside a module, and there is no module"
+                                  " before it.")))
+      (when (clojure.string/blank? path)
+        (analysis-error spec (str "Bad JavaScript module specifier: "
+                                  (pr-str specifier) " - a $ names something"
+                                  " inside a module, and there is nothing after"
+                                  " it. Drop the $ to require the module.")))
+      ;; NOT MUNGED, where a :refer of the symbol some-fn is: a specifier is a
+      ;; string, and a string in an ns form is spelled the host's way from end to
+      ;; end - which is why it can hold a /, an @ and a . without any of them
+      ;; meaning what they mean in a symbol.
+      (doseq [segment (clojure.string/split path #"\." -1)]
+        (when-not (re-matches js-export-re segment)
+          (analysis-error spec (str "Cannot read " (pr-str path) " out of "
+                                    (pr-str module) ": " (pr-str segment)
+                                    " is not a name in JavaScript, and what"
+                                    " follows a $ is spelled the way JavaScript"
+                                    " spells it."))))
+      [module path])))
+
+(defn- js-export-path
+  "Where `export` sits relative to the module object: \"useState\" on its own, and
+  \"default.useState\" when the specifier's $ path put something between them.
+
+  One function because every option goes through it - :refer, :default and the
+  export half of :rename all name something inside whatever the specifier named,
+  and the specifier is free to have named a property rather than the module."
+  [path export]
+  (if path (str path "." export) export))
+
 (defn- plan-js-require
   "One (:require [\"react\" :as React :refer [useState] :default React]) entry,
   checked and turned into what applying it needs. Changes nothing.
@@ -1467,10 +1529,15 @@
     :as       names the module, so React/createElement is a property of it
     :refer    names exports, so useState is a bare name in this namespace
     :default  names the export called `default`, which is what a CommonJS package
-              bundled to ESM puts its single value on - and it is why
-              \"date-fns/sub$default\" was ever written as a specifier. The suffix
-              was a way of asking for a property through a mechanism that had no
-              way to say so; this is the way to say so.
+              bundled to ESM puts its single value on
+
+  AND A FOURTH THING THAT IS NOT AN OPTION: a $ in the specifier, which names a
+  property path into the module and which the three options above then apply to.
+  [\"date-fns/sub$default\" :as sub] binds sub to the default export, and is
+  shadow-cljs's spelling of what [\"date-fns/sub\" :default sub] says with an
+  option. Both are accepted, because a project moving between the two compilers
+  should not have to rewrite its ns forms - which is the same reason the three
+  options are shadow's three. split-js-specifier is the whole of it.
 
   :rename renames a :refer, as it does for a namespace - a refer under another
   name, and the name it replaces is not also referred (check-renames!). The map is
@@ -1484,25 +1551,30 @@
 
   A SPECIFIER IS CHECKED BY THE THING THAT TURNS IT INTO A FILE, which is
   clojure.cljs.output/js->path - called here for its preconditions, the way
-  parse-ns calls names/ns-alias for its own. A mistake in it is then reported
+  parse-ns calls names/ns-alias for its own, and called on the MODULE half
+  because that is the half that becomes a file. A mistake in it is then reported
   against the ns form that holds it rather than at emission."
   [kind spec]
-  (let [[specifier opts] (libspec kind spec)]
+  ;; `written` is the specifier as the ns form spells it, which is what an error
+  ;; about the SPEC should echo; `specifier` below is its module half, which is
+  ;; what everything downstream is told.
+  (let [[written opts] (libspec kind spec)]
     (when (= kind :use)
-      (analysis-error spec (str "Cannot :use " (pr-str specifier)
+      (analysis-error spec (str "Cannot :use " (pr-str written)
                                 ": a JavaScript module has no vars to refer."
                                 " Write :require with :refer.")))
     ;; BEFORE check-opts!, which would refuse it as merely unsupported: it is one
     ;; of the two options a namespace has and a module cannot, so it gets the
     ;; sentence that says which.
     (when (contains? opts :as-alias)
-      (analysis-error spec (str "Cannot :as-alias " (pr-str specifier)
+      (analysis-error spec (str "Cannot :as-alias " (pr-str written)
                                 ": :as-alias names a namespace that need not"
                                 " exist, and a JavaScript module is not a"
                                 " namespace. Write :as.")))
-    (check-opts! kind specifier opts #{:as :refer :default :rename})
+    (check-opts! kind written opts #{:as :refer :default :rename})
     (check-alias! (:as opts))
-    (let [refer  (:refer opts)
+    (let [[specifier path] (split-js-specifier spec written)
+          refer  (:refer opts)
           rename (or (:rename opts) {})]
       (when-not (or (nil? refer) (and (sequential? refer) (every? symbol? refer)))
         (analysis-error spec (str ":refer takes a vector of symbols, got "
@@ -1518,12 +1590,18 @@
       (when-let [d (:default opts)] (check-js-export! spec d :default))
       (run! #(check-js-export! spec % :refer) refer)
       {:specifier specifier
+       ;; the $ half, kept beside the module rather than folded into it: what an
+       ;; alias names is the module when this is nil and a property of it when it
+       ;; is not, and that is the only thing downstream has to know about the sugar
+       :path path
        :as (:as opts)
        ;; {name export}, where the export is what JavaScript calls it and the name
        ;; is what this namespace calls it. A rename moves the key and leaves the
        ;; export where it was, which is the whole of what renaming means.
-       :refers (into (if-let [d (:default opts)] {d "default"} {})
-                     (map (fn [sym] [(get rename sym sym) (name sym)]))
+       :refers (into (if-let [d (:default opts)]
+                       {d (js-export-path path "default")} {})
+                     (map (fn [sym] [(get rename sym sym)
+                                     (js-export-path path (name sym))]))
                      refer)})))
 
 (defn- plan-ns-require
@@ -1827,13 +1905,13 @@
   directions are asked here and in apply-require!. Without them
   (:require [\"react\" :as r] [app.r :as r]) would take whichever branch the
   resolver asks first, silently."
-  [cenv this-ns {:keys [specifier as refers]}]
+  [cenv this-ns {:keys [specifier path as refers]}]
   (env/add-js-require! cenv this-ns specifier)
   (when as
     (when (.lookupAlias ^Namespace (env/cljs-ns cenv this-ns) as)
       (analysis-error as (str as " already names a namespace in " this-ns
                               " - a JavaScript module needs an alias of its own.")))
-    (env/add-js-alias! cenv this-ns as specifier))
+    (env/add-js-alias! cenv this-ns as specifier path))
   (env/add-js-refers! cenv this-ns
                       (into {} (map (fn [[sym export]] [sym [specifier export]]))
                             refers)))
@@ -2199,7 +2277,13 @@
 
   `export` is a String and not a symbol: it is JavaScript's name for the thing,
   which is why :rename can change what this namespace calls it without changing
-  this."
+  this.
+
+  It may be a DOTTED PATH rather than one name, and only because a specifier may
+  ask for one: [\"date-fns/sub$default\" :refer [x]] reads default.x off the
+  module. check-js-name! takes a path already - it is the shape js/a.b.c has -
+  and so does the emitter, which spells each segment the host's way and joins
+  them with the dots they were written with."
   [env specifier export form]
   (check-js-name! (symbol export))
   {:op :js-module-var :form form :env env :children []
@@ -2484,7 +2568,11 @@
       ;; ns form said stands for a module is that module, whatever else the
       ;; session happens to hold under it.
       (contains? (env/js-aliases cenv env/*current-ns*) nsym)
-      (let [specifier (get (env/js-aliases cenv env/*current-ns*) nsym)
+      ;; [specifier path], the path being the $ sugar: sub/foo where the ns form
+      ;; said ["date-fns/sub$default" :as sub] is the property foo of the property
+      ;; default, and the only difference it makes is what the export path starts
+      ;; from.
+      (let [[specifier path] (get (env/js-aliases cenv env/*current-ns*) nsym)
             nm        (name sym)
             dot       (.indexOf nm ".")]
         (if (pos? dot)
@@ -2497,7 +2585,7 @@
                            (with-meta (symbol (str nsym) (subs nm 0 dot))
                              (meta sym))
                            (rest (clojure.string/split nm #"\."))))
-          (js-module-var-node env specifier nm form)))
+          (js-module-var-node env specifier (js-export-path path nm) form)))
 
       ;; PersistentVector/EMPTY - the namespace part names a VAR rather than a
       ;; namespace, so the whole symbol is that value and a property of it. Asked
@@ -2761,7 +2849,12 @@
           ;; itself. Beside the :import alias below, and read the same way: a name
           ;; the ns form gave to something, used as a value.
           (contains? (env/js-aliases cenv env/*current-ns*) sym)
-          (js-module-node env (get (env/js-aliases cenv env/*current-ns*) sym) sym)
+          ;; the module itself, or - when the specifier's $ named a path into it -
+          ;; what sits at that path, which is a property read and not a module
+          (let [[specifier path] (get (env/js-aliases cenv env/*current-ns*) sym)]
+            (if path
+              (js-module-var-node env specifier path sym)
+              (js-module-node env specifier sym)))
 
           :else
           (if-let [^Namespace aliased (.lookupAlias here sym)]

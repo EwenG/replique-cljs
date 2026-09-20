@@ -123,9 +123,11 @@
   What is refused is what could not be a file under this root, or could be the
   wrong one: a relative or absolute specifier (a different feature - a file beside
   the source rather than a package), a . or .. segment, an empty segment, a
-  trailing slash, and anything a URL cannot carry unescaped. js-alias is called
-  for its preconditions besides, so a specifier that cannot be a JavaScript name
-  is refused here rather than at emission - exactly as ns->path calls ns-alias.
+  trailing slash, a $ (the sugar for a property path, which the analyzer has
+  already split off - see below), and anything a URL cannot carry unescaped.
+  js-alias is called for its preconditions besides, so a specifier that cannot be
+  a JavaScript name is refused here rather than at emission - exactly as ns->path
+  calls ns-alias.
 
   Two specifiers differing only in case would be one file on macOS, as two
   namespaces would (doc/cljs-output-layout.md 4). Not detected here: npm names
@@ -148,16 +150,16 @@
                 " not something this compiler resolves.")))
     (when (str/ends-with? specifier "/")
       (bad "a specifier names a module, and a trailing slash names a directory."))
-    ;; "date-fns/sub$default". ClojureScript reads a $ in a string require as a
-    ;; property path into the module, because its mechanism had no other way to
-    ;; ask for one - and a package name never contains one. Here there IS another
-    ;; way, so this is refused rather than resolved: taken literally it would name
-    ;; a file no bundler builds, and a 404 at load is a worse answer than the
-    ;; sentence that says what to write instead.
+    ;; "date-fns/sub$default". A $ in a string require is the sugar for a property
+    ;; path INTO the module (doc/cljs-npm.md 4.1), and the analyzer splits it off
+    ;; where the ns form is read - so what reaches a file name is the module half
+    ;; alone, and a $ arriving here is an unsplit specifier rather than a package
+    ;; (npm has no $ in a name). Taken literally it would name a file no bundler
+    ;; builds: a 404 at load, in place of this sentence.
     (when (str/includes? specifier "$")
-      (bad (str "a $ in a specifier names something INSIDE the module - write"
-                " [\"" (first (str/split specifier #"\$")) "\" :default x] or"
-                " :refer [x] instead.")))
+      (bad (str "a $ in a specifier names a path INSIDE the module, which is not"
+                " part of any file name - the module this one names is "
+                (pr-str (first (str/split specifier #"\$"))) ".")))
     (when (some #{"" "." ".."} (str/split specifier #"/" -1))
       (bad "every segment of it has to be a name."))
     ;; LAST, not first as ns->path calls ns-alias: the checks above say what is
