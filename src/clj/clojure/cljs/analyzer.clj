@@ -1318,10 +1318,12 @@
   (when-not (goog/known? target)
     (analysis-error
      spec
-     (str "No such Closure namespace: " target ". This fork ships a SUBSET of the"
-          " Closure Library - " (clojure.string/join ", " (sort (keys (goog/index))))
-          ". To add one: vendor the file into clojure/cljs/goog and add it to"
-          " clojure.cljs.goog/files.")))
+     (if goog/*closure-library*
+       (str "No such Closure namespace: " target
+            ". The Closure Library on the classpath does not provide it.")
+       (str "No such Closure namespace: " target ". This fork ships a SUBSET of the"
+            " Closure Library - " (clojure.string/join ", " (sort (keys (goog/index))))
+            ". To get the rest: " (goog/get-real-closure)))))
   (when (seq refers)
     (analysis-error
      spec
@@ -2266,10 +2268,12 @@
       gns
       (analysis-error form
                       (str "No such namespace: " gns
-                           ". This fork ships a subset of the Closure Library,"
-                           " and that name is not in it. To get it: vendor what you"
-                           " need into clojure/cljs/goog and add it to"
-                           " clojure.cljs.goog/files."))
+                           (if goog/*closure-library*
+                             (str ". The Closure Library on the classpath does not"
+                                  " provide it.")
+                             (str ". This fork ships a subset of the Closure Library,"
+                                  " and that name is not in it. To get it: "
+                                  (goog/get-real-closure)))))
 
       ;; PersistentVector/EMPTY - the namespace part names a VAR rather than a
       ;; namespace, so the whole symbol is that value and a property of it. Asked

@@ -123,17 +123,17 @@
   (slurp (io/resource prelude-resource)))
 
 (defn write-prelude!
-  "Write what any output directory needs: runtime.js, the package.json that makes
-  node read a .js file under this root as an ES module rather than as CommonJS,
-  and the Closure Library subset under goog/. One package.json covers the whole
-  tree, ns-dir and goog/ included.
+  "Write what any output directory needs before anything is compiled into it:
+  runtime.js, the package.json that makes node read a .js file under this root as
+  an ES module rather than as CommonJS, and the two Closure files that are ours -
+  base.js, which every converted goog file imports, and goog.js, which a require
+  of the bare name fetches. One package.json covers the whole tree, ns-dir and the
+  goog tree included.
 
-  The goog subset is here rather than at a caller because it is not optional in
-  the way a transport is: cljs.core requires seven goog namespaces, so every
-  output directory that will ever hold cljs.core needs it, and that is all of
-  them. It costs 13 files of text to write and nothing to leave unimported - a
-  module nobody imports is never evaluated. See clojure.cljs.goog for what is in
-  it and why it is a subset.
+  THE REST OF THE GOOG TREE IS NOT WRITTEN HERE, and that is the difference between
+  a subset and a library. What has to be written is the closure of what was actually
+  required, which is known after compiling rather than before - see `ensure-goog!`,
+  which the driver calls on its way out.
 
   Read from the classpath on each call rather than cached, so editing runtime.js
   or a goog file and starting a new runtime is enough to see the change.
@@ -147,5 +147,23 @@
     (.mkdirs dir)
     (spit (File. dir prelude-name) (prelude-source))
     (spit (File. dir "package.json") "{\"type\": \"module\"}\n")
-    (goog/write-goog! dir)
+    (goog/write-goog! dir [])
+    dir))
+
+(defn ensure-goog!
+  "Write into `dir` the Closure files the namespaces `required` name, and what those
+  require in turn.
+
+  `required` is any collection of namespace symbols - a whole requires set, goog
+  names and ClojureScript names mixed - because that is what its callers have, and
+  telling them apart is this function's job rather than theirs.
+
+  Called where a module's imports or a script's requires have just been decided:
+  both spell a goog name as a path under this root, and a path that nothing wrote
+  is a 404 at load. Cheap to call often - in library mode nothing is converted
+  twice (clojure.cljs.goog/written), and in subset mode there are twenty files."
+  [dir required]
+  (let [names (into [] (comp (filter goog/goog-ns?) (map str) (distinct)) required)]
+    (when (seq names)
+      (goog/write-goog! dir names))
     dir))

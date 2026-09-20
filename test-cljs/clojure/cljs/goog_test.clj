@@ -99,7 +99,7 @@
   ;; A provide is declared in exactly one place - the file that provides it - so
   ;; adding a file to the subset means adding its path and nothing else.
   (let [idx (goog/index)]
-    (are [n path] (= path (get idx n))
+    (are [n path] (= path (:path (get idx n)))
       "goog.math.Long"           "math/long.js"
       "goog.math.Integer"        "math/integer.js"
       "goog.object"              "object/object.js"
@@ -118,7 +118,7 @@
       "goog"                     "goog.js")
     ;; base.js is not in it: it is the file the others import, and it provides
     ;; nothing they can require
-    (is (not (contains? (set (vals idx)) "base.js")))
+    (is (not (contains? (set (map :path (vals idx))) "base.js")))
     ;; and it is kept out by index and convert excluding it, NOT by its header
     ;; being unparseable - a file in this tree that parse would refuse is a trap
     ;; for whoever next changes which files are parsed
@@ -137,6 +137,15 @@
 
 ;; --- the rewrite ------------------------------------------------------------
 
+(defn- provide-of
+  "The name `path` is converted under - what `convert` takes, where `files` holds
+  paths. One file can provide several names and is written under the first (see
+  clojure.cljs.goog/canonical); this finds that one."
+  [idx path]
+  (first (for [[n entry] idx
+               :when (and (= path (:path entry)) (= n (goog/canonical entry)))]
+           n)))
+
 (deftest test-exactly-one-line-is-added-at-the-top
   ;; The property a stack trace through goog.math.Long is read against: line N of
   ;; the vendored file is line N+1 here. It is why the header is one long line
@@ -145,8 +154,7 @@
     (doseq [path (remove #{goog/base} goog/files)]
       (testing path
         (let [src  (str/split-lines (goog/source path))
-              out  (str/split-lines (goog/convert path idx))
-              ]
+              out  (str/split-lines (goog/convert (provide-of idx path) idx))]
           ;; one at the top and one at the bottom, and convert ends with a newline
           ;; so split-lines is even with the source
           (is (= (+ (count src) 2) (count out)))
@@ -159,7 +167,7 @@
     (doseq [path vendored]
       (testing path
         (let [src (str/split-lines (goog/source path))
-              out (rest (str/split-lines (goog/convert path idx)))]
+              out (rest (str/split-lines (goog/convert (provide-of idx path) idx)))]
           (doseq [[a b] (map vector src out)]
             ;; either untouched, or blanked because it was one of the header
             ;; lines the rewrite consumes: a require (bare or bound), the
@@ -174,7 +182,7 @@
   ;; const asserts = goog.require('goog.asserts') has to keep working as a
   ;; binding, because the body calls asserts.assert - so the import carries the
   ;; ORDER and the const carries the NAME, and they are separate lines.
-  (let [out (goog/convert "math/long.js" (goog/index))
+  (let [out (goog/convert "goog.math.Long" (goog/index))
         header (first (str/split-lines out))]
     ;; ../asserts.js, not ../asserts/asserts.js: the specifier is computed over the
     ;; OUTPUT tree, which is laid out by provide name (goog.asserts ->
@@ -189,7 +197,7 @@
   ;; goog.math.Long IS the Long constructor, not a namespace holding one, and the
   ;; assignment has to come after the whole body: exports is reassigned at
   ;; long.js:758 but constants are still being hung on Long below it.
-  (let [out (goog/convert "math/long.js" (goog/index))]
+  (let [out (goog/convert "goog.math.Long" (goog/index))]
     (is (= "goog.expose('goog.math.Long', exports);"
            (last (remove str/blank? (str/split-lines out)))))
     (is (str/includes? (first (str/split-lines out)) "let exports = {};")))
@@ -198,7 +206,7 @@
   ;; goog.provide('goog.math.Integer') makes an empty object that the body then
   ;; replaces with the constructor, so registering any earlier files the empty one
   ;; away and (Integer.) fails with "not a constructor"
-  (let [out (goog/convert "math/integer.js" (goog/index))]
+  (let [out (goog/convert "goog.math.Integer" (goog/index))]
     (is (not (str/includes? out "goog.expose")))
     (is (= "goog.register('goog.math.Integer');"
            (last (remove str/blank? (str/split-lines out)))))))
@@ -222,9 +230,34 @@
   (are [src] (thrown-with-msg? Exception #"Unrecognised Closure header line"
                                (goog/parse src))
     "goog.require('goog.foo', 'extra');"
-    "goog.requireType('goog.foo');"
-    "const {a, b} = goog.require('goog.foo');"
     "goog.provide('goog.foo')")          ; no semicolon
+
+  ;; A TRAILING COMMENT IS NOT A DIFFERENT SHAPE. goog/promise/promise.js writes
+  ;; `const GoogPromise = goog.requireType('goog.Promise');  // for the type
+  ;; reference.`, and a grammar that ended at the semicolon refused the file rather
+  ;; than reading it - which is what refusing anything unrecognised costs when the
+  ;; recogniser is too narrow.
+  (are [src expected] (= expected (:requires (goog/parse src)))
+    "goog.require('goog.b');  // why"
+    [{:name "goog.b"}]
+
+    "const B = goog.requireType('goog.b'); // for the type reference."
+    [{:name "goog.b" :binding "B" :type-only? true}])
+  (is (= ["goog.a"] (:provides (goog/parse "goog.provide('goog.a');  // a comment"))))
+
+  ;; and closed is not the same as narrow. These three are what the library writes
+  ;; and the subset never did - a destructured require, and a requireType with a
+  ;; binding or without one - so each is read rather than refused, and each carries
+  ;; what convert needs to tell it from a load.
+  (are [src expected] (= expected (:requires (goog/parse src)))
+    "const {a, b} = goog.require('goog.foo');"
+    [{:name "goog.foo" :binding "{a, b}"}]
+
+    "goog.requireType('goog.foo');"
+    [{:name "goog.foo" :type-only? true}]
+
+    "const Foo = goog.requireType('goog.foo');"
+    [{:name "goog.foo" :binding "Foo" :type-only? true}])
   ;; and a goog.require inside a COMMENT is body, not header. This is not
   ;; hypothetical tidiness: the vendored files mention goog.require in their
   ;; docstrings, and a rule that matched them would refuse the tree it exists to
@@ -408,6 +441,7 @@
   (let [dir (h/temp-dir)]
     (try
       (clojure.cljs.output/write-prelude! dir)
+      (clojure.cljs.output/ensure-goog! dir '[goog.math.Long])
       (is (.isFile (java.io.File. dir "goog-subset/goog/math/Long.js")))
       (is (not (.exists (java.io.File. dir "goog"))))
       (finally (h/delete-tree! dir)))))
@@ -678,3 +712,221 @@
          (module-output
           "(ns app.core (:require [goog.string :as gstring] [goog.string.format]))
            (def out (gstring/format \"%s-%d-%.2f\" \"a\" 7 1.5))"))))
+
+;; --- the Closure Library, when a project has one -----------------------------
+;;
+;; The same jar the vendored files are diffed against, used the other way round:
+;; there as the thing `vendored` must still equal, here as the tree a project
+;; compiles against instead of the subset. So these run wherever those do.
+
+(defmacro ^:private with-library
+  "Run `body` against the Closure Library on the classpath.
+
+  `binding` rather than `use-closure-library!`, which alters the root: a test that
+  set the mode for the process would decide it for every test after it."
+  [& body]
+  `(binding [goog/*closure-library* true] ~@body))
+
+(h/deftest-when closure-library? test-the-library-index-is-its-own-deps-js
+  ;; 1,609 goog.addDependency lines, which is the library saying where every name
+  ;; it has lives - so nothing here walks a directory, which a jar has none of.
+  (with-library
+    (let [idx (goog/index)]
+      (are [n path] (= path (:path (get idx n)))
+        ;; names the subset does not have, which is the whole point
+        "goog.style"     "style/style.js"
+        "goog.net.XhrIo" "net/xhrio.js"
+        "goog.date"      "date/date.js"
+        "goog.functions" "functions/functions.js"
+        ;; and one it does, from the other tree
+        "goog.object"    "object/object.js")
+      (is (< 1000 (count idx)))
+      ;; goog.js stays ours in both modes: the library has no file that provides
+      ;; the bare name, because there base.js IS that name - and base.js is ours
+      (is (= {:root goog/root :path "goog.js"}
+             (select-keys (get idx "goog") [:root :path]))))))
+
+(h/deftest-when closure-library? test-the-tree-in-use-is-chosen-not-detected
+  ;; A project that has google-closure-library on its classpath - which anything
+  ;; depending on ClojureScript does - must not silently start compiling against a
+  ;; different Closure than it compiled against yesterday. This whole test file
+  ;; runs with one on the classpath, and the default is still the subset.
+  (is (false? goog/*closure-library*))
+  (is (not (goog/known? 'goog.style)))
+  (with-library (is (goog/known? 'goog.style)))
+  ;; and the error for a name the subset lacks says which of the two answers is
+  ;; true of this classpath
+  (is (str/includes? (goog/get-real-closure) ":closure-library"))
+  (is (str/includes? (goog/get-real-closure) "on your classpath")))
+
+(deftest test-the-mode-can-be-set-for-a-process
+  ;; What a build or a REPL calls once from its options, where the tests bind. Put
+  ;; back in a finally, because this one alters the root: a test that left it set
+  ;; would decide the mode of every test after it.
+  (try
+    (goog/use-closure-library! true)
+    (is (true? goog/*closure-library*))
+    (finally (goog/use-closure-library! false)))
+  (is (false? goog/*closure-library*)))
+
+(h/deftest-when closure-library? test-only-what-we-truncated-is-policed
+  ;; The reductions and the placeholder are things WE removed, so they are ours to
+  ;; report. In library mode nothing is removed and there is nothing to report -
+  ;; the file being converted is the real one, and a var it does not have is the
+  ;; Closure Library's business.
+  (is (thrown-with-msg? Exception #"reduction" (goog/check-var! "goog.string" "format")))
+  (is (thrown-with-msg? Exception #"placeholder" (goog/check-var! "goog.Uri" "parse")))
+  (with-library
+    (is (nil? (goog/check-var! "goog.string" "format")))
+    (is (nil? (goog/check-var! "goog.Uri" "parse")))))
+
+(deftest test-only-what-is-required-is-written
+  ;; What made the subset writable whole is that it is twenty files. The library is
+  ;; 1,600, so what is written is the closure of what was required and nothing else
+  ;; - which is also why write-goog! takes names at all.
+  (let [dir (h/temp-dir)]
+    (try
+      (goog/write-goog! dir ["goog.object"])
+      (is (.isFile (io/file dir "goog-subset/goog/object.js")))
+      ;; always, in both modes: the file every converted file imports, and the file
+      ;; a require of the bare name fetches
+      (is (.isFile (io/file dir "goog-subset/base.js")))
+      (is (.isFile (io/file dir "goog-subset/goog.js")))
+      ;; and nothing else. goog.math.Long is in the subset and nobody asked for it
+      (is (not (.exists (io/file dir "goog-subset/goog/math/Long.js"))))
+      (finally (h/delete-tree! dir)))))
+
+(deftest test-a-require-is-followed-and-a-requiretype-is-not
+  ;; A requireType says this file names that type in a comment. Closure's own
+  ;; loader does not fetch it, and neither does this: it contributes a binding when
+  ;; it has one, so the annotations still parse, and nothing to the closure.
+  (let [parsed (goog/parse "goog.provide('goog.a');\ngoog.require('goog.b');\ngoog.requireType('goog.c');\n")]
+    (is (= [{:name "goog.b"} {:name "goog.c" :type-only? true}] (:requires parsed))))
+  (when closure-library?
+    (with-library
+      (let [idx  (goog/index)
+            out  (goog/convert "goog.style" idx)
+            head (first (str/split-lines out))]
+        ;; goog/style/style.js requires goog.dom and requireTypes goog.events.Event
+        (is (str/includes? head "import \"./dom.js\";"))
+        (is (not (str/includes? head "events/Event.js")))
+        ;; and it is not in what has to be on disk either
+        (is (contains? (goog/closure idx ["goog.style"]) "goog.dom"))
+        (is (not (contains? (goog/closure idx ["goog.style"]) "goog.events.Event")))))))
+
+(h/deftest-when closure-library? test-a-module-is-exposed-with-or-without-a-legacy-name
+  ;; 781 of the library's files are goog.module and 91 declare a legacy namespace.
+  ;; Under Closure that declaration decides whether a global is created; here every
+  ;; namespace is a property of the goog object either way, so it decides nothing -
+  ;; and a converter that refused the other 690 could not convert the library.
+  (with-library
+    (let [idx (goog/index)
+          out (goog/convert "goog.async.promises" idx)]
+      (is (not (str/includes? out "declareLegacyNamespace")))
+      (is (str/includes? out "let exports = {};"))
+      (is (= "goog.expose('goog.async.promises', exports);"
+             (last (remove str/blank? (str/split-lines out))))))))
+
+(h/deftest-when closure-library? test-a-file-that-provides-several-names-is-written-once
+  ;; 193 of the library's entries provide more than one name - a namespace and the
+  ;; nested names under it. ns->path is a pure function of a NAME, because
+  ;; runtime.js computes a URL from one with nothing to ask the JVM, so those are
+  ;; two paths and only one of them can hold the body.
+  (with-library
+    (let [idx   (goog/index)
+          entry (get idx "goog.editor.range.Point")]
+      (is (= "goog.editor.range" (goog/canonical entry)))
+      ;; the other path is an import of the one that has the body, and nothing else
+      (is (= "import \"../range.js\";\n" (goog/stub "goog.editor.range.Point" entry)))
+      ;; and the body registers both, because it is the only place the second one
+      ;; is ever registered from
+      (let [out (goog/convert "goog.editor.range" idx)]
+        (is (str/includes? out "goog.register('goog.editor.range');"))
+        (is (str/includes? out "goog.register('goog.editor.range.Point');")))
+      ;; A STUB DRAGS IN THE FILE IT IMPORTS. Asking for the second name alone has
+      ;; to put the first on disk, because nothing else will: the program never
+      ;; names it and no other file requires it. goog.debug.entryPointRegistry is
+      ;; the case that found this - goog.net.XhrIo reaches it, and the file is
+      ;; written under goog.debug.EntryPointMonitor.
+      (is (contains? (goog/closure idx ["goog.debug.entryPointRegistry"])
+                     "goog.debug.EntryPointMonitor")))))
+
+(defn- node
+  "Run `f` under node. Its trimmed stdout, or \"THREW: <message>\"."
+  [^java.io.File f]
+  (let [{:keys [out err exit]} (sh/sh "node" (.getPath f))]
+    (if (zero? exit) (str/trim out) (str "THREW: " (str/trim err)))))
+
+(h/deftest-when (and h/node? closure-library?) test-the-library-compiles-and-runs
+  ;; The end of it, through every piece at once: a namespace requiring two Closure
+  ;; namespaces the subset does not have, compiled with :closure-library true, its
+  ;; files converted out of the jar on demand, imported by node and called.
+  ;;
+  ;; goog.crypt.base64 is a goog.provide file with a chain behind it - goog.crypt,
+  ;; goog.userAgent and what those reach - so what this really runs is the closure,
+  ;; not one file.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{probe.core "(ns probe.core
+                             (:require [goog.functions :as gfunc]
+                                       [goog.crypt.base64 :as b64]))
+                           (defn run [] (str (b64/encodeString \"hi\") \"-\" ((gfunc/constant 5))))"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv   (env/compile-env {:ns 'cljs.user})
+            result (driver/compile-namespace! cenv 'probe.core
+                                              {:out-dir out
+                                               :closure-library true
+                                               :source-paths [src]})
+            entry  (io/file out "check.mjs")]
+        (is (= '[cljs.core probe.core] (:compiled result)))
+        ;; converted out of the jar, at the path a name gives rather than Closure's
+        (is (.isFile (io/file out "goog-subset/goog/crypt/base64.js")))
+        (is (.isFile (io/file out "goog-subset/goog/functions.js")))
+        (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
+                         "import \"./ns/probe/core.js\";\n"
+                         "console.log($ns(\"probe.core\").run());\n"))
+        (is (= "aGk=-5" (node entry))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(h/deftest-when h/node? test-base-js-has-what-the-library-reaches-for
+  ;; Sixteen functions and one object, added to base.js because the library's bodies
+  ;; call them and the subset's never did. The list was measured over its 1,604
+  ;; non-test files - goog.setTestOnly in 744 of them, getCssName in 570, bind in
+  ;; 457 - rather than guessed.
+  ;;
+  ;; TESTED AS A SURFACE, not through a program that happens to use it. A program
+  ;; reaches four or five of these, and the one it does not reach is exactly the one
+  ;; that could be missing: taking goog.bind out of base.js broke nothing anywhere
+  ;; else in this file, which is what said this test had to exist.
+  (is (= "ok" (goog-js [] "
+     const eq = (a, b, what) => { if (a !== b) throw new Error(what + ': ' + a + ' != ' + b); };
+     eq(goog.bind(function(x){ return this.n + x; }, {n: 1})(2), 3, 'bind');
+     eq(typeof goog.now(), 'number', 'now');
+     eq(goog.getCssName('a-b'), 'a-b', 'getCssName');
+     eq(goog.getCssName('a', 'b'), 'a-b', 'getCssName/2');
+     eq(goog.getMsg('{$who} said', {who: 'x'}), 'x said', 'getMsg');
+     eq(goog.setTestOnly('x'), undefined, 'setTestOnly');
+     eq(goog.isDateLike(new Date()), true, 'isDateLike');
+     eq(goog.isDateLike(1), false, 'isDateLike/2');
+     let scoped = 0; goog.scope(function(){ scoped = 1; }); eq(scoped, 1, 'scope');
+     goog.exportSymbol('a.b.c', 7, globalThis); eq(globalThis.a.b.c, 7, 'exportSymbol');
+     eq(goog.getObjectByName('a.b.c', globalThis), 7, 'getObjectByName');
+     eq(goog.getObjectByName('a.nope.c', globalThis), null, 'getObjectByName/2');
+     const o = {}; goog.exportProperty(o, 'p', 8); eq(o.p, 8, 'exportProperty');
+     eq(goog.cloneObject({a: {b: 1}}).a.b, 1, 'cloneObject');
+     const u = {}; eq(goog.hasUid(u), false, 'hasUid');
+     goog.getUid(u); eq(goog.hasUid(u), true, 'hasUid/2');
+     goog.removeUid(u); eq(goog.hasUid(u), false, 'removeUid');
+     function C(){}; goog.addSingletonGetter(C);
+     eq(C.getInstance(), C.getInstance(), 'addSingletonGetter');
+     // null under node, which has no Trusted Types - the branch every caller handles
+     eq(goog.createTrustedTypesPolicy('x'), null, 'createTrustedTypesPolicy');
+     goog.setCssNameMapping({a: 'z'}); eq(goog.getCssName('a'), 'z', 'setCssNameMapping');
+     goog.setCssNameMapping(null);
+     console.log('ok');")))
+  ;; goog.module.get is the one that is an object rather than a function: a module
+  ;; inside a goog.scope reaches what it required with it, and what it hands back is
+  ;; what goog.expose assigned.
+  (is (= "true" (goog-js ["goog.string"]
+                         "console.log(goog.module.get('goog.string') === goog.string);"))))

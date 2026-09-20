@@ -288,8 +288,11 @@
   is the file whose imports and prologue we most want to be the real ones.
 
   The prelude is written a second time here, over the runtime.js that runtime-dir
-  already put there: identical text, plus the goog subset, which cljs.core requires
-  seven of and which write-runtime! has no reason to write.
+  already put there: identical text, and the two Closure files that are always
+  written. The REST of the Closure tree is ensured afterwards, from what cljs.core
+  turned out to require - this is the one place that writes a module without going
+  through the driver, so it is the one place that has to do the driver's job of
+  making a module's goog imports resolve (clojure.cljs.output/ensure-goog!).
 
   EVERY form, and no skipping. This held a pinned set of the two forms that did not
   compile - a fixture quietly tolerating a third would make every test using it
@@ -313,7 +316,8 @@
                                                  (ana/analyze-top cenv aenv form))))))))]
               (.mkdirs (.getParentFile f))
               (.deleteOnExit f)
-              (spit f (#'driver/module-text cenv 'cljs.core body))))))
+              (spit f (#'driver/module-text cenv 'cljs.core body))
+              (output/ensure-goog! @runtime-dir (env/requires cenv 'cljs.core))))))
       {:file f :cenv cenv})))
 
 (def ^:private core-env-counter (atom 0))

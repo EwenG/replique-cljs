@@ -52,6 +52,7 @@
             [clojure.cljs.driver :as driver]
             [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
+            [clojure.cljs.goog :as cgoog]
             [clojure.cljs.names :as names]
             [clojure.cljs.source-info :as si]
             [clojure.cljs.source-map :as sm]
@@ -279,7 +280,8 @@
   //# sourceURL and no map."
   ([cenv form] (compile-form cenv form nil nil))
   ([cenv form text opts]
-   (names/with-name-scope
+   (binding [cgoog/*closure-library* (cgoog/library-option opts)]
+    (names/with-name-scope
      (let [m     (meta form)
            node  (ana/analyze-top cenv (env/analysis-env cenv) (remembering cenv form))
            nsym  env/*current-ns*
@@ -288,8 +290,15 @@
            label (str base ".cljs")
            node  (cond-> node map? (si/source-info (assoc m :file label)))
            body  (emitter/emit-top-lines node emitter/return-value)
+           reqs  (env/requires cenv nsym)
+           ;; The prologue below spells a goog require as an await $CLJS.require,
+           ;; which fetches it from the output directory by path - so the file has
+           ;; to be there. A require typed at a REPL compiles no ClojureScript at
+           ;; all when what it names is a goog namespace, so the driver's own call
+           ;; never happens and this is the only one that can.
+           _     (when (:out-dir opts) (output/ensure-goog! (:out-dir opts) reqs))
            chunk (emitter/script
-                  (into (emitter/script-prologue nsym (env/requires cenv nsym)) body)
+                  (into (emitter/script-prologue nsym reqs) body)
                   (str base ".js")
                   ;; a bare name, so it resolves against the script's own URL the
                   ;; way a module's does against the module's (driver/map-name)
@@ -301,7 +310,7 @@
                       :positions (rebased (sm/line-positions chunk)
                                           (:line m) (or (:column m) 1))
                       :content   {label text}})))
-       (sm/text chunk)))))
+       (sm/text chunk))))))
 
 (def nil-result
   "What a form evaluated for its effect on the JVM comes back as. The REPL specials

@@ -63,6 +63,7 @@
   See doc/cljs-compiler.md M3."}
   clojure.cljs.driver
   (:require [clojure.cljs.analyzer :as ana]
+            [clojure.cljs.goog :as cgoog]
             [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
             [clojure.cljs.names :as names]
@@ -482,8 +483,24 @@
     ;; restoring means the move is discarded by the scope ending, so a require
     ;; typed at a REPL cannot silently move the user (repl-test).
     (env/with-current-ns env/*current-ns*
-      (binding [emitter/*static-dispatch* (boolean (:static-dispatch opts))]
-        (select-keys (f opts) [:compiled :written :scripts])))))
+      (binding [emitter/*static-dispatch* (boolean (:static-dispatch opts))
+                cgoog/*closure-library* (cgoog/library-option opts)]
+        (let [result (select-keys (f opts) [:compiled :written :scripts])]
+          ;; AFTER, not before: which Closure files have to be on disk is decided by
+          ;; what was compiled, and the prelude runs before anything is. Every module
+          ;; this run wrote imports its goog requires by path, so this is what makes
+          ;; those paths resolve. See clojure.cljs.output/ensure-goog!.
+          ;;
+          ;; EVERY NAMESPACE IN THE ENVIRONMENT, not the ones this run compiled. A
+          ;; compile env outlives an output directory - the same session compiles
+          ;; into a fresh one every time a runtime is started - so a run that
+          ;; compiled nothing because everything was already analysed still has to
+          ;; fill a directory that has none of it. The set is small and the writes
+          ;; are skipped when the files are already there.
+          (output/ensure-goog! (:out-dir opts)
+                               (mapcat #(env/requires cenv (.getName ^clojure.lang.Namespace %))
+                                       (env/all-cljs-ns cenv)))
+          result)))))
 
 (defn compile-namespace!
   "Compile `ns-sym` and everything it requires into an output directory.

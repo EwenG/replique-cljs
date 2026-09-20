@@ -190,3 +190,179 @@ goog.register ??= register;
 // which files are parsed, and the cost of not being one is this comment.
 goog.provide('goog');
 register('goog');
+
+// --- what the whole Closure Library reaches for ------------------------------
+//
+// Everything above is what the SUBSET's files and cljs.core need. A project that
+// compiles against a real Closure Library (clojure.cljs.goog/*closure-library*)
+// converts files nobody here chose, and their bodies call base.js functions the
+// subset never did. Measured over the library's 1,604 non-test files, these are
+// all of them, with how many files call each:
+//
+//     goog.setTestOnly 744   getCssName 570   bind 457   getMsg 378   now 82
+//     exportSymbol 70   addSingletonGetter 45   getObjectByName 38   scope 18
+//     defineClass 12    exportProperty 10   cloneObject 8   setCssNameMapping 7
+//     createTrustedTypesPolicy 6   removeUid/hasUid 6   isDateLike 19
+//
+// Copied from Closure's base.js rather than paraphrased, for the reason goog.typeOf
+// above is: these are contracts library code depends on. Where the original reaches
+// a private helper of base.js - exportPath_, cssNameMapping_, identity_,
+// instantiatedSingletons_ - the helper is inlined, because those exist to serve the
+// debug loader and the compiler, neither of which is here. Each one that is not a
+// straight copy says so.
+//
+// goog.defineClass is NOT here. It is a compiler directive with a runtime fallback
+// of some size, and no file in the library calls it outside its own tests; the day
+// one does, the error names it, which is better than a paraphrase nobody checked.
+
+// A no-op: goog.DISALLOW_TEST_ONLY_CODE is a define the compiler sets, and there is
+// no compilation pass here to set it.
+goog.setTestOnly ??= function(opt_message) {};
+
+// goog.module.get(name), which a file inside a goog.scope uses to reach a module it
+// required - nine of the library files do it. An OBJECT rather than a function,
+// because the goog.module(...) header line it would otherwise shadow is blanked by
+// the rewrite and never called: see clojure.cljs.goog/convert.
+//
+// What it returns is what goog.expose assigned, which is what the requirer would
+// have bound with const - so this and a bound require are two spellings of one
+// thing, as they are under Closure.
+goog.module ??= {};
+goog.module.get ??= function(name) {
+  let o = goog;
+  for (const part of name.split(".").slice(1)) { o = o[part]; if (o == null) return null; }
+  return o;
+};
+
+goog.now ??= function() { return Date.now(); };
+
+// The native path of Closure's goog.bind, which is the one it installs on every
+// engine of this century.
+goog.bind ??= function(fn, selfObj, var_args) {
+  return fn.call.apply(fn.bind, arguments);
+};
+
+goog.getObjectByName ??= function(name, opt_obj) {
+  var parts = name.split('.');
+  var cur = opt_obj || goog.global;
+  for (var i = 0; i < parts.length; i++) {
+    cur = cur[parts[i]];
+    if (cur == null) { return null; }
+  }
+  return cur;
+};
+
+goog.exportProperty ??= function(object, publicName, symbol) {
+  object[publicName] = symbol;
+};
+
+// exportPath_ inlined: walk the path, making the objects that are missing, and
+// assign at the end. The original's overwriteImplicit bookkeeping exists for the
+// compiler's benefit and decides nothing here.
+goog.exportSymbol ??= function(publicPath, object, objectToExportTo) {
+  var parts = publicPath.split('.');
+  var cur = objectToExportTo || goog.global;
+  for (var i = 0; i < parts.length - 1; i++) {
+    cur = cur[parts[i]] ??= {};
+  }
+  cur[parts[parts.length - 1]] = object;
+};
+
+// goog.scope's only job outside the compiler is to call its function. The original
+// also refuses to run inside a module loader, which is a state this has none of.
+goog.scope ??= function(fn) { fn.call(goog.global); };
+
+// instantiatedSingletons_ dropped: it is a DEBUG-only list, kept so that a test
+// harness can reset every singleton, and nothing here resets one.
+goog.addSingletonGetter ??= function(ctor) {
+  ctor.instance_ = undefined;
+  ctor.getInstance = function() {
+    if (ctor.instance_) { return ctor.instance_; }
+    return ctor.instance_ = new ctor;
+  };
+};
+
+goog.isDateLike ??= function(val) {
+  return goog.isObject(val) && typeof val.getFullYear == 'function';
+};
+
+goog.hasUid ??= function(obj) { return !!obj[goog.UID_PROPERTY_]; };
+
+goog.removeUid ??= function(obj) {
+  if (obj !== null && 'removeAttribute' in obj) {
+    obj.removeAttribute(goog.UID_PROPERTY_);
+  }
+  try { delete obj[goog.UID_PROPERTY_]; } catch (ex) {}
+};
+
+goog.cloneObject ??= function(obj) {
+  var type = goog.typeOf(obj);
+  if (type == 'object' || type == 'array') {
+    if (typeof obj.clone === 'function') { return obj.clone(); }
+    if (typeof Map !== 'undefined' && obj instanceof Map) { return new Map(obj); }
+    if (typeof Set !== 'undefined' && obj instanceof Set) { return new Set(obj); }
+    var clone = type == 'array' ? [] : {};
+    for (var key in obj) { clone[key] = goog.cloneObject(obj[key]); }
+    return clone;
+  }
+  return obj;
+};
+
+goog.getMsg ??= function(str, opt_values, opt_options) {
+  if (opt_options && opt_options.html) {
+    str = str.replace(/</g, '&lt;');
+  }
+  if (opt_options && opt_options.unescapeHtmlEntities) {
+    str = str.replace(/&lt;/g, '<')
+             .replace(/&gt;/g, '>')
+             .replace(/&apos;/g, "'")
+             .replace(/&quot;/g, '"')
+             .replace(/&amp;/g, '&');
+  }
+  if (opt_values) {
+    str = str.replace(/\{\$([^}]+)}/g, function(match, key) {
+      return (opt_values != null && key in opt_values) ? opt_values[key] : match;
+    });
+  }
+  return str;
+};
+
+// The CSS renaming map, which only a build sets. Unset, getCssName is identity -
+// which is what an uncompiled Closure does too.
+goog.cssNameMapping_ ??= null;
+
+goog.setCssNameMapping ??= function(mapping, opt_style) {
+  goog.cssNameMapping_ = mapping;
+  goog.cssNameMappingStyle_ = opt_style;
+};
+
+goog.getCssName ??= function(className, opt_modifier) {
+  if (String(className).charAt(0) == '.') {
+    throw new Error('className passed in goog.getCssName must not start with ".".' +
+                    ' You passed: ' + className);
+  }
+  var getMapping = function(cssName) {
+    return goog.cssNameMapping_ ? (goog.cssNameMapping_[cssName] || cssName) : cssName;
+  };
+  var rename = function(cssName) {
+    if (goog.cssNameMappingStyle_ == 'BY_WHOLE') { return getMapping(cssName); }
+    return cssName.split('-').map(getMapping).join('-');
+  };
+  return opt_modifier ? className + '-' + rename(opt_modifier) : rename(className);
+};
+
+// identity_ inlined. Returns null where the browser has no Trusted Types, which is
+// the branch every caller already handles.
+goog.createTrustedTypesPolicy ??= function(name) {
+  var factory = goog.global.trustedTypes;
+  if (!factory || !factory.createPolicy) { return null; }
+  var identity = function(s) { return s; };
+  try {
+    return factory.createPolicy(name, {
+      createHTML: identity, createScript: identity, createScriptURL: identity
+    });
+  } catch (e) {
+    if (goog.DEBUG) { console.error(e.message); }
+    return null;
+  }
+};
