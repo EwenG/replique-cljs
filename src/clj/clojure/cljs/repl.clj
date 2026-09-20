@@ -297,6 +297,14 @@
            ;; all when what it names is a goog namespace, so the driver's own call
            ;; never happens and this is the only one that can.
            _     (when (:out-dir opts) (output/ensure-goog! (:out-dir opts) reqs))
+           ;; and the same courtesy for the other tree, which we do NOT write: a
+           ;; string require this namespace made spells an await $CLJS.requireJs,
+           ;; and a module the bundler has not built is a 404 one line later.
+           ;; Said once per directory and specifier, so a session in a namespace
+           ;; whose package is missing is told once rather than once a form.
+           _     (when (:out-dir opts)
+                   (output/report-missing-js! (:out-dir opts)
+                                              (env/js-requires cenv nsym)))
            chunk (emitter/script
                   (into (emitter/script-prologue nsym reqs
                                                  (env/js-requires cenv nsym))
@@ -400,6 +408,13 @@
         targets (ana/ns-form-deps (list* 'ns 'repl [(cons :require specs)]))
         scripts (ordered-scripts cenv opts targets)]
     (ana/require-libs! cenv specs)
+    ;; A STRING REQUIRE COMPILES NOTHING, so the driver's own report never fires
+    ;; for one and this is the only place that can say it while the user is still
+    ;; looking at what they typed. Asked of the whole namespace rather than of
+    ;; these specs alone, because report-missing-js! is told once per specifier
+    ;; anyway and the question is the same one.
+    (output/report-missing-js! (:out-dir opts)
+                               (env/js-requires cenv env/*current-ns*))
     (ship! runtime
            (cond
              (:reload-all flags) scripts

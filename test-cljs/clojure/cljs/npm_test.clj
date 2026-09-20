@@ -284,8 +284,16 @@
         out (h/temp-dir)]
     (try
       (let [cenv   (env/compile-env {:ns 'cljs.user})
-            result (driver/compile-namespace! cenv 'probe.core
-                                              {:out-dir out :source-paths [src]})
+            ;; under h/warnings because npm/ is written BELOW, after the compile
+            ;; that reports what has to go in it - which is the real order, and
+            ;; the warning it produces is the next test's subject rather than this
+            ;; one's
+            box    (atom nil)
+            _      (h/warnings
+                    #(reset! box (driver/compile-namespace!
+                                  cenv 'probe.core
+                                  {:out-dir out :source-paths [src]})))
+            result @box
             entry  (io/file out "check.mjs")]
         ;; what a bundler has to build, reported rather than acted on
         (is (= ["@scope/pkg" "greeter" "greeter/loud"] (:js-requires result)))
@@ -354,7 +362,74 @@
                          (require '[\"greeter\" :as g :refer [shout]])
                          (g/hello \"a\")
                          (shout \"b\")"
-                        opts))))))
+                        opts))))
+          ;; AND THE OTHER HALF OF THE REPORT, which only a session reaches. A
+          ;; string require compiles nothing, so the driver never runs for one -
+          ;; these are the two places that can say a package is not there while
+          ;; the user is still looking at what they typed.
+          (is (str/includes?
+               (h/warnings
+                #(repl/eval-src cenv rt "(require '[\"nope\" :as n])" opts))
+               "npm/nope.js"))
+          (is (str/includes?
+               (h/warnings
+                #(repl/eval-src cenv rt "(ns app.other (:require [\"nope2\" :as n]))"
+                                opts))
+               "npm/nope2.js"))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(deftest test-the-report-says-what-the-bundler-still-owes
+  ;; The one question about npm/ this compiler can answer: not whether a package
+  ;; exists - that is the bundler's resolution to do - but whether the file we
+  ;; NAMED is on disk. On a first build into a fresh directory the answer is all of
+  ;; them, because this run is what produced the list.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{probe.core "(ns probe.core (:require [\"greeter\" :as g]
+                                                    [\"@scope/pkg\" :as p]))
+                           (defn run [] [g/hello p/answer])"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            box  (atom nil)
+            said (h/warnings
+                  #(reset! box (driver/compile-namespace!
+                                cenv 'probe.core
+                                {:out-dir out :source-paths [src]})))]
+        (is (= ["@scope/pkg" "greeter"] (:js-missing @box)))
+        ;; the specifier AND the path it will be looked for at, because the second
+        ;; is what the bundler has to be told and it is not the first
+        (is (str/includes? said "npm/greeter.js"))
+        (is (str/includes? said "npm/@scope/pkg.js"))
+        ;; now the bundler runs, and the same compile says nothing is owed
+        (write-npm! out)
+        (spit (io/file out (output/js->path "@scope/pkg")) "export const answer = 1;\n")
+        (let [again (h/warnings
+                     #(reset! box (driver/compile-namespace!
+                                   cenv 'probe.core
+                                   {:out-dir out :source-paths [src]})))]
+          (is (= [] (:js-missing @box)))
+          (is (= "" again))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(deftest test-a-missing-module-is-named-once
+  ;; A REPL evaluating form after form in a namespace whose package is not there
+  ;; should be told once, not once a form - so the report remembers what it has
+  ;; said about a directory.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{probe.core "(ns probe.core (:require [\"greeter\" :as g]))
+                           (defn run [] g/hello)"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            opts {:out-dir out :source-paths [src]}
+            once (h/warnings #(driver/compile-namespace! cenv 'probe.core opts))
+            twice (h/warnings #(driver/compile-namespace! cenv 'probe.core opts))]
+        (is (str/includes? once "greeter"))
+        (is (= "" twice))
+        ;; the ANSWER is still the answer, though - only the warning is once
+        (is (= ["greeter"] (output/missing-js out ["greeter"]))))
       (finally (h/delete-tree! src) (h/delete-tree! out)))))
 
 (h/deftest-when h/node? test-a-package-that-is-not-there
@@ -368,13 +443,19 @@
                            (defn run [] (n/f))"})
         out (h/temp-dir)]
     (try
-      (let [cenv (env/compile-env {:ns 'cljs.user})]
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            box  (atom nil)
+            said (h/warnings
+                  #(reset! box (driver/compile-namespace!
+                                cenv 'probe.core
+                                {:out-dir out :source-paths [src]})))]
         ;; it COMPILES: the bundle is built from this list, so refusing to compile
         ;; until the bundle exists would be a cycle with no way in
-        (is (= ["nowhere"]
-               (:js-requires (driver/compile-namespace!
-                              cenv 'probe.core
-                              {:out-dir out :source-paths [src]}))))
+        (is (= ["nowhere"] (:js-requires @box)))
+        ;; and it says so on the way out, naming the path it will look for - which
+        ;; is what the 404 below is worth avoiding
+        (is (= ["nowhere"] (:js-missing @box)))
+        (is (str/includes? said "npm/nowhere.js"))
         (spit (io/file out "check.mjs")
               "import \"./ns/probe/core.js\";\nconsole.log(\"ran\");\n")
         (let [said (node (io/file out "check.mjs"))]

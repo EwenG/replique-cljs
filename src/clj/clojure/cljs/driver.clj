@@ -526,7 +526,13 @@
           (output/ensure-goog! (:out-dir opts)
                                (mapcat #(env/requires cenv (.getName ^clojure.lang.Namespace %))
                                        (env/all-cljs-ns cenv)))
-          (assoc result :js-requires (vec js-req)))))))
+          ;; and the one thing that can be said about npm/ from here: which of
+          ;; those the bundler has not built yet. A warning rather than a failure,
+          ;; because on a first build into a fresh directory every one of them is
+          ;; missing - this run is what produced the list.
+          (assoc result
+                 :js-requires (vec js-req)
+                 :js-missing  (output/report-missing-js! (:out-dir opts) js-req)))))))
 
 (defn compile-namespace!
   "Compile `ns-sym` and everything it requires into an output directory.
@@ -547,7 +553,9 @@
   And one thing that is about the whole environment rather than this run:
 
     :js-requires  every specifier a string require named, sorted - what a bundler
-                  has to build npm/ out of. See run!*."
+                  has to build npm/ out of. See run!*.
+    :js-missing   those of them that are not under npm/ yet, which is a 404 waiting
+                  to happen and is warned about besides"
   [cenv ns-sym opts]
   (run!* cenv opts #(ensure! cenv % (seed-state cenv %) ns-sym)))
 

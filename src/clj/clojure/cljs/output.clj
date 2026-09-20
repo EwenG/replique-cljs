@@ -249,3 +249,60 @@
     (when (seq names)
       (goog/write-goog! dir names))
     dir))
+
+;; --- what the bundler still owes ---------------------------------------------
+
+(defn missing-js
+  "Which of `specifiers` name no file under `dir` yet, sorted and without repeats.
+
+  The one question about npm/ this compiler can answer, and it is not the one it
+  would like to. Whether a PACKAGE exists is the bundler's business - it does the
+  resolving, and node_modules is not ours to read - but whether the FILE WE NAMED
+  is on disk is a question about a path we computed, and a path nothing wrote is a
+  404 when the program loads.
+
+  Asked after compiling and never before. The bundler's input is the specifier
+  list a compile produces, so refusing to compile until npm/ is populated would be
+  a cycle with no way in (doc/cljs-npm.md 6). This turns the 404 into a sentence
+  instead, which is the whole of what can be done about it from here."
+  [dir specifiers]
+  (into []
+        (comp (distinct) (remove #(.isFile (File. (io/file dir) ^String (js->path %)))))
+        (sort specifiers)))
+
+(def ^:private reported
+  "Which missing modules this process has already complained about, as
+  {dir #{specifier}}.
+
+  clojure.cljs.goog/written's shape and its reason: the check is cheap and is made
+  on every compile, and a REPL evaluating form after form in a namespace whose
+  package is not there should be told once rather than once a form."
+  (atom {}))
+
+(defn report-missing-js!
+  "Warn about the modules among `specifiers` that are not under `dir`, once per
+  directory and specifier. Returns all of them, freshly reported or not, so a
+  caller can hand the list on rather than the warning.
+
+  A WARNING AND NOT AN ERROR, which is the same trade `missing-js` explains: on a
+  first build into a fresh output directory every specifier is missing, because
+  the list is what the bundler has not been given yet. So this is a build-time
+  answer to `what do I have to bundle`, and the compile it interrupts is the one
+  that produced the answer."
+  [dir specifiers]
+  (let [missing (missing-js dir specifiers)
+        seen    (get @reported (str dir) #{})
+        fresh   (remove seen missing)]
+    (when (seq fresh)
+      (swap! reported update (str dir) (fnil into #{}) fresh)
+      (binding [*out* *err*]
+        (println (str "WARNING: " (count fresh) " JavaScript module"
+                      (when (< 1 (count fresh)) "s")
+                      " required and not under " (File. (io/file dir) js-dir) ":"))
+        (doseq [s fresh]
+          (println (str "  " s "  ->  " (js->path s))))
+        (println (str "  " js-dir "/ is built by a bundler rather than by this"
+                      " compiler, so each of those has to end up at the path beside"
+                      " it, as an ES module, or it is a 404 when the program"
+                      " loads."))))
+    missing))
