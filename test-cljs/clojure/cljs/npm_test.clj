@@ -516,3 +516,181 @@
           (is (str/includes? said "THREW"))
           (is (str/includes? said "npm/nowhere.js"))))
       (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+;; --- shadow's other spelling: a package named by a bare symbol ----------------
+;;
+;; doc/cljs-compiler.md §5.53. (:require [react :as React]) is what a project
+;; written against shadow-cljs says where upstream says ["react" :as React], and
+;; nosco-gamma says both in ONE ns form. The symbol spelling is REWRITTEN into the
+;; string one at plan-require, so everything above this line is what is being
+;; tested a second time here - which is the point of doing it that way.
+
+(deftest test-a-bare-symbol-can-name-a-package
+  (let [cenv (ns-env '(ns app.core (:require [react :as React]
+                                             [clipboard-polyfill]
+                                             [app.other :as o])))]
+    (is (= ["clipboard-polyfill" "react"] (env/js-requires cenv 'app.core)))
+    ;; THE SYMBOL IS ITSELF A NAME FOR THE MODULE, as a namespace's own name always
+    ;; is - so clipboard-polyfill/write resolves with no :as asked for at all, and
+    ;; react/createElement resolves beside React/createElement
+    (is (= '{React             ["react" nil]
+             react             ["react" nil]
+             clipboard-polyfill ["clipboard-polyfill" nil]}
+           (env/js-aliases cenv 'app.core)))
+    ;; and none of them is a namespace, which is the separation the model rests on
+    (is (= '#{cljs.core app.other} (env/requires cenv 'app.core)))
+    (is (nil? (env/find-cljs-ns cenv 'react)))))
+
+(deftest test-one-name-for-the-module-when-as-asks-for-that-name
+  ;; :as react on the symbol react is one name, not two, and not refused as a
+  ;; collision with itself.
+  ;;
+  ;; A GUARD WITH NO DEFEAT BEHIND IT. The two names are recorded into a map under
+  ;; the same key, so nothing this compiler does could make it come out otherwise -
+  ;; which is why plan-require no longer has a branch for it.
+  (let [cenv (ns-env '(ns app.core (:require [react :as react])))]
+    (is (= '{react ["react" nil]} (env/js-aliases cenv 'app.core)))))
+
+(deftest test-a-symbol-module-takes-the-same-options
+  ;; the same three, because it is the same function underneath
+  (let [cenv (ns-env '(ns app.core
+                        (:require [react :refer [useState useEffect]
+                                   :rename {useEffect effect}]
+                                  [preact :default p])))]
+    (is (= ["preact" "react"] (env/js-requires cenv 'app.core)))
+    (is (= '{useState ["react" "useState"]
+             effect   ["react" "useEffect"]
+             p        ["preact" "default"]}
+           (env/js-refers cenv 'app.core)))))
+
+(deftest test-a-dot-is-the-answer-no
+  ;; The whole of what keeps `Could not locate` as the error for a namespace that
+  ;; is missing. A dot is what a namespace name is made of; a package whose name
+  ;; has one can always be written as a string instead.
+  (are [sym expected] (= expected (output/symbol-specifier sym))
+    'react              "react"
+    'clipboard-polyfill "clipboard-polyfill"
+    'prosemirror-state  "prosemirror-state"
+    'app.core           nil
+    'cljs.core          nil
+    ;; a real package name, and the string spelling is how it is written here
+    'sse.js             nil
+    ;; not a simple symbol, so not a bare name at all
+    'x/y                nil
+    ;; the $ sugar is a string's, and js->path refuses it - one function decides
+    ;; what a specifier may be, however it was spelled
+    'foo$bar            nil)
+  ;; and a dotted name is a namespace to the driver, whatever is or is not behind it
+  (is (= '[a.b] (ana/ns-form-deps '(ns app.core (:require [a.b :as b]))))))
+
+(deftest test-a-symbol-module-is-a-dependency-and-a-string-is-not
+  ;; The one place the two spellings differ, and it is not an oversight. A STRING
+  ;; can never be a namespace, so ns-form-deps can drop it knowing nothing else. A
+  ;; SYMBOL might be - a one-segment name is a legal namespace - and what decides
+  ;; is whether a source exists, which is a fact about the driver's source paths
+  ;; and not about the form. So it is handed over and the driver settles it
+  ;; (driver/ensure!), which is exactly what makes a source win.
+  ;; in the order written, which is what ns-form-deps promises
+  (is (= '[react app.other]
+         (ana/ns-form-deps '(ns app.core (:require ["preact" :as P]
+                                                   [react :as R]
+                                                   [goog.object :as gobj]
+                                                   [app.other :as o]))))))
+
+(h/deftest-when h/node? test-a-source-beats-a-package-of-the-same-name
+  ;; A one-segment name is a legal namespace, so the package reading is the LAST
+  ;; answer and not the first. util.cljs is on the source path and `util` means it.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{util     "(ns util) (def origin \"clojurescript\")"
+               app.core "(ns app.core (:require [util :as u :refer [origin]]))
+                         (js* \"console.log(~{})\" u/origin)
+                         (js* \"console.log(~{})\" origin)"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            res  (driver/compile-namespace! cenv 'app.core
+                                            {:out-dir out :source-paths [src]})]
+        (is (= '[cljs.core util app.core] (:compiled res)))
+        ;; nothing was reported to the bundler, because nothing named a package
+        (is (= [] (:js-requires res)))
+        (is (= "clojurescript\nclojurescript" (node (File. out "ns/app/core.js")))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(h/deftest-when h/node? test-a-closure-file-beats-a-package-of-the-same-name
+  ;; And so does the other kind of file. widgetjs.js is a Closure provide on the
+  ;; classpath (§5.52); a file that is actually there beats a package that may or
+  ;; may not be in somebody's node_modules.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{app.core "(ns app.core (:require [widgetjs :as w]))
+                         (js* \"console.log(~{})\" w/origin)"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            res  (driver/compile-namespace! cenv 'app.core
+                                            {:out-dir out :source-paths [src]})]
+        (is (= [] (:js-requires res)))
+        (is (.isFile (File. out "ns/widgetjs.js")))
+        (is (= "closure" (node (File. out "ns/app/core.js")))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(h/deftest-when h/node? test-a-symbol-module-fetches-its-package-and-calls-it
+  ;; Through every piece at once, the way the string spelling is tested above: a
+  ;; namespace whose ns form names packages by bare symbols, compiled by the
+  ;; driver, imported by node and called.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{probe.core "(ns probe.core
+                             (:require [greeter :as g :refer [shout]]
+                                       [clipboard-polyfill]))
+                           (js* \"console.log(~{})\" (g/hello \"a\"))
+                           (js* \"console.log(~{})\" (shout \"b\"))
+                           (js* \"console.log(~{})\" (clipboard-polyfill/write \"c\"))"})
+        out (h/temp-dir)]
+    (try
+      ;; the bundler's output first, so the run has nothing to report as owed
+      (doseq [[path text] {"npm/greeter.js"
+                           (str "export function hello(x) { return \"hello \" + x; }\n"
+                                "export function shout(x) { return x.toUpperCase(); }\n")
+                           "npm/clipboard-polyfill.js"
+                           "export function write(x) { return \"wrote \" + x; }\n"}]
+        (let [f (io/file out path)]
+          (.mkdirs (.getParentFile f))
+          (spit f text)))
+      (driver/compile-namespace! (env/compile-env {:ns 'cljs.user}) 'probe.core
+                                 {:out-dir out :source-paths [src]})
+      ;; ONE import per specifier, whichever way it was spelled
+      (let [text (slurp (File. out "ns/probe/core.js"))]
+        (is (str/includes? text "import * as greeter$js from \"../../npm/greeter.js\""))
+        (is (str/includes? text
+                           "import * as clipboard_polyfill$js from \"../../npm/clipboard-polyfill.js\"")))
+      (is (= "hello a\nB\nwrote c" (node (File. out "ns/probe/core.js"))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(h/deftest-when h/node? test-a-repl-require-of-a-symbol-package-fetches-it
+  ;; (require '[greeter :as g]) typed at a real REPL. What is shipped is
+  ;; $CLJS.requireJs and not $CLJS.require - the second would compute ./ns/greeter.js
+  ;; and 404 - and the next form reaches the module through its own prologue.
+  (let [src (h/write-sources! '{app.core "(ns app.core) (def n 1)"})
+        out (h/temp-dir)]
+    (try
+      (with-open [rt (repl/node-runtime {:dir out :out program-out})]
+        (let [cenv (env/compile-env {:ns 'cljs.user})
+              opts {:out-dir out :source-paths [src]}]
+          (write-npm! out)
+          (is (= ["nil" "nil" "\"hello a\"" "\"B\""]
+                 (mapv :value
+                       (repl/eval-src
+                        cenv rt
+                        "(require 'app.core)
+                         (require '[greeter :as g :refer [shout]])
+                         (g/hello \"a\")
+                         (shout \"b\")"
+                        opts))))
+          ;; and the report reaches a session typing the symbol spelling too
+          (is (str/includes?
+               (h/warnings
+                #(repl/eval-src cenv rt "(require '[nope3 :as n])" opts))
+               "npm/nope3.js"))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))

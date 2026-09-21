@@ -667,7 +667,11 @@
     ;; the shape someone reaching for Clojure's ns writes
     '(ns app.core (:require [a [b :as c]])) #"no prefix lists"
     '(ns app.core (:require [a :as 1]))     #":as must be a simple symbol"
-    '(ns app.core (:require [a :refer x]))  #"sequence of simple symbols"
+    ;; a.b rather than a: an UNDOTTED name with no source is shadow's spelling of a
+    ;; JavaScript module (§5.53), and a module's :refer is checked by the other
+    ;; half - which is the row below this one
+    '(ns app.core (:require [a.b :refer x]))  #"sequence of simple symbols"
+    '(ns app.core (:require [a :refer x]))    #":refer takes a vector of symbols"
     ;; :rename is supported now (§5.24); what is still refused is its shape
     '(ns app.core (:require [a :rename [b c]])) #"map of simple symbols"
     ;; :import works now (M5's goog subset), so what is refused is a class that is

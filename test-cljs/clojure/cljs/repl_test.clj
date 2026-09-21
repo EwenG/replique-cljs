@@ -738,3 +738,28 @@
     (testing "and with both, the name is bare so it resolves against the script's own URL"
       (let [js (repl/compile-form c '(+ 1 1) "(+ 1 1)" {:out-dir @runtime-dir})]
         (is (re-find #"\n//# sourceMappingURL=\d+\.js\.map\n" js) js)))))
+
+(h/deftest-when h/node? test-reload-ships-the-bodies-among-the-targets-and-no-others
+  ;; :reload takes the named namespaces' bodies off the tail of what was compiled,
+  ;; and how many to take is HOW MANY OF THE TARGETS HAVE A BODY - not how many
+  ;; targets there were. A target can compile nothing at all and still be a target:
+  ;; a JavaScript module named by a bare symbol (§5.53), or a Closure file on the
+  ;; classpath (§5.52). Counting those in reaches one namespace too far down the
+  ;; tail and re-runs a dependency nobody asked to reload - here my-lib.core, whose
+  ;; source has been edited underneath.
+  (with-project*
+   two-files
+   (fn [{:keys [opts] :as p}]
+     ;; the bundler's output, so that requiring the package loads something
+     (let [f (io/file (:out-dir opts) "npm/greeter.js")]
+       (.mkdirs (.getParentFile f))
+       (spit f "export const n = 1;\n"))
+     (is (= ["nil" "42"] (vals-in p "(require '[app.core :as a]) (a/use-it)")))
+     (edit! p 'my-lib.core
+            "(ns my-lib.core) (def helper (fn* ([x] (js* \"~{} * 5\" x))))")
+     ;; two targets, one body. app.core's body re-runs; my-lib.core's does not,
+     ;; so the answer is still 42 - the same thing :reload means on its own.
+     (is (= ["nil" "42"]
+            (vals-in p "(require 'app.core '[greeter :as g] :reload) (a/use-it)")))
+     ;; and :reload-all still ships the whole graph, which is the contrast
+     (is (= ["nil" "105"] (vals-in p "(require 'app.core :reload-all) (a/use-it)"))))))

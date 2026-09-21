@@ -19,7 +19,9 @@
       it gave under Closure."
   (:require [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env]
+            [clojure.cljs.emitter :as emitter]
             [clojure.cljs.goog :as goog]
+            [clojure.cljs.names :as names]
             [clojure.cljs.output]
             [clojure.cljs.test-harness :as h]
             [clojure.java.io :as io]
@@ -582,6 +584,15 @@
   (try (h/js (h/fresh-env) src) nil
        (catch Exception e (or (ex-message e) ""))))
 
+(defn- emitted
+  "The JavaScript one form compiles to in `cenv`, as an expression. npm-test's
+  helper of the same name, needed here for the same reason: a precedence question
+  is about what ONE symbol resolves to, and a whole program's text is a blunt way
+  to ask it."
+  [cenv form]
+  (names/with-name-scope
+    (str (emitter/emit-top (h/analyze cenv form) identity))))
+
 (deftest test-a-goog-namespace-we-do-not-have-is-refused-early
   ;; The alternative is an import of a file that is not there and a 404 at load.
   ;; The message names the subset, because "no such namespace" would send someone
@@ -591,12 +602,121 @@
     (is (re-find #"ships a SUBSET" msg))
     (is (re-find #"goog.object" msg))))
 
-(deftest test-refer-on-a-goog-namespace-is-refused
-  ;; There is no Var to map. :import is how Closure gives a bare name, and the
-  ;; message says so rather than leaving someone to guess.
-  (let [msg (refuses "(ns app.core (:require [goog.string :refer [contains]]))")]
-    (is (re-find #"Cannot :refer" msg))
-    (is (re-find #":import" msg))))
+(h/deftest-when h/node? test-refer-on-a-goog-namespace-gives-the-bare-name
+  ;; §5.54, and the test this replaced said the opposite: `Cannot :refer ... a goog
+  ;; name is a JavaScript property, not a var, so there is nothing to map into this
+  ;; namespace`. Every clause of that is still true. What it stopped being is a
+  ;; REASON, because §5.51 made this compiler map JavaScript properties into
+  ;; namespaces all day - (:require ["react" :refer [useState]]) is one - and
+  ;; env/js-refers is where they live precisely because a Namespace could not hold
+  ;; them. env/goog-refers is that map, one world over.
+  ;;
+  ;; Both readings of a goog name, because a refer decides neither and must not.
+  ;; goog.string/format is a PROVIDE, in a file of its own (§5.29), so `format`
+  ;; here is that file; goog.object/get is a property of a namespace object, so
+  ;; `get` here is that property. analyze-qualified-symbol already told those two
+  ;; apart for the qualified spelling, and the bare one is handed straight to it.
+  (is (= "a-7-1.50 v"
+         (module-output
+          "(ns app.core (:require [goog.string :refer [format]]
+                                  [goog.object :refer [get]]))
+           (def out (js* \"[~{}, ~{}].join(\\\" \\\")\"
+                         (format \"%s-%d-%.2f\" \"a\" 7 1.5)
+                         (get (js* \"{k: \\\"v\\\"}\") \"k\")))")))
+
+  ;; the provide is IMPORTED, which is the half that cannot be faked: without it
+  ;; $ns("goog.string.format") is an empty object and the call is not a function
+  (let [js (h/js (h/fresh-env)
+                 "(ns app.core (:require [goog.string :refer [format]]))
+                  (format \"%s\" 1)")]
+    (is (str/includes? js "goog$string$format$ns(\"%s\", (1))"))
+    ;; and NOT goog$string$ns.format - the two spellings are two different names
+    (is (not (str/includes? js "goog$string$ns.format")))))
+
+(deftest test-a-goog-refer-may-be-renamed
+  ;; :rename was in the option set a Closure require accepts and was read by
+  ;; nothing, which is the quiet half of the same gap: this compiled and gave you
+  ;; `fmt` meaning nothing at all. A rename is a refer under another name here as
+  ;; everywhere else, and the renamed name is not also referred under its own.
+  (let [js (h/js (h/fresh-env)
+                 "(ns app.core (:require [goog.string :refer [format]
+                                          :rename {format fmt}]))
+                  (fmt \"%s\" 1)")]
+    (is (str/includes? js "goog$string$format$ns(\"%s\", (1))")))
+  (is (re-find #"neither a local nor a var"
+               (refuses "(ns app.core (:require [goog.string :refer [format]
+                                                 :rename {format fmt}]))
+                         (format \"%s\" 1)"))))
+
+(deftest test-a-goog-refer-sits-where-a-refer-sits
+  ;; The same claim test-a-js-refer-sits-where-a-refer-sits makes one world over,
+  ;; and it has to be made with a REAL cljs.core or it makes itself: core-env,
+  ;; because `clone` and `sort` are cljs.core vars as well as goog.array names and
+  ;; the two paths are being compared rather than cljs.core's absence.
+  ;;
+  ;; ABOVE the implicit refer of cljs.core. Without this half, a :refer of a name
+  ;; core also has would silently resolve to core's - which for goog.array is most
+  ;; of the namespace.
+  (let [cenv (h/core-env 'app.googrefers)]
+    (h/analyze cenv '(ns app.googrefers (:require [goog.array :refer [clone sort]])))
+    (is (= "goog$array$ns.clone" (emitted cenv 'clone)))
+    (is (= "goog$array$ns.sort" (emitted cenv 'sort)))
+    ;; and BELOW anything this namespace defines itself, exactly as it sits below
+    ;; a def that shadows a :refer of a var
+    (h/analyze cenv '(def clone 1))
+    (is (= "app$googrefers$ns.clone" (emitted cenv 'clone)))))
+
+(deftest test-an-unused-goog-refer-requires-nothing
+  ;; A refer that resolves to a PROVIDE records the require where the name is
+  ;; USED, not where it is referred - require-goog! has the argument (§5.18), and
+  ;; the refer is a note about a name rather than a reference to one. So a refer
+  ;; shadowed by a def costs nothing at all, not even an import of the file.
+  (let [cenv (h/fresh-env)
+        js   (h/js cenv "(ns app.core (:require [goog.string :refer [format]]))
+                         (defn format [x] x)
+                         (format 1)")]
+    (is (str/includes? js "app$core$ns.format.call(null"))
+    (is (not (contains? (set (env/requires cenv 'app.core)) 'goog.string.format))))
+  ;; used, and the require is there
+  (let [cenv (h/fresh-env)]
+    (h/js cenv "(ns app.core (:require [goog.string :refer [format]])) (format \"%s\" 1)")
+    (is (contains? (set (env/requires cenv 'app.core)) 'goog.string.format))))
+
+(deftest test-a-goog-declaration-replaces
+  ;; An ns form DECLARES rather than accumulates, so deleting a :refer from a file
+  ;; and re-reading it has to take the bare name away with it - the rule
+  ;; clear-ns-declaration! applies to every other thing an ns form establishes,
+  ;; and ::goog-refers is in its list for the same reason ::js-refers is.
+  ;;
+  ;; Written because a defeat that dropped ::goog-refers from that list came back
+  ;; INERT: the code is live and needed - re-evaluating an ns form at a REPL is
+  ;; the ordinary way to reach it - so what was missing was the test, not the
+  ;; reason.
+  (let [cenv (h/fresh-env)]
+    (h/analyze cenv '(ns app.core (:require [goog.string :refer [format]
+                                             :rename {format fmt}])))
+    (is (= '{fmt goog.string/format} (env/goog-refers cenv 'app.core)))
+    ;; the same namespace, re-read without it
+    (h/analyze cenv '(ns app.core (:require [goog.string :as gstring])))
+    (is (= {} (env/goog-refers cenv 'app.core)))
+    (is (re-find #"neither a local nor a var"
+                 (try (h/analyze cenv 'fmt) nil
+                      (catch Exception e (or (ex-message e) "")))))))
+
+(deftest test-a-goog-refer-is-checked-where-it-is-written
+  ;; At the ns form, not at the first call. A refer NAMES a var, so a name this
+  ;; fork removed should surface where it was named - and it is the same sentence
+  ;; check-var! gives at a use, because both places ask the same function.
+  (let [msg (refuses "(ns app.core (:require [goog.string :refer [htmlEscape]]))")]
+    (is (re-find #"goog.string/htmlEscape is not in the Closure subset" msg))
+    (is (re-find #"contains, endsWith, isEmpty" msg)))
+  ;; a namespace we do not have is still refused first, and says so about the
+  ;; NAMESPACE rather than about the name
+  (is (re-find #"No such Closure namespace: goog.dom"
+               (refuses "(ns app.core (:require [goog.dom :refer [getElement]]))")))
+  ;; and a complete namespace is not policed, here as at a use: nothing analysed
+  ;; goog/object.js and a JavaScript object's properties cannot be enumerated
+  (is (nil? (refuses "(ns app.core (:require [goog.object :refer [getValueByKeys]]))"))))
 
 (deftest test-macro-options-on-a-goog-namespace-are-refused
   (is (re-find #"Closure namespace"
@@ -1060,12 +1180,19 @@
         (is (str/includes? (slurp (File. out "ns/closurejs/both.js")) "$ns")))
       (finally (h/delete-tree! src) (h/delete-tree! out)))))
 
-(deftest test-a-classpath-closure-file-is-refused-the-same-things-goog-is
-  ;; It is JavaScript either way, so the rules are the same rules: no vars to
-  ;; refer, and no JVM namespace of the name for :include-macros to reach.
-  (let [msg (refuses "(ns app.core (:require [closurejs.widget :refer [describe]]))")]
-    (is (re-find #"Cannot :refer" msg))
-    (is (re-find #"closurejs.widget" msg)))
+(deftest test-a-classpath-closure-file-is-allowed-and-refused-what-goog-is
+  ;; It is JavaScript either way, so the rules are the same rules - which is a
+  ;; statement about BOTH directions and was easy to miss while they pointed the
+  ;; same way. :refer now works here because it works for goog (§5.54), and it
+  ;; needed no code of its own: closure-ns? made the two one thing at §5.52, and
+  ;; every line the refer goes through asks that question and not `goog.`.
+  (is (str/includes?
+       (h/js (h/fresh-env) "(ns app.core (:require [closurejs.widget :refer [describe]]))
+                            (describe 1)")
+       "closurejs$widget$ns.describe"))
+  ;; and a referred name in one is UNCHECKED, like a goog var in a namespace we
+  ;; vendored whole: there is no reduction to police it against
+  (is (nil? (refuses "(ns app.core (:require [closurejs.widget :refer [nosuchthing]]))")))
   (is (re-find #"Closure namespace"
                (refuses "(ns app.core (:require [closurejs.widget :include-macros true]))")))
   ;; and a var in one is UNCHECKED, like a goog var and for the same reason -

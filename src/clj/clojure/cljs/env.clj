@@ -313,6 +313,16 @@
 ;;   ::js-refers    {name [specifier export]}, for :refer and :default, which
 ;;                  bring a BARE name into scope the way a :refer of a var does -
 ;;                  the export being a dotted path when the $ sugar named one
+;;
+;; And one more of the same kind for the other world of JavaScript this compiler
+;; knows, which lives here for the same reason - a Closure name is not a Var
+;; either, so a refer of one has nowhere in a Namespace to go:
+;;
+;;   ::goog-refers  {name goog.string/format}, for (:require [goog.string :refer
+;;                  [format]]) - the value being the QUALIFIED name the bare one
+;;                  stands for, which is all the resolver needs because the
+;;                  qualified spelling already resolves (analyzer's
+;;                  analyze-qualified-symbol)
 
 (defn add-js-require!
   "Record that `ns-sym` requires the JavaScript module `specifier`.
@@ -372,6 +382,26 @@
   other with a name that happens to be a keyword."
   [^CompileEnv cenv ns-sym]
   (::js-refers (meta (some-> (find-cljs-ns cenv ns-sym))) {}))
+
+(defn add-goog-refers!
+  "Record the bare names `ns-sym` drew out of Closure namespaces: `m` is
+  {name qualified-name}."
+  [^CompileEnv cenv ns-sym m]
+  (alter-meta! (cljs-ns cenv ns-sym) update ::goog-refers merge m)
+  m)
+
+(defn goog-refers
+  "The bare names `ns-sym` drew out of Closure namespaces: {format
+  goog.string/format}.
+
+  The value is the QUALIFIED symbol and nothing else, because the qualified
+  spelling is already a complete answer: goog.string/format resolves to the
+  provide goog.string.format, gobject/get to a property of the goog.object
+  namespace object, and a name in a namespace this fork REDUCED is refused by
+  name. A refer therefore has nothing of its own to decide - it says which
+  qualified name a bare one stands for, and hands the question on."
+  [^CompileEnv cenv ns-sym]
+  (::goog-refers (meta (some-> (find-cljs-ns cenv ns-sym))) {}))
 
 (defn all-cljs-ns
   "Every ClojureScript namespace in this environment."
@@ -464,7 +494,7 @@
     (doseq [[sym _] (.getMappings view)]
       (.unmap view sym))
     (alter-meta! ns dissoc ::requires ::excludes ::global-refers ::imports
-                 ::js-requires ::js-aliases ::js-refers)
+                 ::js-requires ::js-aliases ::js-refers ::goog-refers)
     ns-sym))
 
 (defn excluded?

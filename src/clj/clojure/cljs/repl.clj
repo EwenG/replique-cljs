@@ -366,14 +366,24 @@
       nil-result))
 
 (defn- require-script
-  "A script that asks the runtime to load `ns-syms` if it does not have them.
+  "A script that asks the runtime to load `ns-syms` if it does not have them, and to
+  fetch the JavaScript modules `specifiers`.
 
   This is what plain require ships, and shipping a QUESTION rather than a body is
   what keeps the JVM from modelling the runtime's state (doc/cljs-repl.md 7.2): the
   runtime knows what it holds, so it decides whether to fetch. A JVM-side record of
-  what this session has shipped would be wrong the moment a browser was refreshed."
-  [ns-syms]
-  (emitter/script (mapv #(str "await $CLJS.require(\"" % "\");") ns-syms)))
+  what this session has shipped would be wrong the moment a browser was refreshed.
+
+  A MODULE IS FETCHED BY THE OTHER FUNCTION, and not because npm/ is a different
+  directory: $CLJS.require consults `loaded`, which is about namespaces this
+  session may have redefined, and a module has no such state - the module system's
+  own one-evaluation-per-URL is the whole of it. Nothing is bound here, unlike the
+  script prologue's requireJs: the value is not wanted, only the loading, and the
+  next form evaluated in this namespace binds it for itself."
+  [ns-syms specifiers]
+  (emitter/script (-> (mapv #(str "await $CLJS.require(\"" % "\");") ns-syms)
+                      (into (map #(str "await $CLJS.requireJs(\"" % "\");"))
+                            specifiers))))
 
 (defn- ordered-scripts
   "The [ns script] pairs of every namespace compiled for `targets`, in dependency
@@ -406,7 +416,20 @@
         flags   (set (filter keyword? args))
         specs   (vec (remove keyword? args))
         targets (ana/ns-form-deps (list* 'ns 'repl [(cons :require specs)]))
-        scripts (ordered-scripts cenv opts targets)]
+        scripts (ordered-scripts cenv opts targets)
+        ;; WHAT EACH TARGET TURNED OUT TO BE, asked after compiling and not before,
+        ;; because that is when the answer exists: a name with a source is now
+        ;; declared, and one without is whatever driver/ensure! settled on. Three
+        ;; kinds, and each is shipped differently - a namespace has a body and is
+        ;; fetched with $CLJS.require, a Closure file has no body and is fetched
+        ;; the same way (it is written under ns/ like any other), and a JavaScript
+        ;; module is fetched with $CLJS.requireJs from npm/.
+        modules (filterv #(ana/js-module-ns? cenv %) targets)
+        fetched (filterv (complement (set modules)) targets)
+        ;; only the namespaces with a body of their own, which is what :reload
+        ;; takes from the tail of `scripts` - a target that compiled nothing put
+        ;; nothing there to take
+        bodies  (filterv #(env/declared? cenv %) targets)]
     (ana/require-libs! cenv specs)
     ;; A STRING REQUIRE COMPILES NOTHING, so the driver's own report never fires
     ;; for one and this is the only place that can say it while the user is still
@@ -418,8 +441,8 @@
     (ship! runtime
            (cond
              (:reload-all flags) scripts
-             (:reload flags)     (take-last (count targets) scripts)
-             :else               [(require-script targets)]))))
+             (:reload flags)     (take-last (count bodies) scripts)
+             :else               [(require-script fetched modules)]))))
 
 (defn- do-load-file
   "(load-file \"path/to/foo.cljs\") - compile that file, whatever namespace it

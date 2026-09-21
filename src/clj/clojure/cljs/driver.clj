@@ -425,27 +425,41 @@
         (if (ana/closure-ns? cenv ns-sym)
           (update state :done conj ns-sym)
 
-          ;; clojure.test WITH NO FILE OF ITS OWN MEANS cljs.test, and it means it
-          ;; here rather than at the ns form because this is where the evidence is:
-          ;; the source paths are the driver's, and "there is no clojure.test" is a
-          ;; statement about them. The analyzer reaches the same conclusion from what
-          ;; it has analysed a moment later (analyzer/aliased-clj-ns), which it can
-          ;; only do because this compiled the target first.
+          ;; A JAVASCRIPT MODULE REQUIRED BY ITS BARE NAME - shadow-cljs's
+          ;; spelling, (:require [react :as React]). Nothing to compile and
+          ;; nothing to write: npm/ is built by a bundler out of node_modules,
+          ;; and all this run owes it is the specifier, which the ns form's
+          ;; analysis records a moment later (analyzer/js-module-ns?, which asks
+          ;; the same question and can only answer because this got here).
           ;;
-          ;; Asked LAST, after the file and after declared?: a clojure.* namespace
-          ;; that does exist is itself and nothing else, which is what keeps
-          ;; clojure.string out of this.
-          (let [alt (ana/clj-ns->cljs-ns ns-sym)]
-            (if-let [src (and (not= alt ns-sym) (find-source (:source-paths opts) alt))]
-              (-> (compile-one! cenv opts (update state :done conj ns-sym) src alt)
-                  (update :compiled conj ns-sym))
-              (throw (ex-info (str "Could not locate " (ns->source-path ns-sym ".cljs")
-                                   (when (not= alt ns-sym)
-                                     (str " or " (ns->source-path alt ".cljs")))
-                                   " on the source path: "
-                                   (str/join ", " (map str (:source-paths opts))))
-                              {:ns ns-sym
-                               :source-paths (mapv str (:source-paths opts))})))))))))
+          ;; AFTER the source path and after the classpath, which is what makes
+          ;; a name with a file behind it mean the file. It can never be confused
+          ;; with the clojure.test fallback below: that one is about a DOTTED
+          ;; name, and a dot is exactly what output/symbol-specifier refuses.
+          (if (ana/js-module-ns? cenv ns-sym)
+            (update state :done conj ns-sym)
+
+            ;; clojure.test WITH NO FILE OF ITS OWN MEANS cljs.test, and it means it
+            ;; here rather than at the ns form because this is where the evidence is:
+            ;; the source paths are the driver's, and "there is no clojure.test" is a
+            ;; statement about them. The analyzer reaches the same conclusion from what
+            ;; it has analysed a moment later (analyzer/aliased-clj-ns), which it can
+            ;; only do because this compiled the target first.
+            ;;
+            ;; Asked LAST, after the file and after declared?: a clojure.* namespace
+            ;; that does exist is itself and nothing else, which is what keeps
+            ;; clojure.string out of this.
+            (let [alt (ana/clj-ns->cljs-ns ns-sym)]
+              (if-let [src (and (not= alt ns-sym) (find-source (:source-paths opts) alt))]
+                (-> (compile-one! cenv opts (update state :done conj ns-sym) src alt)
+                    (update :compiled conj ns-sym))
+                (throw (ex-info (str "Could not locate " (ns->source-path ns-sym ".cljs")
+                                     (when (not= alt ns-sym)
+                                       (str " or " (ns->source-path alt ".cljs")))
+                                     " on the source path: "
+                                     (str/join ", " (map str (:source-paths opts))))
+                                {:ns ns-sym
+                                 :source-paths (mapv str (:source-paths opts))}))))))))))
 
 (def ^:private empty-state
   {:done #{} :visiting [] :compiled [] :written [] :scripts []})

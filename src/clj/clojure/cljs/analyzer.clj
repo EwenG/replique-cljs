@@ -1361,17 +1361,71 @@
   (or (goog/goog-ns? target)
       (and (not (env/declared? cenv target)) (goog/js-ns? target))))
 
+(defn js-module-ns?
+  "Is `target` - a bare SYMBOL in a require - the name of a JavaScript module
+  rather than of a ClojureScript namespace?
+
+  shadow-cljs's spelling. A project written against it says
+
+      (:require [react :as React] [react :refer [useRef]] [clipboard-polyfill])
+
+  where upstream says [\"react\" :as React], and both are read here for the reason
+  the three options of a string require are shadow's three: a project moving between
+  the two compilers should not have to rewrite its ns forms. See
+  doc/cljs-compiler.md 5.53.
+
+  Three questions, cheapest first, and each is doing something.
+
+  COULD IT BE A SPECIFIER AT ALL - output/symbol-specifier, which is syntactic and
+  answers no for anything with a dot in it. That is what makes this free to ask
+  about every require in every ns form, and it is also what keeps `Could not locate
+  nosco/colours.cljs` as the answer for a namespace that is missing rather than for
+  a package that is not.
+
+  HAS IT BEEN DECLARED - a one-segment name may perfectly well be a ClojureScript
+  namespace, and a source wins. env/declared? is the same question closure-ns? asks
+  and answers by the same arrangement: by the time an ns form is analysed, a
+  compilation driver has compiled everything it requires (driver/ensure!), so a
+  namespace with a source has an ns form behind it.
+
+  IS IT A CLOSURE FILE - because that is the other way to be a namespace with no
+  .cljs, and a file that is actually on the classpath beats a package that may or
+  may not be in somebody's node_modules.
+
+  Public because clojure.cljs.driver and clojure.cljs.repl ask it too, and the
+  three must agree."
+  [cenv target]
+  (and (symbol? target)
+       (some? (output/symbol-specifier target))
+       (not (env/declared? cenv target))
+       (not (goog/closure-ns? target))))
+
 (defn- check-goog-require!
   "A (:require [goog.object :as gobject]) entry, checked. A classpath Closure file -
   (:require [com.cognitect.transit :as t]) - passes through here too, and the rules
   are the same rules: it is JavaScript either way.
 
-  Three things are refused rather than passed through. A Closure name we do not
+  Two things are refused rather than passed through. A Closure name we do not
   have, because the alternative is a module import for a file that is not there and
-  a 404 at load; :refer, because a Closure var is not a Var and there is nothing to
-  map - :import is how Closure gives a bare name, and it is what cljs.core uses; and
-  the macro options, because there is no JVM namespace called goog.object."
-  [spec target refers macros]
+  a 404 at load; and the macro options, because there is no JVM namespace called
+  goog.object.
+
+  :REFER IS NOT ONE OF THEM ANY MORE, and what changed is not the fact it was
+  refused over. A Closure var is still not a Var, and a Namespace still has nowhere
+  to put one - that was true and stays true. What it stopped being is a reason,
+  because this compiler now refers names that are not Vars all the time: a
+  (:require [\"react\" :refer [useState]]) is exactly a bare name standing for a
+  JavaScript property, and env/js-refers is where it lives precisely because a
+  Namespace could not hold it (5.51). Once that map exists the goog side has no
+  argument left of its own, and the refusal was costing a real program the whole of
+  lambdaisland.deep-diff2 for one #?(:cljs [goog.string :refer [format]]).
+
+  So a referred name is checked here the way the QUALIFIED spelling would be
+  checked where it was written, and for the same reasons - the ns form is where the
+  name was asked for, so the ns form is where a mistake should surface. Returns
+  {name qualified-name}, which is what the resolver needs and all it needs; see
+  env/goog-refers."
+  [spec target refers renames macros]
   (when-not (goog/provided? target)
     (analysis-error
      spec
@@ -1381,18 +1435,40 @@
        (str "No such Closure namespace: " target ". This fork ships a SUBSET of the"
             " Closure Library - " (clojure.string/join ", " (sort (keys (goog/index))))
             ". To get the rest: " (goog/get-real-closure)))))
-  (when (seq refers)
-    (analysis-error
-     spec
-     (str "Cannot :refer " (pr-str (vec refers)) " from " target
-          ": a goog name is a JavaScript property, not a var, so there is nothing"
-          " to map into this namespace. Use :as, or (:import [" target " Name]) for"
-          " a class - which is what cljs.core does for goog.string.StringBuffer.")))
   (when macros
     (analysis-error
      spec
      (str target " is a Closure namespace, so :include-macros / :refer-macros have"
-          " nothing to reach - those name a JVM namespace of the same name."))))
+          " nothing to reach - those name a JVM namespace of the same name.")))
+  ;; A RENAME IS A REFER UNDER ANOTHER NAME, the same as everywhere else - so the
+  ;; two are one list here, keyed by what THIS namespace will call each one, and a
+  ;; renamed name is not also referred under its own. Until now :rename was in the
+  ;; option set a Closure require accepts and was read by nothing, which is the
+  ;; quiet half of the same gap: (:require [goog.string :rename {format fmt}])
+  ;; compiled and gave you nothing.
+  (let [named   (concat (map (fn [r] [r r]) (remove (set (keys renames)) refers))
+                        (map (fn [[from to]] [to from]) renames))
+        refers  (into {} (map (fn [[here there]]
+                                [here (symbol (str target) (str there))]))
+                      named)]
+    (doseq [[_ there] refers]
+      ;; The provide branch of analyze-qualified-symbol answers first, and a
+      ;; provide needs no further checking - goog.string.format is a file the
+      ;; output tree will hold. Everything else is a property of a namespace
+      ;; object, unchecked exactly as gobject/get is, EXCEPT in the three
+      ;; namespaces this fork reduced, where we do have the list and a missing
+      ;; name is missing because we removed it (goog/reduced-vars).
+      ;;
+      ;; Asked HERE as well as at the use, because a refer names a var in the ns
+      ;; form and a mistake there should not wait for the first call. Both places
+      ;; ask the same function and get the same sentence.
+      ;; the DOTTED spelling for the provide question and the slashed one for the
+      ;; var: a provide is one name, and goog.string.format is not goog.string's
+      ;; `format` (5.18). analyze-qualified-symbol splits the same two readings
+      ;; the same way, and this is that line said once earlier.
+      (when-not (goog/provided? (symbol (str target "." (name there))))
+        (goog/check-var! (str target) (name there))))
+    refers))
 
 (defn clj-ns->cljs-ns
   "clojure.foo -> cljs.foo. Any other name unchanged.
@@ -1686,8 +1762,15 @@
         (closure-ns? cenv target)
         (let [macros (when (or (:include-macros opts) (:refer-macros opts))
                        {:target target :as (:as opts) :refers (:refer-macros opts)})]
-          (check-goog-require! spec target asked macros)
-          {:target target :as (:as opts) :refers asked :macros macros})
+          ;; :refers rather than :goog-refers would be the shorter spelling and the
+          ;; wrong one: apply-ns-require! reads :refers as names to look up in the
+          ;; TARGET'S Namespace and intern here, and a Closure namespace has no
+          ;; Namespace and no interned anything. The two are different enough to
+          ;; deserve different keys - one is a Var mapping, the other is a note
+          ;; that a bare name stands for a qualified one.
+          {:target target :as (:as opts) :macros macros
+           :goog-refers (check-goog-require! spec target asked
+                                             (check-renames! (:rename opts)) macros)})
 
         ;; A RENAMED NAME IS CHECKED LIKE ANY OTHER REFERRED NAME - same split
         ;; into vars and macros, same message when it is neither - and then taken
@@ -1720,11 +1803,40 @@
   A STRING SPEC IS A JAVASCRIPT MODULE and shares nothing with the other but the
   ns form it was written in - no namespace, no alias on a Namespace, no vars to
   refer, no macro side. Told apart here rather than by a branch in each step, so
-  that every rule in plan-ns-require can go on being about namespaces."
+  that every rule in plan-ns-require can go on being about namespaces.
+
+  AND SO IS A BARE SYMBOL THAT NAMES ONE, which is shadow-cljs's spelling and is
+  told apart by js-module-ns? rather than by its shape. It is REWRITTEN into the
+  string spelling and handed to the same function, so there is one kind of module
+  require from here on and every rule about one goes on being about all of them.
+  What the rewrite costs is that an error names the module as \"react\" where the
+  ns form said react, and what it buys is that no rule below had to learn a second
+  shape.
+
+  THE SYMBOL IS ITSELF A NAME FOR THE MODULE, which is the one thing the two
+  spellings do not share. (:require [clipboard-polyfill]) is a whole require in
+  nosco-gamma and clipboard-polyfill/write is how it is used - so the symbol
+  qualifies names the way a namespace's own name always does, whether or not an
+  :as was asked for. When :as was, both work, and :also-as is how the second one
+  is carried - the very word and the very mechanism a namespace require already
+  uses for the name it was WRITTEN under (see apply-ns-require!)."
   [cenv kind spec]
-  (if (string? (if (vector? spec) (first spec) spec))
-    (plan-js-require kind spec)
-    (plan-ns-require cenv kind spec)))
+  (let [target (if (vector? spec) (first spec) spec)]
+    (cond
+      (string? target) (plan-js-require kind spec)
+
+      (js-module-ns? cenv target)
+      (let [specifier (output/symbol-specifier target)
+            rest-of   (rest (if (vector? spec) spec [spec]))]
+        ;; ALWAYS, even when :as asked for the symbol itself. Guarding that case
+        ;; was written here and taken out again: the two names are recorded into a
+        ;; map under the same key, so the second write is the first one over again
+        ;; and no test could tell the difference. An invariant nothing can observe
+        ;; is not one worth a branch.
+        (assoc (plan-js-require kind (into [specifier] rest-of))
+               :also-as target))
+
+      :else (plan-ns-require cenv kind spec))))
 
 (defn- plan-import
   "One (:import ...) entry: [goog.string StringBuffer], or the class written out as
@@ -1938,9 +2050,14 @@
   directions are asked here and in apply-require!. Without them
   (:require [\"react\" :as r] [app.r :as r]) would take whichever branch the
   resolver asks first, silently."
-  [cenv this-ns {:keys [specifier path as refers]}]
+  [cenv this-ns {:keys [specifier path as also-as refers]}]
   (env/add-js-require! cenv this-ns specifier)
-  (when as
+  ;; `as` is the alias that was asked for; `also-as` is the SYMBOL the require was
+  ;; written under when the spec was shadow's spelling, so that
+  ;; (:require [clipboard-polyfill]) leaves clipboard-polyfill/write resolving -
+  ;; the same second name, and the same word for it, that a namespace require
+  ;; carries for a rewritten target (apply-ns-require!).
+  (doseq [as (remove nil? [as also-as])]
     (when (.lookupAlias ^Namespace (env/cljs-ns cenv this-ns) as)
       (analysis-error as (str as " already names a namespace in " this-ns
                               " - a JavaScript module needs an alias of its own.")))
@@ -1950,7 +2067,8 @@
                             refers)))
 
 (defn- apply-ns-require!
-  [cenv this-ns {:keys [target as also-as refers renames macros alias-only]}]
+  [cenv this-ns {:keys [target as also-as refers renames goog-refers macros
+                        alias-only]}]
   ;; :as-alias alone: the alias below and nothing else. NOT add-require!, which is
   ;; what puts a namespace in the module's imports and the prologue - and there is
   ;; no module to import, because the namespace was never compiled and need not
@@ -1977,6 +2095,13 @@
                              " - a namespace needs an alias of its own.")))
     (.addAlias ^Namespace (env/cljs-ns cenv this-ns) a
                ^Namespace (env/cljs-ns cenv target)))
+  ;; (:require [goog.string :refer [format]]) - a bare name drawn out of a Closure
+  ;; namespace. Beside the Var refers below rather than among them: what is
+  ;; recorded is which QUALIFIED name the bare one stands for, and nothing is
+  ;; interned, because there is no Var on the other end to intern. The counterpart
+  ;; of apply-js-require!'s env/add-js-refers!, one world over.
+  (when (seq goog-refers)
+    (env/add-goog-refers! cenv this-ns goog-refers))
   (let [^Namespace from (env/cljs-ns cenv target)
         ^Namespace here (env/cljs-ns cenv this-ns)]
     (doseq [sym refers]
@@ -2847,6 +2972,9 @@
             ;; (:require ["react" :refer [useState]]) - a bare name drawn out of a
             ;; JavaScript module. {name [specifier export]}, or nil.
             js-ref (get (env/js-refers cenv env/*current-ns*) sym)
+            ;; (:require [goog.string :refer [format]]) - a bare name drawn out of
+            ;; a Closure namespace. The QUALIFIED symbol it stands for, or nil.
+            gg-ref (get (env/goog-refers cenv env/*current-ns*) sym)
             ;; is `v` a mapping of THIS namespace - a def, or a :refer of a var -
             ;; rather than the cljs.core one resolve-var falls back to? That is the
             ;; whole of the ordering question below, and asking it costs one lookup
@@ -2859,10 +2987,30 @@
           ;; second half, (:require ["react-dom" :refer [render]]) would resolve to
           ;; nothing at all today and to cljs.core/render the day core grew one,
           ;; which is a name silently changing meaning under a program.
-          (and (some? v) (or (nil? js-ref) (mine?))) (var-node env v sym)
+          (and (some? v) (or (and (nil? js-ref) (nil? gg-ref)) (mine?)))
+          (var-node env v sym)
 
           (some? js-ref)
           (js-module-var-node env (first js-ref) (second js-ref) sym)
+
+          ;; A GOOG REFER IS A REFER too, so it sits in the same slot a JS one
+          ;; does and for the identical reason - below what this namespace defines
+          ;; or refers itself, above the implicit refer of cljs.core. `format` is
+          ;; the name that makes the second half concrete rather than hypothetical:
+          ;; it is what lambdaisland.deep-diff2 refers out of goog.string, and
+          ;; cljs.core has no format TODAY.
+          ;;
+          ;; Handed to analyze-qualified-symbol rather than turned into a node
+          ;; here, which is the whole of why this branch is one line. That function
+          ;; already reads a goog name both ways - goog.string/format is the
+          ;; PROVIDE of that name, gobject/get is a property of a namespace object
+          ;; - and already records the require, checks a reduced namespace's var
+          ;; list and refuses a name we do not have. A refer decides none of that
+          ;; and must not: it says only which qualified name was meant.
+          ;;
+          ;; `sym` is passed as the form so every message and every node names what
+          ;; the source actually wrote, which is the bare name.
+          (some? gg-ref) (analyze-qualified-symbol cenv env gg-ref sym)
 
           ;; (:refer-global :only [Object]) - a bare name this namespace said is
           ;; the host's. AFTER the var, which is what makes it a refer rather than
