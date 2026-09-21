@@ -354,6 +354,70 @@
                (js/console.log (-unbox (js/Date. 1000)))
                (js/console.log (-unbox (reify IBox (-unbox [this] \"from-reify\"))))"))))
 
+(h/deftest-when h/node? test-a-reify-inside-a-method-reaches-the-enclosing-object
+  ;; §5.50. reify makes every local in scope a field of the type it mints, and
+  ;; inside a deftype method one of those locals is the SELF BINDING - the symbol
+  ;; deftype* gives the object its methods are called on. The reify's own deftype
+  ;; binds that same symbol, so making it a field was a name collision, and the
+  ;; compiler said so and stopped: "A field cannot be named self__2947__auto__".
+  ;;
+  ;; 58 of one real application's 414 namespaces died of it, all of them behind
+  ;; malli, whose -simple-schema returns a reify from inside a schema method.
+  ;;
+  ;; What the body actually reaches the enclosing object by is the name the USER
+  ;; wrote. Both spellings, because they take different routes: `this` is a local
+  ;; bound by a let the macro writes, and `x` is a FIELD, whose bare name analyses
+  ;; as a property read of the enclosing object - out here, where that object is
+  ;; still in scope, and its value is then passed to the reify's constructor.
+  (is (= "x=7 this-x=7"
+         (run "(defprotocol IReach (-reach [this]))
+               (deftype Outer [x]
+                 IReach
+                 (-reach [this]
+                   (reify Object
+                     (toString [_] (str \"x=\" x \" this-x=\" (.-x this))))))
+               (js/console.log (.toString (-reach (Outer. 7))))"))))
+
+(h/deftest-when h/node? test-a-reify-inside-a-method-copies-the-right-object
+  ;; THE ASSERTION THE FIX RESTS ON, and the reason dropping the self binding is
+  ;; not merely an economy. reify's -with-meta rebuilds the object with
+  ;; (new t <every captured local> meta), and that expression sits INSIDE one of
+  ;; the reify's own methods - where the self symbol names THIS object. Had the
+  ;; enclosing self stayed a field, the copy would have been handed itself in the
+  ;; place where it meant to carry the object it was created inside, and the field
+  ;; read below would have gone looking on the wrong one.
+  ;;
+  ;; So the meta round-trip is the test: x has to survive the copy.
+  (is (= "x=7 k=1"
+         (run "(defprotocol ICopy (-copy [this]))
+               (deftype Outer [x]
+                 ICopy
+                 (-copy [this] (reify Object (toString [_] (str \"x=\" x)))))
+               (def r (with-meta (-copy (Outer. 7)) {:k 1}))
+               (js/console.log (str (.toString r) \" k=\" (:k (meta r))))"))))
+
+(h/deftest-when h/node? test-a-reify-nests-in-a-reify-and-in-a-record
+  ;; The same shape one level in, where the enclosing self comes from a type the
+  ;; reify macro minted rather than one the user wrote
+  (is (= "n=3"
+         (run "(defprotocol INest (-nest [this]))
+               (def outer (let [n 3]
+                            (reify INest
+                              (-nest [this] (reify Object (toString [_] (str \"n=\" n)))))))
+               (js/console.log (.toString (-nest outer)))")))
+  ;; and from a defrecord, which is the case that always worked and has to go on
+  ;; working. A record mints a self symbol of its own, so the name reify drops is
+  ;; not the one in scope here: the record's self is captured, becomes a field,
+  ;; and the field is fine - nothing shadows it. NO DEFEAT BITES THIS ONE, which
+  ;; is the point of writing it down: it is a guard on a case that passes for a
+  ;; different reason than the two above, not a second test of the filter.
+  (is (= "x=7"
+         (run "(defprotocol INestRec (-nest-rec [this]))
+               (defrecord Rec [x]
+                 INestRec
+                 (-nest-rec [this] (reify Object (toString [_] (str \"x=\" x)))))
+               (js/console.log (.toString (-nest-rec (Rec. 7))))"))))
+
 (h/deftest-when h/node? test-find-ns-answers-from-the-registry
   ;; THE MEASUREMENT THE REMOVAL WAS MADE ON, taken again. (find-ns 'cljs.user) was
   ;; nil for a namespace that certainly exists, because find-ns-obj walked munged

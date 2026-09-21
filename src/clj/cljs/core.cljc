@@ -1470,6 +1470,30 @@
       'js/BigInt "bigint"
       'js/Function "function"})
 
+(def ^:private self-sym
+  "The symbol deftype* binds the object its methods are called on to.
+
+  ADAPTED (M5). It lives up here rather than inside deftype because REIFY needs
+  the same symbol: reify mints a deftype, and it has to know which name that
+  deftype is about to bind in order to keep it out of the fields it captures
+  (§5.50). Two places, one name, and the whole of what the name is for.
+
+  It is a READ-TIME auto-gensym, so it is minted once when this file is read and
+  never again. That is what keeps recompiling an unchanged file byte-identical:
+  an explicit (gensym \"self__\") would mint a new number on every expansion, and
+  names/legible-base cannot strip what carries no mark saying it was minted -
+  only the __<n>__auto__ shape is stripped, which is why this is spelled as an
+  auto-gensym and not as a call. Nothing downstream depends on the number:
+  names/local-name strips the decoration and appends a counter of its own, so two
+  live selfs get two distinct JavaScript names whatever they are called here.
+
+  defrecord mints one of ITS own, below, and is deliberately left doing so. A
+  reify inside a record method captures that symbol as a field and the field
+  works - the minted deftype binds a different name, so nothing is shadowed and
+  nothing collides. Sharing one symbol there too would be tidier to say and
+  changes no behaviour any test can see, which is the reason not to do it."
+  `self#)
+
 (core/defmacro reify
   "reify creates an object implementing a protocol.
   reify is a macro with the following structure:
@@ -1519,7 +1543,24 @@
                         {:anonymous true})
              meta-sym (gensym "meta")
              this-sym (gensym "_")
-             locals   (keys (:locals &env))
+             ;; EVERY LOCAL IN SCOPE BECOMES A FIELD - except the one that
+             ;; names the object of an enclosing type's method (§5.50). That one
+             ;; is not a local the body can reach: the deftype below binds the
+             ;; same symbol for its own methods, so inside them the name means
+             ;; THIS object and not the outer one. Capturing it would not merely
+             ;; waste a field - -with-meta reconstructs (new t ~@locals ...) from
+             ;; inside a method, where the outer object's name now reads the inner
+             ;; one, and the copy would carry itself where it meant to carry its
+             ;; enclosing object.
+             ;;
+             ;; Nothing is lost by dropping it. A method reaches its object by the
+             ;; name the USER gave it - (-p [this] ...) binds `this` with a let,
+             ;; and `this` is an ordinary local that is captured here like any
+             ;; other. A field of the enclosing type is captured by its own bare
+             ;; name too, and the constructor argument for it is analysed out
+             ;; here, where the outer self is still in scope and still means the
+             ;; outer object.
+             locals   (remove #{self-sym} (keys (:locals &env)))
              ns       (core/-> &env :ns :name)
              munge    comp/munge]
     `(do
@@ -1990,13 +2031,11 @@
              r (:name v)
              protocols (collect-protocols impls env)
              ;; ADAPTED (M5): deftype*'s third argument is the SELF SYMBOL, not
-             ;; the protocol bitmasks (§5.4). It is an auto-gensym rather than a
-             ;; fresh one per expansion, so that recompiling an unchanged file
-             ;; produces unchanged text; names/local-name drops the decoration, so
-             ;; its number never reaches the output. extend-type reads it back off
-             ;; the type symbol's metadata, which is how a method comes to bind it
-             ;; and a field comes to be in scope by its bare name.
-             self `self#
+             ;; the protocol bitmasks (§5.4). extend-type reads it back off the
+             ;; type symbol's metadata, which is how a method comes to bind it and
+             ;; a field comes to be in scope by its bare name. self-sym above, so
+             ;; that reify can name the same one.
+             self self-sym
              t (vary-meta t assoc
                  :protocols protocols
                  :self self)]
@@ -2115,7 +2154,9 @@
                            (reduce (fn [ret# [k# v#]] (f# ret# k# v#)) init# this#))
                         ])
                protocols (collect-protocols impls env)
-               ;; ADAPTED (M5): as deftype above - self, not pmasks.
+               ;; ADAPTED (M5): as deftype above - self, not pmasks. Its OWN
+               ;; auto-gensym, not self-sym: a record's self is never the symbol
+               ;; a minted type binds, so nothing has to agree with it (§5.50).
                self `self#
                tagname (vary-meta tagname assoc
                          :protocols protocols
