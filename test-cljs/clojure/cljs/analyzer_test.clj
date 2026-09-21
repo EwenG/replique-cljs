@@ -1422,6 +1422,25 @@
         (is (= :editor (asked 'app.editor)))
         (is (nil? (asked 'app.some.leaf)))))))
 
+(deftest test-a-js-name-that-reaches-a-clojurescript-namespace-says-so
+  ;; 5.60. js/app.other.thing is somebody assuming the layout every OTHER
+  ;; ClojureScript compiler emits, where a namespace is an object at a global path.
+  ;; Here it is not one, so the name is undefined at load and the browser says
+  ;; "app is not defined" - true, unhelpful, and a long way from the assumption
+  ;; that caused it. The warning names the assumption at compile time instead.
+  (let [cenv (h/fresh-env 'app.w)]
+    (h/analyze cenv '(ns app.other))
+    (h/analyze cenv '(ns app.w))
+    (is (str/includes? (h/warnings #(h/analyze cenv 'js/app.other.thing))
+                       "js-name-is-a-namespace"))
+    (testing "an ordinary host global is not one"
+      (is (str/blank? (h/warnings #(h/analyze cenv 'js/Math.floor))))
+      (is (str/blank? (h/warnings #(h/analyze cenv 'js/app.nosuch)))))
+    (testing "and cljs is the one root runtime.js publishes, so it works and is silent"
+      ;; a warning about a name that resolves would be noise, and this is the only
+      ;; place that knows the two facts are the same fact
+      (is (str/blank? (h/warnings #(h/analyze cenv 'js/cljs.core)))))))
+
 (deftest test-a-macro-alias-target-is-rewritten-like-any-other-name
   ;; §5.28. (:require-macros [clojure.core :as lang]) makes lang/for the CLJS.CORE
   ;; macro. The alias itself points at the JVM clojure.core - a :refer off the same

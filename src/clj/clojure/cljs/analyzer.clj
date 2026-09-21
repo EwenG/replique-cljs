@@ -2327,6 +2327,34 @@
   (check-js-name! sym)
   {:op :js-var :name sym :ns 'js :form form :env env :children []})
 
+(def ^:private published-global-root
+  "The one ClojureScript namespace root this compiler publishes as a JavaScript
+  global. runtime.js sets globalThis.cljs, and nothing else - see 5.60 for the
+  measurement that says one is the right number."
+  "cljs")
+
+(defn- cljs-namespace-behind
+  "The ClojureScript namespace a js/ name is reaching for, or nil.
+
+  js/app.core.foo under a compiled app.core is somebody assuming the layout every
+  OTHER ClojureScript compiler emits, where a namespace is an object at a global
+  path. Here it is not one, so the name is undefined at load and the message says
+  `app is not defined` - true, unhelpful, and a long way from the assumption that
+  caused it. This is what lets the warning name the assumption instead.
+
+  The LONGEST prefix that names a namespace, which is analyze-dotted-symbol's rule
+  and dotted-var-sym's, so the three cannot drift apart.
+
+  `cljs` is excluded because it is the one root runtime.js does publish, and a
+  warning about a name that works would be noise."
+  [cenv sym]
+  (let [segs (clojure.string/split (str (name sym)) #"\.")]
+    (when-not (= published-global-root (first segs))
+      (some (fn [n]
+              (let [p (symbol (clojure.string/join "." (take n segs)))]
+                (when (or (= 'cljs.core p) (some? (env/find-cljs-ns cenv p))) p)))
+            (range (count segs) 0 -1)))))
+
 (defn- analyze-js-symbol
   "js/foo - a JavaScript global.
 
@@ -2373,7 +2401,9 @@
       ;; records, the subset it has to be in - is decided there and stays decided
       ;; in one place
       (goog/goog-ns? bare) (analyze cenv env (with-meta bare (meta sym)))
-      :else (js-var-node env sym sym))))
+      :else (do (when-let [nsym (cljs-namespace-behind cenv bare)]
+                  (warning :js-name-is-a-namespace env {:sym sym :ns-sym nsym}))
+                (js-var-node env sym sym)))))
 
 (defn- goog-var-node
   "gobject/get - a var in a goog namespace.

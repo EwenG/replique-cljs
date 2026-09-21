@@ -718,6 +718,40 @@
     "(first (vals {:a 1}))"       "1"
     "(str \"a\" :b 1)"            "a:b1"))
 
+;; --- the cljs global --------------------------------------------------------
+
+(h/deftest-when h/node? test-the-cljs-global-is-the-real-namespace-object
+  ;; 5.60. runtime.js publishes globalThis.cljs, which is the object a
+  ;; goog.provide build makes and this compiler otherwise does not. Nothing we
+  ;; emit reads it; cljs-bean does, and 339 of nosco-gamma's 684 modules stop
+  ;; there without it.
+  (testing "a read finds the real type, not a copy of it"
+    (is (= "true"
+           (h/output-with-core
+            (h/core-env 'app.glob)
+            (str "(cljs.core/pr-str (identical? (.. js/cljs -core -PersistentArrayMap -EMPTY)"
+                 " cljs.core/PersistentArrayMap.EMPTY))")))))
+  (testing "and a WRITE through it lands on the real type"
+    ;; which is the half a synthesised object would get silently wrong, and which
+    ;; cljs-bean does on purpose - it replaces the empty map to make ->clj's
+    ;; result the default one
+    (is (= "true"
+           (h/output-with-core
+            (h/core-env 'app.glob2)
+            (str "(set! (.. js/cljs -core -PersistentArrayMap -EMPTY) 42)"
+                 " (cljs.core/pr-str (identical? 42 cljs.core/PersistentArrayMap.EMPTY))")))))
+  (testing "and on the NAMESPACE OBJECT, which the read above cannot tell"
+    ;; PersistentArrayMap is the same object in a copy of the namespace as in the
+    ;; namespace, so setting a property OF IT proves nothing about `core` itself -
+    ;; a shallow copy passes that assertion. Writing a new name is the one that
+    ;; separates them, because exists? reads $ns("cljs.core") directly: through a
+    ;; view the write is there, through a copy it went somewhere else and is lost.
+    (is (= "true"
+           (h/output-with-core
+            (h/core-env 'app.glob3)
+            (str "(set! (.. js/cljs -core -brandnew) 42)"
+                 " (cljs.core/pr-str (cljs.core/exists? cljs.core/brandnew))"))))))
+
 ;; --- exists? -----------------------------------------------------------------
 
 (deftest test-exists-asks-the-question-this-compiler-can-answer

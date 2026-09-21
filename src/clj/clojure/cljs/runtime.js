@@ -48,6 +48,36 @@ export function truth_(x) { return x !== null && x !== undefined && x !== false;
 // drops the variable, so a compiled bundle is not reading this at run time.
 globalThis.COMPILED = false;
 
+// The `cljs` object a goog.provide build publishes as a global. Nothing WE emit
+// reads it - a var here is a property of a namespace object (doc/cljs-compiler.md
+// 5.2) and a module reaches those through $ns - but code we did not write does:
+// cljs-bean asks for (.. js/cljs -core -PersistentArrayMap -EMPTY), wanting the
+// empty map's identity rather than a value, and 339 of nosco-gamma's 684 modules
+// stop there.
+//
+// A VIEW AND NOT A COPY. `core` is the object ns() hands every module, so a read
+// finds the real type - and cljs-bean's two set!s of PersistentArrayMap.EMPTY land
+// on the real one too. A synthesised object would get the read right and the
+// writes silently wrong, which is the worse half of that trade.
+//
+// ONE ROOT, because one is what was measured. Across every ClojureScript source on
+// a 414-namespace application's classpath, exactly one library reaches for a global
+// like this, and the only thing it asks of it is `core`.
+//
+// UNCONDITIONAL, as COMPILED above is, and with a sharper edge. If another
+// ClojureScript bundle shares the page then globalThis.cljs is ITS namespace tree,
+// and deferring would send our cljs-bean at its PersistentArrayMap - a different
+// type of the same name, and every wrong answer silent. Two runtimes on one page is
+// broken either way; being broken in our own favour is the half we can reason about.
+//
+// AND IT IS THE EXCEPTION RATHER THAN THE RULE. js/goog is deliberately NOT
+// published here - analyzer/analyze-js-symbol resolves it instead, to keep our
+// Closure subset isolated from a Closure the user's project bundles. This goes the
+// other way because nothing can resolve `js/cljs` at compile time: what cljs-bean
+// reads off it are three host property accesses, not a name this compiler ever sees
+// whole. See doc/cljs-compiler.md 5.60.
+globalThis.cljs = { core: ns("cljs.core") };
+
 $CLJS.ns = ns;
 $CLJS.truth_ = truth_;
 
