@@ -1314,6 +1314,114 @@
           (h/analyze cenv '(ns app.viewed (:require [clojure.string :as str2])))
           (is (= 'clojure.string (get-in nss ['app.viewed :requires 'str2]))))))))
 
+;; --- 5.58, shadow-cljs's module map ------------------------------------------
+
+(def ^:private two-build-config
+  "A shadow-cljs.edn with the shape that matters: two builds splitting one source
+  tree differently, and app.editor an entry of a module in each - under a
+  different name, which is the whole reason a build has to be named rather than
+  guessed at.
+
+  #shadow/env is here on purpose. shadow reads its configuration with readers for
+  that tag and for #env, both of which look up environment variables;
+  nosco-gamma's :main build spells its :asset-path that way. We read one vector of
+  symbols out of this file, so if the tag were not got past every assertion below
+  would error rather than fail."
+  (str "{:builds\n"
+       " {:trial {:target :browser\n"
+       "          :modules {:trial {:entries [app.editor app.trial]}}}\n"
+       "  :main  {:target :browser\n"
+       "          :asset-path #shadow/env [\"NO_SUCH_VAR\" :default \"/js\"]\n"
+       "          :modules {:base   {:entries [app.base]}\n"
+       "                    :editor {:entries [app.editor] :depends-on #{:base}}}}}}\n"))
+
+(defn- config-file
+  "A configuration file holding `text`, for *shadow-cljs-edn* to be pointed at."
+  ^java.io.File [text]
+  (doto (java.io.File/createTempFile "shadow-cljs" ".edn")
+    (.deleteOnExit)
+    (spit text)))
+
+(defmacro module-upstream-would-load
+  "What shadow.lazy/module-for-ns reads, quoted:
+
+      (get-in @env/*compiler* [:shadow.build/ns->mod ns])
+
+  copied rather than described, because the point of the test below is that the
+  lookup upstream's macro makes is the lookup this compiler answers. shadow-cljs
+  is not a dependency here - the vendored suite is the oracle - so the one line of
+  it that matters is spelled out instead. requiring-resolve for
+  upstream-expansion-of's reason."
+  [ns-sym]
+  (list 'quote (get-in @@(requiring-resolve 'cljs.env/*compiler*)
+                       [:shadow.build/ns->mod ns-sym])))
+
+(deftest test-a-module-entry-names-the-module-it-is-the-entry-of
+  ;; 5.58. shadow.lazy/loadable asks which output module a namespace loads with,
+  ;; and throws "Could not find module for ns: X" when nothing answers - which is
+  ;; not a failure of analysis but a question about a build, asked of a compiler
+  ;; that is not running one. The answer is in the configuration already: a module
+  ;; is named by its :entries, and an entry is the kind of namespace loadable is
+  ;; given, because naming a module by its entry point is what code-splitting is.
+  (binding [macroexpand/*shadow-cljs-edn* (config-file two-build-config)]
+    (let [mods (macroexpand/shadow-ns->mod)]
+      (is (= :editor (get mods 'app.editor)))
+      (is (= :base (get mods 'app.base)))
+
+      (testing "the build read is the one named, not whichever the file holds first"
+        ;; app.editor is an entry in :trial too, under the module name :trial.
+        ;; Nothing in the world this compiler holds could settle which build it is
+        ;; compiling for, so the name is written down instead - macroexpand/
+        ;; shadow-build, and it reads :main.
+        (is (not= :trial (get mods 'app.editor))))
+
+      (testing "a namespace that is not an entry has no answer here"
+        ;; AND MUST NOT GET ONE. Which module shadow puts a non-entry in is decided
+        ;; by walking the dependency graph against the module tree, which is a
+        ;; build's work. Absent, module-for-ns! throws exactly what it threw
+        ;; before, and the refusal sits where the knowledge runs out rather than a
+        ;; step past it.
+        (is (nil? (get mods 'app.some.leaf)))
+        (is (nil? (get mods 'app.trial)))))))
+
+(deftest test-the-module-map-is-read-when-it-is-asked
+  ;; A VIEW, for upstream-namespaces' reason: a REPL outlives an edit to
+  ;; shadow-cljs.edn, and adding a module is how a component is made lazy in the
+  ;; first place. A map built when the compiler-state atom was made would go on
+  ;; answering what the file used to say, for the life of the process.
+  (let [f    (config-file two-build-config)
+        mods (binding [macroexpand/*shadow-cljs-edn* f]
+               (macroexpand/shadow-ns->mod))]
+    (binding [macroexpand/*shadow-cljs-edn* f]
+      (is (= :editor (get mods 'app.editor)))
+      (spit f (str "{:builds {:main {:modules"
+                   " {:later {:entries [app.editor]}}}}}"))
+      (is (= :later (get mods 'app.editor))))))
+
+(deftest test-no-configuration-file-answers-nothing
+  ;; The file is relative, which is shadow's own rule - its load-cljs-edn is
+  ;; literally (io/file "shadow-cljs.edn"), so the project directory is the one the
+  ;; JVM was started in. A REPL started somewhere else has no shadow build to speak
+  ;; of, and saying nothing is the truth about it.
+  (binding [macroexpand/*shadow-cljs-edn* (java.io.File. "no/such/shadow-cljs.edn")]
+    (is (nil? (get (macroexpand/shadow-ns->mod) 'app.editor)))))
+
+(h/deftest-when h/cljs-analyzer? test-a-macro-reads-the-module-map-through-upstreams-atom
+  ;; THE PATH THAT MATTERS. shadow.lazy's macros do not take the map from us; they
+  ;; read it through cljs.env/*compiler*, the same var 5.55 bound for core.async
+  ;; and 5.57 filled for sci. So the entry has to be in that atom, and the atom has
+  ;; to be bound while our macroexpansion runs.
+  (let [cenv (h/fresh-env 'app.lazy)]
+    (h/analyze cenv '(ns app.lazy
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [module-upstream-would-load]])))
+    (binding [macroexpand/*shadow-cljs-edn* (config-file two-build-config)]
+      (let [asked (fn [sym] (second (macroexpand/macroexpand-1
+                                     cenv (env/analysis-env cenv)
+                                     (list 'module-upstream-would-load sym))))]
+        (is (= :editor (asked 'app.editor)))
+        (is (nil? (asked 'app.some.leaf)))))))
+
 (deftest test-a-macro-alias-target-is-rewritten-like-any-other-name
   ;; §5.28. (:require-macros [clojure.core :as lang]) makes lang/for the CLJS.CORE
   ;; macro. The alias itself points at the JVM clojure.core - a :refer off the same

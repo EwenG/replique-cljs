@@ -22,8 +22,11 @@
   See doc/cljs-compiler.md M1."}
   clojure.cljs.macroexpand
   (:refer-clojure :exclude [macroexpand macroexpand-1])
-  (:require [clojure.cljs.env :as env])
-  (:import [clojure.lang Namespace NamespaceWorld Symbol Var]))
+  (:require [clojure.cljs.env :as env]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io])
+  (:import [clojure.lang Namespace NamespaceWorld Symbol Var]
+           [java.io File]))
 
 (def specials
   "cljs.analyzer/specials. A special form is never a macro call, whatever the
@@ -121,6 +124,112 @@
               (resolve 'cljs.env/*compiler*)
               (catch Throwable _ nil))))
 
+;; --- the other build tool's module map ---------------------------------------
+
+;; shadow-cljs splits one source tree into several output modules and loads them
+;; on demand, and shadow.lazy/loadable is the macro a program writes to say `this
+;; component comes later`. It expands by asking the compiler-state atom which
+;; module a namespace is part of:
+;;
+;;     (defn module-for-ns [compiler-env ns]
+;;       (get-in compiler-env [:shadow.build/ns->mod ns]))
+;;
+;;     (defn module-for-ns! [env ns]
+;;       (let [mod (module-for-ns @env/*compiler* ns)]
+;;         (when-not mod
+;;           (throw (ana/error env (str "Could not find module for ns: " ns))))
+;;         mod))
+;;
+;; and with nothing under that key the throw is unconditional. It is not a failure
+;; of analysis - the form is fine and we understand it - it is a question about a
+;; build, asked of a compiler that is not running one.
+;;
+;; THE ANSWER IS WRITTEN DOWN ALREADY, and that is why this is small. A module is
+;; named by its ENTRY namespaces in shadow-cljs.edn:
+;;
+;;     :modules {:editor {:entries [nosco.richtext.editor] :depends-on #{:main}}}
+;;
+;; and an entry is exactly the kind of namespace loadable is given, because naming
+;; a module by its entry point is what code-splitting is. So the map shadow would
+;; have computed is not needed; the part of it anyone asks for is stated in the
+;; configuration, and reading it is not a guess.
+;;
+;; WHERE IT STOPS is a namespace that is not an entry. Which module shadow puts one
+;; of those in is decided by walking the dependency graph against the module tree,
+;; and that is a build's work and a build's alone. Such a namespace is absent here,
+;; module-for-ns! throws exactly what it threw before, and the refusal sits where
+;; the knowledge actually runs out rather than one step past it.
+;;
+;; See doc/cljs-compiler.md 5.58.
+
+(def ^:dynamic *shadow-cljs-edn*
+  "shadow-cljs's configuration file.
+
+  RELATIVE, AND THAT IS SHADOW'S OWN RULE RATHER THAN A CHOICE OF OURS.
+  shadow.cljs.devtools.config/load-cljs-edn is literally (io/file
+  \"shadow-cljs.edn\"): the project directory is whichever directory the JVM was
+  started in, which is why the shadow-cljs command line insists on being run from
+  the project root. A java.io.File holding a relative path resolves it when it is
+  read and not when it is made, so this stays a question and does not become an
+  answer at load time.
+
+  A REPL started somewhere else finds no file and this answers nothing, which is
+  the truth about that REPL and not a fallback worth inventing around.
+
+  Dynamic so a test can point it at a fixture."
+  (io/file "shadow-cljs.edn"))
+
+(def shadow-build
+  "Which build's :modules are read.
+
+  THE ONE THING THAT CANNOT BE DERIVED, so it is written down instead. A
+  shadow-cljs.edn holds several builds; each splits the same source tree its own
+  way, and one namespace can be an entry of differently named modules in two of
+  them - nosco-gamma's richtext editor is :editor in the :main build and :trial in
+  the :trial build. A shadow build knows which one it is because it was started as
+  one. This compiler was not started as any, and there is no fact anywhere in the
+  world it holds that would settle it, so guessing would be picking one build's
+  answer and presenting it as the truth about all of them."
+  :main)
+
+(defn- shadow-modules
+  "[:builds <shadow-build> :modules] out of the configuration file, or nil.
+
+  EVERY TAG IS DROPPED, its value kept. shadow reads this file with readers for
+  #shadow/env and #env, which look up environment variables - nosco-gamma spells
+  an :asset-path that way. We read one vector of symbols out of the whole file and
+  a symbol carries no tag, so the tags we meet are always somebody else's
+  configuration on the way past, and the cheapest correct thing to do with a value
+  we will never look at is to stop it from throwing."
+  []
+  (let [^File f *shadow-cljs-edn*]
+    (when (and f (.exists f))
+      (-> (edn/read-string {:default (fn [_tag value] value)} (slurp f))
+          (get-in [:builds shadow-build :modules])))))
+
+(defn shadow-ns->mod
+  "What upstream's atom answers under :shadow.build/ns->mod.
+
+  A VIEW, for the reason clojure.cljs.env/upstream-namespaces is one: the file is
+  read when a lookup happens rather than when this is made. A REPL outlives an
+  edit to shadow-cljs.edn - adding a module is how you make a component lazy - and
+  a map built once would go on answering what the file used to say. The cost is a
+  slurp of a few kilobytes per loadable in a compilation unit, and there are six
+  in the whole of nosco-gamma.
+
+  ILookup AND NOTHING ELSE, because one get-in is the whole of what reads it.
+  5.57 grew its view twice at runtime by guessing at the shape first; this one
+  waits to be asked."
+  []
+  (reify
+    clojure.lang.ILookup
+    (valAt [this k] (.valAt this k nil))
+    (valAt [_ k nf]
+      (or (some (fn [[mod-id {:keys [entries]}]]
+                  (when (some #(= k %) entries) mod-id))
+                (shadow-modules))
+          nf))))
+
 (def ^:private upstream-compiler-state
   "What `cljs.env/*compiler*` derefs to while a macro of ours runs.
 
@@ -159,11 +268,22 @@
   reason 5.55 gave for leaving it empty, read backwards: excluded? and used? ask
   &env first, but cljs.analyzer.api does not ask &env at all. It is a facade over
   this atom, and a macro that calls it - sci's protocol-vars, asking whether
-  cljs.core/ICloneable is a protocol - has no other road in."
+  cljs.core/ICloneable is a protocol - has no other road in.
+
+  AND STILL A CONSTANT AFTER 5.58, which added a second entry that is not one,
+  and not even upstream's: :shadow.build/ns->mod, which shadow-cljs's own macros
+  read through upstream's var. The two views differ in what they read - one the
+  compile environment bound around this call, the other a file on disk - and
+  agree in why they are views: neither fact can be frozen at the moment this atom
+  is made without a REPL going on to answer from the past."
   (atom {:options    {:spec-skip-macros true}
          ;; spelled out rather than ::-resolved: this is cljs.analyzer's keyword,
          ;; and cljs.analyzer is not required here (see upstream-compiler-var)
-         :cljs.analyzer/namespaces (env/upstream-namespaces)}))
+         :cljs.analyzer/namespaces (env/upstream-namespaces)
+         ;; not cljs.analyzer's key at all but shadow-cljs's, and here for the
+         ;; same reason: a macro reads it through this atom and has no other road
+         ;; in. See shadow-ns->mod above.
+         :shadow.build/ns->mod (shadow-ns->mod)}))
 
 (defn macroexpand-1
   "Expand `form` once in `env`. Returns the form unchanged when there is nothing
