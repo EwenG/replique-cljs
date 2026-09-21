@@ -150,8 +150,20 @@
 
   :spec-skip-macros is a DECISION rather than a default: clojure.spec's macro
   instrumentation is not something this compiler runs, so it is skipped by saying
-  so rather than by happening not to be configured."
-  (atom {:options {:spec-skip-macros true}}))
+  so rather than by happening not to be configured.
+
+  STILL A CONSTANT AFTER 5.57, which added the entry that is not one. `::namespaces`
+  answers for whichever compile environment is bound when it is asked, so there is
+  one of these for the whole compiler rather than one per macroexpansion - see
+  clojure.cljs.env/upstream-namespaces. The reason it had to be added at all is the
+  reason 5.55 gave for leaving it empty, read backwards: excluded? and used? ask
+  &env first, but cljs.analyzer.api does not ask &env at all. It is a facade over
+  this atom, and a macro that calls it - sci's protocol-vars, asking whether
+  cljs.core/ICloneable is a protocol - has no other road in."
+  (atom {:options    {:spec-skip-macros true}
+         ;; spelled out rather than ::-resolved: this is cljs.analyzer's keyword,
+         ;; and cljs.analyzer is not required here (see upstream-compiler-var)
+         :cljs.analyzer/namespaces (env/upstream-namespaces)}))
 
 (defn macroexpand-1
   "Expand `form` once in `env`. Returns the form unchanged when there is nothing
@@ -160,12 +172,20 @@
   The macro is invoked exactly as Clojure invokes one: (apply @v form env args),
   so it receives &form and &env.
 
-  Two departures from cljs.analyzer here. It binds *ns* to (create-ns *cljs-ns*)
-  around the call, minting a JVM namespace named after a ClojureScript one - which
-  is the collision NamespaceWorld exists to avoid, and which only matters to a
-  macro that reaches for *ns* itself (cljs/core.cljc does so once). And it tags a
-  js* expansion with :js-op / ::numeric metadata for the emitter's operator
-  inference, which has nothing to consume it yet."
+  One departure from cljs.analyzer remains: it tags a js* expansion with :js-op /
+  ::numeric metadata for the emitter's operator inference, which has nothing to
+  consume it yet.
+
+  *NS* IS BOUND, AND TO THE MACRO VIEW. cljs.analyzer binds it to
+  (create-ns *cljs-ns*), minting a JVM namespace named after a ClojureScript one,
+  which is the collision NamespaceWorld exists to avoid - so this used to bind
+  nothing, and a macro that asked (ns-name *ns*) got whoever happened to be
+  compiling. The macro view answers the question that macro is really asking: it is
+  a clojure.lang.Namespace, it is named after the ClojureScript namespace, and it
+  already exists in a world of its own (doc/cljs-compiler.md 5.57). goog-define in
+  our own core.cljc is the local reader - it munges the name of *ns* into the
+  define it emits - and kitchen-async's fixup-alias is the one that made it
+  necessary."
   [cenv env form]
   (if-not (seq? form)
     form
@@ -186,7 +206,8 @@
           ;; - which derefs that var and, unbound, throws a NullPointerException
           ;; out of deref-future. See upstream-compiler-state, and
           ;; doc/cljs-compiler.md 5.55.
-          (with-bindings (cond-> {#'env/*cenv* cenv}
+          (with-bindings (cond-> {#'env/*cenv* cenv
+                                  #'*ns* (env/macro-view cenv env/*current-ns*)}
                            @upstream-compiler-var
                            (assoc @upstream-compiler-var upstream-compiler-state))
             (apply @v form env (rest form)))

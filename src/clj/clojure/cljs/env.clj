@@ -739,3 +739,159 @@
   a macro can read it by accident, and a macro that starts a nested compilation
   gets that compilation's environment rather than this one's."
   nil)
+
+;; --- the other compiler's symbol table ---------------------------------------
+;;
+;; cljs.analyzer keeps every namespace it knows about in one map under
+;; [::ana/namespaces], and cljs.analyzer.api is a reading facade over it: resolve,
+;; find-ns, ns-publics, all-ns. A library macro that wants to know something about
+;; the program it is expanding inside asks THAT, because that is the compiler it
+;; was written for. sci's protocol-vars asks whether cljs.core/ICloneable is a
+;; protocol; kitchen-async's fixup-alias asks what a namespace's aliases point at.
+;; So the map has to answer.
+;;
+;; §5.55 could leave the compiler-state atom a constant because the two things
+;; upstream's MACRO LOOKUP reads through it are asked of &env first. Nothing asks
+;; &env first here: cljs.analyzer.api goes straight to the atom, and there is no
+;; other road into it.
+;;
+;; ANSWERED RATHER THAN BUILT. Copying the world into upstream's shape once per
+;; macroexpansion would cost more than the macroexpansions do - cljs.core alone is
+;; thousands of vars - and copying it once and caching it would go stale exactly
+;; when it matters, because the world grows as compilation proceeds and a macro
+;; asks about the namespace being compiled. What upstream does with the map is
+;; `gets`, which is plain nested `get` (doc/cljs-compiler.md §5.54), so a LOOKUP is
+;; all of it that is ever used - and a lookup can be computed when it is asked.
+;;
+;; The boundary is stated rather than hidden: these answer ILookup and Seqable,
+;; which is get, get-in and keys. Anything else - assoc, contains?, a swap! into
+;; the map - fails loudly instead of silently returning a half-truth about a
+;; symbol table that is not really a map.
+
+(defn- interned-defs
+  "[::namespaces <ns> :defs] - what a def carried, per symbol.
+
+  cljs.analyzer stores a map it built while analysing the def; we have the Var,
+  and its metadata IS what the def carried. clojure.cljs.analyzer/resolve-var
+  already answers this same question for cljs.core's own macros, in the same words
+  (:protocol-symbol, :protocol-info, :const, :deprecated), which is the point:
+  this is not new knowledge, only the other compiler's spelling of it.
+
+  INTERNED, not mapped. A :refer puts another namespace's Var in this one's
+  mappings, and upstream keeps those under :uses and :renames - see
+  ns-refers-and-renames. Seqable as well as ILookup because
+  cljs.analyzer.api/ns-publics walks it, which is how sci asks a namespace what it
+  has in it."
+  [^Namespace ns]
+  (let [info (fn [^Var v]
+               (assoc (meta v)
+                      :name (symbol (str (.getName ns)) (str (.sym v)))
+                      :ns   (.getName ns)))]
+    (reify
+      clojure.lang.ILookup
+      (valAt [this k] (.valAt this k nil))
+      (valAt [_ k nf]
+        (if-let [^Var v (when (symbol? k) (.findInternedVar ns ^Symbol k))]
+          (info v)
+          nf))
+      clojure.lang.Seqable
+      (seq [_]
+        (seq (into [] (keep (fn [[sym v]]
+                              (when (and (instance? Var v)
+                                         (identical? ns (.ns ^Var v)))
+                                (clojure.lang.MapEntry/create sym (info v)))))
+                   (.getMappings ns)))))))
+
+(defn- ns-refers-and-renames
+  "{:uses {name namespace} :renames {here there-qualified}} for `ns-sym`.
+
+  One pass, because in this world a :refer and a :rename are the same act - the
+  analyzer .refer's the other namespace's Var in under some name - and what tells
+  them apart is whether that name is the Var's own. Upstream keeps them in two
+  maps because it never has the Var to ask."
+  [^CompileEnv cenv ns-sym]
+  (let [^Namespace ns (cljs-ns cenv ns-sym)]
+    (reduce (fn [m [sym v]]
+              (if (or (not (instance? Var v)) (identical? ns (.ns ^Var v)))
+                m
+                (let [there (.getName (.ns ^Var v))]
+                  (if (= sym (.sym ^Var v))
+                    (assoc-in m [:uses sym] there)
+                    (assoc-in m [:renames sym] (symbol (str there) (str (.sym ^Var v))))))))
+            {:uses {} :renames {}}
+            (.getMappings ns))))
+
+(defn- ns-require-macros-map
+  "{alias macro-namespace} for `ns-sym` - ClojureScript's :require-macros.
+
+  An alias in the macro view already points at a real loaded JVM namespace, which
+  is the whole of what the macro world is for (see the namespace docstring)."
+  [^CompileEnv cenv ns-sym]
+  (persistent!
+   (reduce (fn [m [alias ^Namespace target]] (assoc! m alias (.getName target)))
+           (transient {})
+           (.getAliases ^Namespace (macro-view cenv ns-sym)))))
+
+(defn- upstream-ns-entry
+  "[::namespaces <ns>] for one namespace, or nil if there is no such namespace.
+
+  Nil rather than an empty map on purpose: upstream's loaded-js-ns? reads absence
+  here as `this name is a JavaScript namespace rather than a ClojureScript one`,
+  and an empty map would answer that question the wrong way round."
+  [^CompileEnv cenv ns-sym]
+  (when-let [^Namespace ns (find-cljs-ns cenv ns-sym)]
+    (merge {:name           ns-sym
+            :defs           (interned-defs ns)
+            :requires       (ns-requires-map cenv ns-sym)
+            :require-macros (ns-require-macros-map cenv ns-sym)
+            :use-macros     (ns-use-macros-map cenv ns-sym)
+            :excludes       (::excludes (meta ns) #{})
+            :imports        (imports cenv ns-sym)}
+           (ns-refers-and-renames cenv ns-sym))))
+
+(defn upstream-namespaces
+  "cljs.analyzer's [::namespaces] map, answered from the world instead of copied
+  into it. See the section note above for why it is a lookup and not a map.
+
+  With no argument it reads whatever *cenv* is bound to when the lookup happens,
+  which is what lets clojure.cljs.macroexpand hold ONE of these in a constant atom
+  for the whole compiler rather than allocating a compile environment's worth of
+  them per macroexpansion."
+  ([] (upstream-namespaces nil))
+  ([cenv]
+   (let [world  (fn [] (or cenv *cenv*))
+         entry  (fn [c k] (when (symbol? k) (upstream-ns-entry c k)))
+         allsq  (fn [^CompileEnv c]
+                  (seq (mapv (fn [^Namespace n]
+                               (clojure.lang.MapEntry/create
+                                (.getName n) (upstream-ns-entry c (.getName n))))
+                             (all-cljs-ns c))))]
+     (reify
+       clojure.lang.ILookup
+       (valAt [this k] (.valAt this k nil))
+       (valAt [_ k nf] (or (when-let [c (world)] (entry c k)) nf))
+
+       clojure.lang.Seqable
+       (seq [_] (when-let [c (world)] (allsq c)))
+
+       clojure.lang.IPersistentCollection
+       (count [_] (if-let [c (world)] (count (all-cljs-ns c)) 0))
+       (empty [_] {})
+       (equiv [this o] (identical? this o))
+       ;; A WRITE IS DROPPED, and this is the one place that needs saying out loud.
+       ;; cljs.analyzer swaps bookkeeping into [::namespaces <ns> :externs] while
+       ;; resolving a js/ name, for an externs-inference pass it runs later. We
+       ;; have no such pass, and nothing here is written through the atom anyway -
+       ;; a def reaches the symbol table by being analysed, which interns a Var.
+       ;; So the write has nothing to change and nothing to tell, and returning
+       ;; the view unchanged leaves the atom holding exactly what it held before.
+       ;; Refusing instead would break the macro that triggered it over
+       ;; bookkeeping neither compiler would ever read.
+       (cons [this _] this)
+
+       clojure.lang.Associative
+       (containsKey [_ k] (boolean (when-let [c (world)] (entry c k))))
+       (entryAt [_ k] (when-let [c (world)]
+                        (when-let [e (entry c k)]
+                          (clojure.lang.MapEntry/create k e))))
+       (assoc [this _ _] this)))))

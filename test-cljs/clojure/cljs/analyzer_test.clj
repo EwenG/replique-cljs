@@ -1165,6 +1165,155 @@
       (is (= [] (emitter/emit-top-lines
                  (ana/analyze-top cenv positioned '(intern-and-return-a-var))))))))
 
+(defmacro the-macro-time-ns
+  "(ns-name *ns*), quoted - what a macro sees when it asks which namespace it is
+  expanding inside. kitchen-async's fixup-alias asks exactly this, and uses the
+  answer to key into the compiler-state atom. See doc/cljs-compiler.md 5.57."
+  []
+  (list 'quote (ns-name *ns*)))
+
+(defmacro upstream-resolution-of
+  "cljs.analyzer.api/resolve on `sym`, quoted, with the &env this compiler handed
+  us - sci's copy-vars does precisely this to find out whether a name is a
+  protocol. requiring-resolve for upstream-expansion-of's reason."
+  [sym]
+  (list 'quote (select-keys ((requiring-resolve 'cljs.analyzer.api/resolve) &env sym)
+                            [:name :ns :protocol-symbol :protocol-info])))
+
+(defmacro upstream-compiler-state-now
+  "The compiler-state atom itself, so a test can look at what upstream would see."
+  []
+  (list 'quote @@(requiring-resolve 'cljs.env/*compiler*)))
+
+(deftest test-a-macro-sees-the-clojurescript-namespace-as-ns
+  ;; 5.57. *ns* is bound to the MACRO VIEW - a clojure.lang.Namespace named after
+  ;; the ClojureScript namespace, living in a world of its own, which is the object
+  ;; cljs.analyzer mints with (create-ns *cljs-ns*) and the collision
+  ;; NamespaceWorld exists to avoid. Before this it was bound to nothing, so a
+  ;; macro asking got whichever JVM namespace happened to be compiling.
+  (let [cenv (h/fresh-env 'app.whereami)]
+    (h/analyze cenv '(ns app.whereami
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [the-macro-time-ns]])))
+    (is (= 'app.whereami
+           (second (macroexpand/macroexpand-1
+                    cenv (env/analysis-env cenv) '(the-macro-time-ns)))))
+
+    (testing "and our own core.cljc is a reader of it"
+      ;; goog-define builds the name Closure knows the define by out of *ns*, so
+      ;; with nothing bound it named whichever JVM namespace was compiling - a
+      ;; silent wrong answer that no test had, because nothing else in core.cljc
+      ;; asks. app$SLASH$ is (str *ns* "/" sym) munged.
+      (is (re-find #"app\.whereami\$SLASH\$MY\$US\$FLAG"
+                   (pr-str (macroexpand/macroexpand-1
+                            cenv (env/analysis-env cenv)
+                            '(goog-define MY_FLAG "d"))))))))
+
+(h/deftest-when h/cljs-analyzer? test-the-upstream-symbol-table-answers-a-resolve
+  ;; THE QUESTION sci's protocol-vars ASKS, and the reason the compiler-state atom
+  ;; could not stay the constant 5.55 left it as. cljs.analyzer.api is a facade
+  ;; over that atom and does not consult &env at all, so there is no other road in:
+  ;; with nothing under ::namespaces, resolving a protocol name falls through to a
+  ;; synthesised {:name cljs.core/ICloneable} carrying neither :protocol-symbol nor
+  ;; :protocol-info, and sci throws "Not a protocol: ICloneable".
+  (let [cenv (h/core-env 'app.resolver)]
+    (h/analyze cenv '(ns app.resolver
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [upstream-resolution-of]])))
+    (h/analyze cenv '(defprotocol IShape (area [this])))
+    (let [info (second (macroexpand/macroexpand-1
+                        cenv (env/analysis-env cenv)
+                        '(upstream-resolution-of IShape)))]
+      (is (= 'app.resolver/IShape (:name info)))
+      (is (true? (:protocol-symbol info)))
+      ;; the methods, which is what protocol-vars walks to build its entry
+      (is (contains? (:methods (:protocol-info info)) 'area)))
+
+    ;; and a cljs.core protocol, which is the one sci actually asks about - it
+    ;; reaches it through core-name?, a different branch of resolve-var and a
+    ;; different entry of the map
+    (let [info (second (macroexpand/macroexpand-1
+                        cenv (env/analysis-env cenv)
+                        '(upstream-resolution-of ICloneable)))]
+      (is (= 'cljs.core/ICloneable (:name info)))
+      (is (true? (:protocol-symbol info))))))
+
+(h/deftest-when h/cljs-analyzer? test-the-upstream-symbol-table-is-a-view-not-a-copy
+  ;; What the shape buys, stated three ways. It is answered from the world, so it
+  ;; is never stale; it is a lookup and a seq, which is every way upstream reads
+  ;; it; and a write through it is dropped, because nothing reaches our symbol
+  ;; table that way - a def arrives by being analysed, which interns a Var.
+  (let [cenv  (h/fresh-env 'app.viewed)
+        state (fn [] (second (macroexpand/macroexpand-1
+                              cenv (env/analysis-env cenv)
+                              '(upstream-compiler-state-now))))]
+    ;; something to refer out of - a :refer needs the namespace analysed
+    (h/analyze cenv '(ns app.source))
+    (h/analyze cenv '(def blank? 1))
+    (h/analyze cenv '(def join 2))
+    (h/analyze cenv '(ns app.viewed
+                       (:require [clojure.string :as string]
+                                 [app.source :refer [blank? join]
+                                  :rename {join joined}])
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [upstream-compiler-state-now]])))
+    (let [nss (:cljs.analyzer/namespaces (state))]
+      (testing "outside a macroexpansion it answers nothing at all"
+        ;; THE VIEW IS ONLY LIVE WHILE A MACRO RUNS, for *cenv*'s own reason: it
+        ;; reads whatever compile environment is bound when the lookup happens, and
+        ;; that is bound around the macro call and nowhere else. So the atom can be
+        ;; a constant shared by the whole compiler, and nothing that is not a macro
+        ;; can read a symbol table by accident.
+        (is (nil? (get nss 'app.viewed)))
+        (is (empty? (keys nss))))
+
+      ;; and bound, which is what a macro would have. Every read below is one
+      ;; upstream actually makes.
+      (binding [env/*cenv* cenv]
+        (testing "a lookup, which is how gets reads it"
+          (is (= 'app.viewed (:name (get nss 'app.viewed))))
+          (is (nil? (get nss 'no.such.namespace))))
+
+        (testing "an alias, which is the whole of what kitchen-async's fixup-alias wants"
+          (is (= 'clojure.string (get-in nss ['app.viewed :requires 'string]))))
+
+        (testing "a :refer is a use and a :rename is a rename, not a def"
+          ;; The one distinction this world does not draw for itself: both are a
+          ;; .refer of somebody else's Var, and what tells them apart is whether
+          ;; the name it went in under is the Var's own. :defs is what the
+          ;; namespace INTERNED, so neither is in it - which is also the rule that
+          ;; keeps cljs.core out of every namespace's defs.
+          (is (= 'app.source (get-in nss ['app.viewed :uses 'blank?])))
+          (is (= 'app.source/join (get-in nss ['app.viewed :renames 'joined])))
+          (is (nil? (get-in nss ['app.viewed :defs 'blank?])))
+          (is (nil? (get-in nss ['app.viewed :defs 'joined]))))
+
+        (testing "seqable, which is how cljs.analyzer.api/all-ns reads it"
+          (is (contains? (set (keys nss)) 'app.viewed)))
+
+        (testing "not stale - a def made after the view was taken is in it"
+          (is (nil? (get-in nss ['app.viewed :defs 'later])))
+          (h/analyze cenv '(def later 1))
+          (is (= 'app.viewed/later (get-in nss ['app.viewed :defs 'later :name])))
+          ;; and :defs is seqable too, which is how cljs.analyzer.api/ns-publics
+          ;; reads it - sci asks a namespace what it has in it that way
+          (is (contains? (set (keys (get-in nss ['app.viewed :defs]))) 'later)))
+
+        (testing "a write is dropped rather than refused"
+          (is (identical? nss (assoc nss 'app.viewed {:defs {}})))
+          (is (= 'app.viewed (:name (get nss 'app.viewed)))))
+
+        (testing "not stale through a map that is BUILT, either"
+          ;; :defs alone does not test this, which is why the defeat that caches an
+          ;; entry came back inert the first time. :defs is a lookup over the
+          ;; Namespace object, and a Namespace is mutable - so it answers a new def
+          ;; whether or not the entry around it was rebuilt. :requires is a map
+          ;; built when the entry is, so it is the one that goes stale if the entry
+          ;; is cached, and a REPL re-reading an ns form is how that happens.
+          (is (nil? (get-in nss ['app.viewed :requires 'str2])))
+          (h/analyze cenv '(ns app.viewed (:require [clojure.string :as str2])))
+          (is (= 'clojure.string (get-in nss ['app.viewed :requires 'str2]))))))))
+
 (deftest test-a-macro-alias-target-is-rewritten-like-any-other-name
   ;; §5.28. (:require-macros [clojure.core :as lang]) makes lang/for the CLJS.CORE
   ;; macro. The alias itself points at the JVM clojure.core - a :refer off the same
