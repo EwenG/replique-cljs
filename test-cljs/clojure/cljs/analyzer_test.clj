@@ -17,6 +17,7 @@
   clojure.cljs.analyzer-test
   (:require [clojure.cljs.analyzer :as ana]
             [clojure.cljs.env :as env]
+            [clojure.spec.alpha :as spec]
             [clojure.cljs.macroexpand :as macroexpand]
             [clojure.string :as str]
             [clojure.cljs.names :as names]
@@ -967,6 +968,119 @@
                                       (:require-macros
                                        [clojure.cljs.analyzer-test
                                         :rename {no-such-macro m}]))))))))
+
+(defmacro upstream-expansion-of
+  "What core.async's `go` does to its body, in miniature.
+
+  `go` walks its body to build a state machine, and walking means macroexpanding -
+  so ioc_macros.clj:728 calls cljs.analyzer/macroexpand-1, UPSTREAM's, on an &env
+  it was handed by ours. This is that call and nothing else, with the expansion
+  handed back quoted so a test can read it. See doc/cljs-compiler.md 5.55.
+
+  requiring-resolve rather than a :require, because the ClojureScript jar is a test
+  dependency and this file has to load without it; every test that uses this macro
+  is guarded by h/cljs-analyzer?."
+  [form]
+  (list 'quote ((requiring-resolve 'cljs.analyzer/macroexpand-1) &env form)))
+
+(defmacro spec-checked
+  "A macro with an :args spec, for the one test that needs clojure.spec to have an
+  opinion about a macro CALL rather than about a value."
+  [x]
+  (list 'js* "~{}" x))
+
+(spec/fdef spec-checked :args (spec/cat :x number?))
+
+(h/deftest-when h/cljs-analyzer? test-specs-macro-check-does-not-run
+  ;; :spec-skip-macros, the one thing macroexpand/upstream-compiler-state actually
+  ;; decides - and it is a decision rather than a default. Upstream's
+  ;; do-macroexpand-check runs clojure.spec.alpha/macroexpand-check on every macro
+  ;; it expands unless that option says not to, and the option is the only thing
+  ;; stopping it: clojure.spec.alpha is loaded in this JVM before any test runs and
+  ;; macroexpand-check resolves, so the guard around it passes.
+  ;;
+  ;; We skip it because OUR macroexpander does not run it, and a form that expands
+  ;; one way through clojure.cljs.macroexpand and throws through cljs.analyzer
+  ;; would be two compilers in one process disagreeing about the same file.
+  ;;
+  ;; Written because the defeat that removes the option came back INERT: nothing in
+  ;; the suite had an :args spec to violate, so the option could be deleted without
+  ;; a test noticing. It is not dead code - defeat it now and this throws
+  ;; :macro-syntax-check.
+  (let [cenv (h/core-env 'app.spec)]
+    (h/analyze cenv '(ns app.spec
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [upstream-expansion-of spec-checked]])))
+    ;; "nope" violates (spec/cat :x number?) on purpose
+    (is (= '(js* "~{}" "nope")
+           (second (macroexpand/macroexpand-1
+                    cenv (env/analysis-env cenv)
+                    '(upstream-expansion-of (spec-checked "nope"))))))))
+
+(deftest test-the-analysis-env-carries-what-a-macro-reads
+  ;; 5.55. Three keys that used to be part of `ClojureScript's shape, minus what
+  ;; does not exist yet` and now exist, because somebody else's macro reads them.
+  (let [cenv (h/fresh-env 'cljs.user)]
+    (h/analyze cenv '(ns app.core
+                       (:refer-clojure :exclude [time])
+                       (:require [clojure.string :as string])
+                       (:require-macros [clojure.cljs.analyzer-test :refer [twice]])))
+    (let [ns-map (:ns (env/analysis-env cenv))]
+      ;; :requires is EVERY name by which this namespace can call something it
+      ;; requires, mapped to that thing's real name - the alias and the full name
+      ;; both, because both are things a program may write. core.async's
+      ;; fixup-aliases is the reader that matters: it turns the a/<! everybody
+      ;; writes into the cljs.core.async/<! its terminator table is keyed by.
+      (is (= 'clojure.string (get (:requires ns-map) 'string)))
+      (is (= 'clojure.string (get (:requires ns-map) 'clojure.string)))
+      ;; a JavaScript module is NOT in it - it is not a namespace here (5.51)
+      (is (= #{} (set (filter string? (vals (:requires ns-map))))))
+      (is (= #{'time} (:excludes ns-map)))
+      (is (= 'clojure.cljs.analyzer-test (get (:use-macros ns-map) 'twice))))))
+
+(h/deftest-when h/cljs-analyzer? test-a-macro-may-call-upstreams-analyzer
+  ;; The whole of what core.async's `go` needed. With cljs.env/*compiler* unbound
+  ;; this is a NullPointerException out of clojure.core/deref-future - upstream's
+  ;; excluded? derefs that var, (deref nil) is not an IDeref so it is tried as a
+  ;; java.util.concurrent.Future, and 241 of nosco-gamma's 414 namespaces died
+  ;; there. See macroexpand/upstream-compiler-state.
+  (let [cenv (h/core-env 'app.upstream)]
+    (h/analyze cenv '(ns app.upstream
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [upstream-expansion-of]])))
+    (let [expanded (second (macroexpand/macroexpand-1
+                            cenv (env/analysis-env cenv)
+                            '(upstream-expansion-of (when x 1))))]
+      (is (seq? expanded))
+      (is (= 'if (first expanded))))))
+
+(h/deftest-when h/cljs-analyzer? test-an-exclusion-reaches-upstreams-macro-lookup
+  ;; THE REASON &env CARRIES THE FACTS RATHER THAN THE ATOM. Upstream's excluded?
+  ;; asks &env first and the compiler-state atom only as a fallback, so answering
+  ;; truthfully there is what makes the atom a constant. Binding an atom and
+  ;; stopping - not touching &env at all - also makes `go` compile, and then
+  ;; `nothing is excluded` is the answer for every namespace: a core MACRO the ns
+  ;; form excluded goes on expanding inside a go body, silently, over the top of
+  ;; the var the program defined instead.
+  ;;
+  ;; `time` rather than a name picked at random: it is a cljs.core macro, so
+  ;; excluding it is a question macro lookup actually has to answer. Run end to
+  ;; end, the defeat of this prints `Elapsed time: 0.027292 msecs` where the
+  ;; program said `mine:3`.
+  (let [cenv (h/core-env 'app.excluder)]
+    (h/analyze cenv '(ns app.excluder
+                       (:refer-clojure :exclude [time])
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [upstream-expansion-of]])))
+    (is (= '(time 1)
+           (second (macroexpand/macroexpand-1
+                    cenv (env/analysis-env cenv)
+                    '(upstream-expansion-of (time 1))))))
+    ;; and a core macro it did NOT exclude still expands, or the test above would
+    ;; pass for a compiler that had simply stopped expanding anything
+    (is (= 'if (first (second (macroexpand/macroexpand-1
+                              cenv (env/analysis-env cenv)
+                              '(upstream-expansion-of (when x 1)))))))))
 
 (deftest test-a-macro-alias-target-is-rewritten-like-any-other-name
   ;; §5.28. (:require-macros [clojure.core :as lang]) makes lang/for the CLJS.CORE

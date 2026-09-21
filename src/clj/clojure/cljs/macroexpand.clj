@@ -108,6 +108,51 @@
 
       :else form)))
 
+(def ^:private upstream-compiler-var
+  "ClojureScript's own `cljs.env/*compiler*`, if the ClojureScript jar is on this
+  classpath, and nil if it is not.
+
+  RESOLVED RATHER THAN REQUIRED, because org.clojure/clojurescript is a TEST
+  dependency here (pom.xml) - the vendored suite is the oracle, and nothing in
+  src/clj may depend on it. Resolving also says the right thing: the var is bound
+  for the benefit of somebody else's macro that calls upstream's analyzer, and no
+  such macro can be on a classpath that has no upstream analyzer on it either."
+  (delay (try (require 'cljs.env)
+              (resolve 'cljs.env/*compiler*)
+              (catch Throwable _ nil))))
+
+(def ^:private upstream-compiler-state
+  "What `cljs.env/*compiler*` derefs to while a macro of ours runs.
+
+  A CONSTANT, and that is the whole point. The three things upstream's macro
+  lookup reads through that atom on the JVM path are
+
+    ::namespaces <ns> :excludes    - excluded?  (analyzer.cljc:4176)
+    ::namespaces <ns> :use-macros  - used?      (analyzer.cljc:4182)
+    :options :spec-skip-macros     - do-macroexpand-check
+
+  and the first two are asked of the ANALYSIS ENV FIRST, with this only as the
+  fallback:
+
+      (defn excluded? [env sym]
+        (or (some? (gets env :ns :excludes sym))                      ; <- ours
+            (some? (gets @env/*compiler* ::namespaces ... :excludes sym))))
+
+  So the facts go where upstream asks for them first - env/analysis-env - and what
+  is left here is a constant. That is the ORDER of the design and not a detail of
+  it. The other way round is the trap: binding an atom and stopping there makes
+  `go` compile without giving &env anything, and then `excluded?` answers `nothing
+  is excluded` for every namespace, so a core MACRO an ns form excluded goes on
+  expanding over the top of the var the program defined instead. Run end to end
+  that prints `Elapsed time: 0.027292 msecs` where the program said `mine:3` -
+  the same shape of bug as the one 5.55 exists to fix, and not a trade worth
+  making.
+
+  :spec-skip-macros is a DECISION rather than a default: clojure.spec's macro
+  instrumentation is not something this compiler runs, so it is skipped by saying
+  so rather than by happening not to be configured."
+  (atom {:options {:spec-skip-macros true}}))
+
 (defn macroexpand-1
   "Expand `form` once in `env`. Returns the form unchanged when there is nothing
   to expand - identical?, so callers can test for a fixed point.
@@ -134,7 +179,16 @@
           ;; &env, so a macro that has to resolve a ClojureScript symbol -
           ;; defprotocol and its family, which turn one into a property name -
           ;; has no way to be handed the compile environment explicitly.
-          (binding [env/*cenv* cenv]
+          ;; and cljs.env/*compiler*, for a macro that calls UPSTREAM's analyzer
+          ;; rather than being expanded by ours. core.async's go is the case: it
+          ;; walks its own body to build a state machine, and walking means
+          ;; macroexpanding, so ioc_macros.clj:728 calls cljs.analyzer/macroexpand-1
+          ;; - which derefs that var and, unbound, throws a NullPointerException
+          ;; out of deref-future. See upstream-compiler-state, and
+          ;; doc/cljs-compiler.md 5.55.
+          (with-bindings (cond-> {#'env/*cenv* cenv}
+                           @upstream-compiler-var
+                           (assoc @upstream-compiler-var upstream-compiler-state))
             (apply @v form env (rest form)))
           (host-sugar form op))
 

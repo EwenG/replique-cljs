@@ -537,6 +537,45 @@
 
 ;; --- the analysis environment handed to macros as &env ---------------------
 
+(defn- ns-requires-map
+  "{alias full-name, full-name full-name} for `ns-sym` - every name by which this
+  namespace can call something it requires, mapped to that thing's real name.
+
+  ClojureScript's `:requires`. A namespace's OWN names are in it as well as its
+  aliases, because both are things a program may write and both have to resolve to
+  the same target.
+
+  JAVASCRIPT MODULES ARE NOT IN IT, and that is our model rather than an omission:
+  a module is not a namespace here - it has no Namespace, no vars and no place in
+  the dependency graph - which is exactly why env/js-aliases is a map of its own
+  (doc/cljs-compiler.md §5.51). Upstream lists them under :requires because it has
+  nowhere else to put them."
+  [^CompileEnv cenv ns-sym]
+  (let [^Namespace ns (cljs-ns cenv ns-sym)]
+    (persistent!
+     (reduce (fn [m [alias ^Namespace target]] (assoc! m alias (.getName target)))
+             (reduce (fn [m r] (assoc! m r r))
+                     (transient {})
+                     (::requires (meta ns) #{}))
+             (.getAliases ns)))))
+
+(defn- ns-use-macros-map
+  "{macro-name macro-namespace} for `ns-sym` - ClojureScript's `:use-macros`.
+
+  Read off the MACRO VIEW, which is where a :refer-macros / :use-macros mapping
+  actually lives here (require-macros!): a Var in the view that was interned
+  somewhere else is a macro this namespace calls by a bare name, and the namespace
+  it came from is the answer."
+  [^CompileEnv cenv ns-sym]
+  (let [^Namespace view (macro-view cenv ns-sym)]
+    (persistent!
+     (reduce (fn [m [sym v]]
+               (if (and (instance? Var v) (not (identical? view (.ns ^Var v))))
+                 (assoc! m sym (.getName (.ns ^Var v)))
+                 m))
+             (transient {})
+             (.getMappings view)))))
+
 (defn analysis-env
   "A fresh &env for the namespace `cenv` is currently in.
 
@@ -544,9 +583,26 @@
   (:name (:ns &env)) reads correctly; cljs.core's macros reach for (:locals &env),
   (:def-emits-var &env), (:async &env) and, at one site, (-> &env :ns :defs).
   Since we own the vendored core.cljc (doc/cljs-compiler.md §4.4), that last one is
-  adaptable rather than binding."
+  adaptable rather than binding.
+
+  THREE KEYS THAT USED TO BE PART OF `minus what does not exist yet` AND NOW DO
+  EXIST - :requires, :excludes and :use-macros (doc/cljs-compiler.md §5.55). A
+  macro of somebody else's may read any of them, and core.async's `go` reads the
+  first: it looks its parking operations up by fully-qualified name, so a body
+  written with an alias - (a/<! c), which is how everybody writes it - resolves
+  through `:requires` or not at all. Without it `go` COMPILED and produced code
+  that threw `>! used not in (go ...) block` at run time, which is the worst
+  failure this compiler can have (doc/cljs-compiler.md §8, M5).
+
+  They are also what upstream's `excluded?` and `used?` ask for FIRST, before the
+  compiler-state atom they fall back to - which is what keeps that atom a constant
+  rather than a second copy of our symbol table. See
+  clojure.cljs.macroexpand/with-upstream-state!."
   [^CompileEnv cenv]
-  {:ns      {:name *current-ns*}
+  {:ns      {:name       *current-ns*
+             :requires   (ns-requires-map cenv *current-ns*)
+             :excludes   (::excludes (meta (cljs-ns cenv *current-ns*)) #{})
+             :use-macros (ns-use-macros-map cenv *current-ns*)}
    :locals  {}
    :context :statement})
 
