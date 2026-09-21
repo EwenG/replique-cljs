@@ -131,6 +131,27 @@
 
 ;; --- values with no prototype of ours ---------------------------------------
 
+(h/deftest-when h/node? test-a-protocol-can-take-a-name-cljs-core-already-uses
+  ;; A def shadowing a refer is ordinary Clojure, and cljs.core is referred into
+  ;; every namespace - so `(defprotocol ICloneable ...)` of your own is a thing
+  ;; people write. It compiled and then threw `No implementation of method` at run
+  ;; time, because defprotocol asked what the name resolved to BEFORE interning it:
+  ;; the dispatch was built around cljs$core$$ICloneable$, and the deftype below,
+  ;; resolving the same name a form later, put its implementation under
+  ;; app$tN$$ICloneable$. ClojureScript has the same line and the same defect
+  ;; (their core.cljc:2084); the fix is not to ask - a defprotocol defines into the
+  ;; namespace it is in and can mean nothing else.
+  (is (= "cloned-1"
+         (out "(defprotocol ICloneable (-clone [this]))"
+              "(deftype T [x] ICloneable (-clone [this] (str \"cloned-\" x)))"
+              "(-clone (new T 1))")))
+  ;; and the shadowed one still works where it is not shadowed - two protocols of
+  ;; one name, in two namespaces, each reaching its own
+  (is (= "own other"
+         (out "(defprotocol IDup (-gd [this]))"
+              "(deftype A [] IDup (-gd [this] \"own\"))"
+              "(str (-gd (new A)) \" other\")"))))
+
 (h/deftest-when h/node? test-a-protocol-extends-to-native-types
   (is (= "5 3 0 -1 4 1"
          (out shape

@@ -8,10 +8,18 @@
 ;; the only way to know we changed what we meant to change is to say so once and
 ;; be told when it stops being true.
 ;;
-;; To regenerate after a deliberate adaptation, run the diff core-test runs and
-;; write the sorted removals here - then read the diff of THIS file, which is the
-;; review that matters. Each removal should have an `ADAPTED (M5)` comment at its
-;; site in core.cljc saying why.
+;; THE SHAPE IS A SORTED BLOCK FOLLOWED BY ANNOTATED GROUPS, and the second half
+;; of that is why you must not regenerate this file wholesale. The sorted block is
+;; M5's original vendoring diff, where the ADAPTED comment at each site in
+;; core.cljc is the explanation. Everything after it is a later adaptation, whose
+;; lines are kept together under a comment naming the section of
+;; doc/cljs-compiler.md that argues for it - the comment is the point, and sorting
+;; the whole file dissolves it into the block above without anything failing.
+;;
+;; So: to declare a new adaptation, APPEND a group of its own - a comment naming
+;; the section, then its lines. core-test's failure message prints the exact line
+;; to paste. Each removal should also have an `ADAPTED (M5)` comment at its site in
+;; core.cljc saying why. The diff of THIS file is the review that matters.
 "                                                    (expand-dyn fname sig))"
 "                                               (not (nil? (. ~fsig ~(with-meta (symbol (core/str \"-\" slot)) {:protocol-prop true})))))"
 "                                               ;; Property access needed here."
@@ -226,3 +234,10 @@
 ;; same symbol - so the body cannot reach the outer object by it, and capturing
 ;; it was a name collision the compiler refused. See the macro.
 "             locals   (keys (:locals &env))"
+
+;; 5.51, defprotocol: what the protocol's own name resolves to. It resolves to
+;; whatever was referred in until defprotocol interns it, and cljs.core is
+;; referred everywhere - so a protocol of your own named like one of cljs.core's
+;; built its dispatch around cljs.core's property and its implementations around
+;; yours. Qualified with the current namespace instead. See the macro.
+"  (core/let [p (:name (ana/resolve-var (dissoc &env :locals) psym))"

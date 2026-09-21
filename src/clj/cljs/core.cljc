@@ -2287,7 +2287,25 @@
         (bar-me [this y] x))))
   => 17"
   [psym & doc+methods]
-  (core/let [p (:name (ana/resolve-var (dissoc &env :locals) psym))
+  (core/let [;; ADAPTED (M5): THE PROTOCOL BEING DEFINED, not whatever that name
+             ;; resolves to right now. ClojureScript asks resolve-var here, and
+             ;; the answer is wrong in exactly one case - which is the case where
+             ;; it matters. defprotocol INTERNS psym in this namespace, so before
+             ;; it has run the name still means whatever was referred in, and every
+             ;; namespace refers cljs.core: (defprotocol ICloneable ...) in a
+             ;; namespace of your own resolved to cljs.core/ICloneable and built
+             ;; the dispatch around cljs$core$$ICloneable$_clone$arity$1. Every
+             ;; other form then resolved the same name to the var this one had by
+             ;; then interned, so the implementations went on the prototype under
+             ;; app$core$$ICloneable$_clone$arity$1 and the call found nothing.
+             ;; It compiled, and threw `No implementation of method` at run time.
+             ;;
+             ;; A defprotocol can only ever define into the namespace it is in, so
+             ;; there is nothing to ask: the name is the current namespace and this
+             ;; symbol. p is read in one place, protocol-method, which is the
+             ;; property every implementation and every dispatch is named from -
+             ;; so the two halves agree by construction rather than by luck.
+             p (symbol (core/str (core/-> &env :ns :name)) (core/str psym))
              [opts methods]
              (core/loop [opts {:protocol-symbol true}
                          methods []

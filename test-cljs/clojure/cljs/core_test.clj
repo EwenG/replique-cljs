@@ -194,7 +194,7 @@
   "Every line of ClojureScript's core.cljc our copy no longer has, once the
   mechanical rewrite above is accounted for.
 
-  In a file beside this one rather than inline, and that is the point: 183 lines
+  In a file beside this one rather than inline, and that is the point: 206 lines
   do not read as a set literal, but they read very well as a diff. Each belongs to
   an adaptation marked `ADAPTED (M5)` at its site, and the site says why."
   (declared-in "clojure/cljs/core_cljc_removals.edn"))
@@ -210,7 +210,15 @@
       (is (contains? @declared-removals line)
           (str "core.cljc line removed but not declared in core_cljc_removals.edn: "
                (pr-str line))))
+    ;; BOTH DIRECTIONS, as core.cljs's test does. Checking only that a declared
+    ;; line is absent from ours leaves a declaration that is in NEITHER copy
+    ;; passing forever - it names nothing, so nothing contradicts it, and the file
+    ;; slowly fills with lines that once described an adaptation and now describe
+    ;; a file that has moved on.
     (doseq [line @declared-removals]
+      (is (contains? theirs line)
+          (str "core_cljc_removals.edn names a line that is in neither copy - stale: "
+               (pr-str line)))
       (is (not (contains? ours line))
           (str "core_cljc_removals.edn names a line core.cljc still has - stale: "
                (pr-str line))))))
