@@ -16,6 +16,7 @@
   what is handled, rather than guessing and emitting something plausible."}
   clojure.cljs.analyzer-test
   (:require [clojure.cljs.analyzer :as ana]
+            [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
             [clojure.spec.alpha :as spec]
             [clojure.cljs.macroexpand :as macroexpand]
@@ -1081,6 +1082,88 @@
     (is (= 'if (first (second (macroexpand/macroexpand-1
                               cenv (env/analysis-env cenv)
                               '(upstream-expansion-of (when x 1)))))))))
+
+(defmacro intern-and-return-a-var
+  "sci.impl.cljs's (require-cljs-analyzer-api) in miniature.
+
+  A macro called for what it does WHILE EXPANDING rather than for what it expands
+  to: sci's interns two JVM vars holding cljs.analyzer.api functions, this one
+  interns one var, and in both the last form of the body is a `def`. `def`
+  evaluates to the var it interned, so the EXPANSION is that var - a
+  clojure.lang.Var handed back to the analyzer as a form, by accident, because
+  nobody chose what the macro should return. See doc/cljs-compiler.md 5.56."
+  []
+  (def interned-while-expanding :the-effect-the-macro-was-called-for))
+
+(deftest test-a-macro-may-expand-to-a-var
+  ;; 5.56. THE FORM IS A JVM OBJECT, and there is no other way to write one: #'foo
+  ;; reads as (var foo), which is a list and a different form entirely.
+  (let [cenv (h/fresh-env 'app.residue)]
+    (h/analyze cenv '(ns app.residue
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [intern-and-return-a-var]])))
+    (let [node (h/analyze cenv '(intern-and-return-a-var))]
+      ;; a constant, which is what cljs.analyzer makes of one too - its
+      ;; analyze-form has no Var case either, so a Var falls into the :else that
+      ;; builds a :const node
+      (is (= :const (:op node)))
+      (is (instance? Var (:val node)))
+
+      ;; the interning happened, which is the whole of what the macro was for
+      (is (= :the-effect-the-macro-was-called-for
+             @(resolve 'clojure.cljs.analyzer-test/interned-while-expanding)))
+
+      ;; AND NOTHING IS EMITTED. The value is discarded at the top level, a
+      ;; discarded constant is dropped rather than evaluated (see emitter/no-effect),
+      ;; and emitter/unspellable is what lets it be dropped without first being
+      ;; built. cljs.compiler arrives at the same empty output by a different road:
+      ;; its emit* :const skips a :statement context before reaching emit-constant*,
+      ;; which has no Var method and would throw if it did reach it.
+      (is (= [] (emitter/emit-top-lines node)))
+
+      ;; the same as a statement among others, where what follows still runs
+      (is (= ["side();"]
+             (emitter/emit-top-lines
+              (h/analyze cenv '(do (intern-and-return-a-var) (js* "side()")))))))))
+
+(deftest test-a-var-is-refused-where-its-value-is-wanted
+  ;; The other half, and the half that keeps the first one honest: dropping it is
+  ;; right only because nothing wanted it. Anywhere a program actually reads the
+  ;; value, the refusal deferred by emitter/unspellable is thrown - by the `str`
+  ;; that reads the expression, naming what it could not spell. cljs.compiler
+  ;; refuses these three too: "clojure.lang.Var is not a valid ClojureScript
+  ;; constant", out of emit-constant*.
+  (let [cenv (h/fresh-env 'app.residue2)
+        read-by (fn [form & [f]]
+                  (h/message #(if f
+                                (emitter/emit-top-lines (h/analyze cenv form) f)
+                                (emitter/emit-top-lines (h/analyze cenv form)))))]
+    (h/analyze cenv '(ns app.residue2
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [intern-and-return-a-var]])))
+    (are [form] (re-find #"a Var constant" (or (read-by form) ""))
+      '(js* "~{}" (intern-and-return-a-var))
+      '(let* [x (intern-and-return-a-var)] (js* "~{}" x))
+      '(js* "f(~{})" (do 1 (intern-and-return-a-var))))
+    ;; and returned rather than discarded, which is the REPL's destination
+    (is (re-find #"a Var constant"
+                 (or (read-by '(intern-and-return-a-var) emitter/return-value) "")))))
+
+(deftest test-a-source-position-does-not-force-a-var
+  ;; The one subtlety in emitter/unspellable, and the reason it does not go through
+  ;; ->result. ->result maps source-map/fill over both channels, fill stringifies
+  ;; whatever it is given, and stringifying this IS the refusal - so a constant
+  ;; that carried a position would be refused before anything asked whether its
+  ;; value was wanted. Which is to say: with source maps on, every namespace sci
+  ;; is required from.
+  (let [cenv (h/fresh-env 'app.residue3)]
+    (h/analyze cenv '(ns app.residue3
+                       (:require-macros [clojure.cljs.analyzer-test
+                                         :refer [intern-and-return-a-var]])))
+    (let [positioned (assoc (env/analysis-env cenv)
+                            :file "residue3.cljs" :line 12 :column 3)]
+      (is (= [] (emitter/emit-top-lines
+                 (ana/analyze-top cenv positioned '(intern-and-return-a-var))))))))
 
 (deftest test-a-macro-alias-target-is-rewritten-like-any-other-name
   ;; §5.28. (:require-macros [clojure.core :as lang]) makes lang/for the CLJS.CORE

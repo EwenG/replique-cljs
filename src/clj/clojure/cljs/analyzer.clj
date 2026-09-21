@@ -3203,6 +3203,31 @@
         (instance? java.time.Instant form) (instance? java.util.UUID form))
     (const-node env form)
 
+    ;; A JVM VAR, WHICH IS NOT A CLOJURESCRIPT VALUE AND COULD NOT BE: a var here
+    ;; is a property of a namespace object (§5.2), and clojure.lang.Var is the
+    ;; other world's object entirely. Nothing a reader produces is one either -
+    ;; #'foo reads as (var foo), which parse-var handles and which is a different
+    ;; form. So one arrives from exactly one place: a macro that returned it.
+    ;;
+    ;; AND A MACRO RETURNS ONE BY ACCIDENT. `def` evaluates to the var it
+    ;; interned, so a macro whose body ends in a def hands that var back as its
+    ;; expansion, having meant only the interning. sci.impl.cljs does it:
+    ;; (require-cljs-analyzer-api) exists to require cljs.analyzer.api and intern
+    ;; two JVM vars WHILE EXPANDING, and its last form is a def, so what it
+    ;; expands to is #'sci.impl.cljs/cljs-find-ns.
+    ;;
+    ;; It is therefore a constant with no spelling, and cljs.analyzer makes
+    ;; exactly that of it: analyze-form's :else branch, :op :const, and
+    ;; emit-constant* has no method for a Var. That survives because of WHERE such
+    ;; a form sits. The macro was called for its effect, at the top level, where
+    ;; the value is discarded - and a discarded constant is never spelled at all.
+    ;; Upstream drops it in emit* :const, which skips a :statement context before
+    ;; it reaches emit-constant*; ours has no context to read, so emitter/unspellable
+    ;; carries the refusal into the expression channel and lets it be dropped
+    ;; unread. The two agree in both positions: nothing as a statement, and a
+    ;; refusal anywhere the value is actually wanted.
+    (instance? clojure.lang.Var form) (const-node env form)
+
     :else (unsupported form (str "a " (.getSimpleName (class form)) " literal"))))
 
 (defn analyze-top

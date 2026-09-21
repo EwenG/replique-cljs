@@ -566,8 +566,43 @@
       (str (core-name 'with-meta) ".call(null, " js ", " (const-js m) ")")
       js)))
 
+;; A refusal that has not happened yet. toString is the whole mechanism: the only
+;; way to use an expression here is to put it in a string, so reading one of these
+;; is exactly the event that should refuse. See `unspellable` below.
+(deftype Unspellable [val]
+  Object
+  (toString [_]
+    (throw (ex-info (str "Not implemented yet: " (pr-str val) ", a "
+                         (.getSimpleName (class val)) " constant")
+                    {:val val}))))
+
+(defn- unspellable
+  "The expression channel of a constant that has no JavaScript spelling.
+
+  There is one such value today - a clojure.lang.Var, which reaches a form as the
+  accidental expansion of a macro whose body ended in a def (analyzer/analyze says
+  which macro and why). What is interesting is not that it cannot be spelled, but
+  that NOT SPELLING IT IS USUALLY RIGHT: the macro was called for its effect, so
+  its expansion sits where a value is discarded, and a discarded expression is one
+  this emitter never reads. `no-effect` on the :const result is what drops it.
+
+  So the refusal is DEFERRED rather than thrown: built eagerly, it would refuse a
+  form that compiles to nothing at all. Dropped, this costs a line of JavaScript
+  that was never going to exist. Read - bound in a let*, passed to a function,
+  returned from a body - the `str` that reads it throws, and names what it could
+  not spell. Both halves stay honest, and they match cljs.compiler in both
+  positions: emit* :const there skips a :statement context before reaching
+  emit-constant*, which has no Var method either.
+
+  IT BYPASSES ->result DELIBERATELY. There is no text for a source position to be
+  written onto, and sm/fill would force the very string this exists not to build."
+  [val]
+  {:stmts [] :expr (Unspellable. val)})
+
 (defn- emit-const [{:keys [val]}]
-  (->result [] (const-js val)))
+  (if (instance? clojure.lang.Var val)
+    (unspellable val)
+    (->result [] (const-js val))))
 
 ;; --- emit -------------------------------------------------------------------
 
