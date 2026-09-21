@@ -746,6 +746,21 @@
       (let [js (h/js cenv "(cljs.core/exists? clojure.test.check.generators/foo)")]
         (is (str/includes? js "(void 0 !== $ns(\"clojure.test.check.generators\")[\"foo\"])") js)))
 
+    (testing "a qualified name whose NAME half has dots is a path INTO the var"
+      ;; 5.59. cljs-ajax writes (exists? goog/global.XMLHttpRequest) on one line
+      ;; and goog/global.XMLHttpRequest on the next, and the two disagreed: the
+      ;; value was a member chain and the test was a single property called
+      ;; "global.XMLHttpRequest", which nothing has. So the answer was FALSE
+      ;; whatever was there, and cljs-ajax took its no-XMLHttpRequest branch in a
+      ;; browser that has one - silently, which is the whole complaint.
+      (let [js (h/js cenv "(cljs.core/exists? goog/global.XMLHttpRequest)")]
+        (is (str/includes? js "$ns(\"goog\")[\"global\"][\"XMLHttpRequest\"]") js)
+        (is (not (str/includes? js "\"global.XMLHttpRequest\"")) js)
+        ;; WALKED, a segment at a time, for the reason the js/ branch walks:
+        ;; reading a property of undefined throws, and exists? is the question
+        ;; asked when you do not know that it is not
+        (is (str/includes? js "(void 0 !== $ns(\"goog\")[\"global\"]) &&") js)))
+
     (testing "a dotted name that IS a var is the var, not a namespace"
       ;; §5.29. cljs.core.first and clojure.test.check are the same SHAPE - a
       ;; simple symbol with dots - and one is a var. env/dotted-var-sym splits it
@@ -771,7 +786,16 @@
                                      "(def q 1) (cljs.core/exists? q)")))
   ;; §5.29: a var spelled with dots
   (is (= "true"  (h/output-with-core (h/core-env) "(cljs.core/exists? cljs.core.first)")))
-  (is (= "false" (h/output-with-core (h/core-env) "(cljs.core/exists? cljs.core.nope)"))))
+  (is (= "false" (h/output-with-core (h/core-env) "(cljs.core/exists? cljs.core.nope)")))
+  ;; §5.59: a property path INTO a var - and the missing prefix, which is the
+  ;; reason the walk exists at all: reading .a of undefined is a TypeError, and
+  ;; the answer wanted is false
+  (is (= "true"  (h/output-with-core (h/core-env 'app.ex4)
+                                     "(def o #js {:a 1}) (cljs.core/exists? app.ex4/o.a)")))
+  (is (= "false" (h/output-with-core (h/core-env 'app.ex5)
+                                     "(def o #js {:a 1}) (cljs.core/exists? app.ex5/o.b)")))
+  (is (= "false" (h/output-with-core (h/core-env 'app.ex6)
+                                     "(def o #js {:a 1}) (cljs.core/exists? app.ex6/missing.a)"))))
 
 (h/deftest-when h/node? test-ns-imports-runs
   ;; §5.30. cljs.core's own (:import [goog.string StringBuffer]), read back at

@@ -1117,8 +1117,27 @@
                            (reverse (take c (iterate butlast segs))))
                    js    (string/join " && " (repeat c "(typeof ~{} !== 'undefined')"))]
           (bool-expr (concat (core/list 'js* js) syms)))
-        (bool-expr (core/list 'js* "(void 0 !== $ns(~{})[~{}])"
-                              (namespace n) (comp/munge (name n)))))))
+        (core/let [segs (map comp/munge (string/split (core/str (name n)) #"\."))]
+          (if (next segs)
+            ;; A PATH INTO the var and not a var: goog/global.XMLHttpRequest is
+            ;; the XMLHttpRequest property of the global property of the goog
+            ;; namespace object. Spelled as one property it names a property
+            ;; called "global.XMLHttpRequest", which nothing has, so the answer
+            ;; was FALSE whatever was there - and silently, which is how
+            ;; cljs-ajax came to take its no-XMLHttpRequest branch in a browser.
+            ;;
+            ;; WALKED, one segment at a time, for the reason the js/ branch above
+            ;; walks: reading a property of undefined throws, and exists? is the
+            ;; question asked when you do not know that it is not.
+            (core/let [prefixes (map #(take % segs) (range 1 (core/inc (count segs))))
+                       prop     (core/fn [p] (apply core/str (map #(core/str "[\"" % "\"]") p)))
+                       tmpl     (string/join " && "
+                                  (map #(core/str "(void 0 !== $ns(~{})" (prop %) ")")
+                                       prefixes))]
+              (bool-expr (concat (core/list 'js* tmpl)
+                                 (repeat (count prefixes) (namespace n)))))
+            (bool-expr (core/list 'js* "(void 0 !== $ns(~{})[~{}])"
+                                  (namespace n) (core/first segs))))))))
     `(some? ~x)))
 
 (core/defmacro undefined?
@@ -1439,6 +1458,23 @@
   "The property every implementing prototype carries: app$core$$IShape."
   [psym]
   (comp/protocol-name psym))
+
+(core/defn- protocol-sym
+  "The protocol `psym` names here, fully qualified.
+
+  env/dotted-var-sym FIRST, for cljs.core/exists?'s reason (5.29) and with the
+  same consequence when it is not asked. malli.registry.Registry is a simple
+  symbol with dots, and resolve-var reads one of those as a var of the CURRENT
+  namespace carrying a dotted name - so the marker came out as
+  app$user2$$app.proto.Registry, whose surviving dots make JavaScript read a
+  property chain where one property was meant.
+
+  Only the two TEST sites could drift, which is why this went unseen: the
+  namespace defining a protocol spells the marker off the symbol extend-type
+  already resolved (proto-assign-impls), so the set and the test disagreed."
+  [env psym]
+  (core/or (env/dotted-var-sym env/*cenv* psym)
+           (:name (ana/resolve-var (dissoc env :locals) psym))))
 
 (core/defn- protocol-method
   "The property holding one arity of one method: app$core$$IShape$_area$arity$1.
@@ -2455,7 +2491,7 @@
 (core/defmacro implements?
   "EXPERIMENTAL"
   [psym x]
-  (core/let [p      (:name (ana/resolve-var (dissoc &env :locals) psym))
+  (core/let [p      (protocol-sym &env psym)
              marker (protocol-marker p)
              xsym   (gensym "x")]
     `(let [~xsym ~x]
@@ -2467,7 +2503,7 @@
   ;; ADAPTED (M5): as implements?, plus the fallback for a value with no prototype
   ;; of ours - a string, a number, nil, or anything reached by (extend-type
   ;; default ...). Only a value carrying no marker pays for it.
-  (core/let [p      (:name (ana/resolve-var (dissoc &env :locals) psym))
+  (core/let [p      (protocol-sym &env psym)
              marker (protocol-marker p)
              xsym   (gensym "x")]
     `(let [~xsym ~x]

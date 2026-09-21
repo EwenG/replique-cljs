@@ -216,6 +216,54 @@
                           (do (satisfies? IShape (set! n (js* \"~{} + 1\" n))) n)
                           (satisfies? IShape 1))"))))
 
+;; --- a protocol named with dots ---------------------------------------------
+
+(deftest test-a-protocol-named-with-dots-spells-the-same-marker
+  ;; 5.59. malli.registry writes (implements? malli.registry.Registry x) - a
+  ;; SIMPLE symbol with dots, which is how ClojureScript names a protocol without
+  ;; an alias or a refer. resolve-var reads one of those as a var of the CURRENT
+  ;; namespace carrying a dotted name, so the marker came out as
+  ;; app$user$$app.proto.Registry: the wrong namespace, and dots that JavaScript
+  ;; then reads as a property chain - "Cannot read properties of undefined
+  ;; (reading 'proto')" - where one property was meant.
+  ;;
+  ;; THE SET SITE WAS ALWAYS RIGHT, which is why nothing caught it. extend-type
+  ;; spells the marker off a symbol it has already resolved, so a type carried
+  ;; app$proto$$Registry while every test of it asked for something else.
+  (let [cenv (h/core-env 'app.proto)]
+    (h/analyze cenv '(ns app.proto))
+    (h/analyze cenv '(defprotocol Registry (-schema [this])))
+    ;; asked from ANOTHER namespace, because the wrong answer used the asking
+    ;; namespace's own name and a same-namespace test cannot tell the two apart
+    (h/analyze cenv '(ns app.user (:require [app.proto])))
+    (let [slash  (h/js cenv "(cljs.core/implements? app.proto/Registry nil)")
+          dotted (h/js cenv "(cljs.core/implements? app.proto.Registry nil)")
+          sat    (h/js cenv "(cljs.core/satisfies? app.proto.Registry nil)")]
+      (is (str/includes? slash "app$proto$$Registry") slash)
+      (testing "the dotted spelling is the same protocol"
+        (is (str/includes? dotted "app$proto$$Registry") dotted)
+        (is (str/includes? sat "app$proto$$Registry") sat))
+      (testing "and no dot survives into a property name"
+        ;; the failure is not that the marker is wrong but that it is not one
+        ;; NAME: x.a$$b.c.D reads three properties, and the first is undefined
+        (is (not (str/includes? dotted "app.proto.Registry")) dotted)
+        (is (not (str/includes? sat "app.proto.Registry")) sat)
+        (is (not (str/includes? dotted "app$user$$")) dotted)))))
+
+(h/deftest-when h/node? test-a-protocol-named-with-dots-answers-at-runtime
+  ;; and the answers agree, which is the whole of what malli asked for
+  ;; a NAMED namespace, because the source has to spell it out loud
+  (is (= "true true true false"
+         (h/output-with-core
+          (h/core-env 'app.protodots)
+          (src "(defprotocol P (-m [this]))"
+               "(deftype T [] P (-m [_] 1))"
+               "(js* \"[~{},~{},~{},~{}].join(' ')\"
+                  (implements? P (new T))
+                  (implements? app.protodots.P (new T))
+                  (satisfies? app.protodots.P (new T))
+                  (implements? app.protodots.P 42))")))))
+
 ;; --- across namespaces ------------------------------------------------------
 
 (def ^:private program
