@@ -13,12 +13,17 @@
   next one means - it can switch namespace. The tests below are mostly about that
   boundary: what has been consumed, and what the reader resolved against.
 
-  Needs neither node nor the ClojureScript jar."}
+  Then the two worlds a data reader lives in, which is the other thing a reader
+  here has that Clojure's does not (§5.49).
+
+  Needs the ClojureScript jar nowhere, and node for one test."}
   clojure.cljs.reader-test
-  (:require [clojure.cljs.env :as env]
+  (:require [clojure.cljs.driver :as driver]
+            [clojure.cljs.env :as env]
             [clojure.cljs.reader :as reader]
             [clojure.cljs.test-harness :as h]
             [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]])
   (:import [clojure.lang LineNumberingPushbackReader]
@@ -375,6 +380,10 @@
   ;; symbol data_readers.cljc named is resolved twice against two different worlds -
   ;; once on the JVM so a tag can be read while compiling, and once in this
   ;; expansion so the same name means the ClojureScript var of that name at runtime.
+  ;;
+  ;; No env/*cenv*, so the second resolution cannot be checked and every tag is
+  ;; kept - the case §5.49's filter leaves alone, because "cannot ask" is not "the
+  ;; var is absent".
   (require 'cljs.reader)
   (with-redefs [reader/user-data-readers
                 (constantly {'my/up (with-meta identity
@@ -385,3 +394,126 @@
       (is (= '{'js read-js} default))
       (is (= '['my/up] (vec (keys readers))))
       (is (= 'clojure.string/upper-case (ffirst (drop 2 (first (vals readers)))))))))
+
+;; --- the two worlds a tag is registered in ------------------------------------
+
+(defn- expand-add-data-readers
+  "add-data-readers expanded the way a compile expands it - inside env/*cenv*, which
+  is what makes the second resolution askable at all (env/*cenv* is bound around a
+  macro call and nowhere else). Returns [tags warning]."
+  [cenv tags]
+  (require 'cljs.reader)
+  (with-redefs [reader/user-data-readers (constantly tags)]
+    (let [err (java.io.StringWriter.)
+          ex  (binding [env/*cenv* cenv *err* err]
+                (macroexpand-1 '(cljs.reader/add-data-readers {'js read-js})))]
+      [(set (map second (keys (nth ex 2)))) (str err)])))
+
+(deftest test-a-tag-whose-runtime-reader-exists-is-kept
+  ;; §5.49. The filter is EXACT rather than a blanket: what it asks is the only
+  ;; question that decides whether the emitted call does anything but throw, so it
+  ;; can never drop an entry that would have worked.
+  (let [cenv (h/fresh-env)]
+    ;; a var in a namespace this environment really has
+    (intern (env/cljs-ns cenv 'app.tags) 'read-thing)
+    (let [[tags warning] (expand-add-data-readers
+                          cenv {'my/kept-one (with-meta identity
+                                               {:sym 'app.tags/read-thing})})]
+      (is (= '#{my/kept-one} tags))
+      (is (= "" warning) "a tag that works is not warned about"))))
+
+(deftest test-a-tag-whose-reader-is-a-jvm-function-is-dropped
+  ;; The case that made us look, and it is the common idiom rather than a mistake:
+  ;; flatland/ordered's data_readers.cljc names ordered-map-reader-cljs under :cljs,
+  ;; and that function lives in map.clj and returns a ClojureScript FORM. It is the
+  ;; right reader for reading a source file and there is nothing to call at run
+  ;; time. ClojureScript emits the call regardless, marked ::no-resolve so nothing
+  ;; checks it; here the tag is left out of the table and said out loud.
+  (let [cenv (h/fresh-env)]
+    (env/cljs-ns cenv 'app.tags)                    ; the namespace, but not the var
+    (let [[tags warning] (expand-add-data-readers
+                          cenv {'my/jvm-only (with-meta identity
+                                               {:sym 'app.tags/read-thing})})]
+      (is (= #{} tags))
+      (is (str/includes? warning "#my/jvm-only"))
+      (is (str/includes? warning "app.tags defines no ClojureScript var of that name"))
+      ;; and it says what still works, because the compile-time half is untouched
+      (is (str/includes? warning "still reads while compiling")))))
+
+(deftest test-a-tag-whose-namespace-is-not-here-is-dropped-and-says-so
+  ;; A DIFFERENT REASON AND A DIFFERENT SENTENCE. flatland.ordered.set ships no
+  ;; .cljs at all, so there is nothing to compile and nothing to call - which is
+  ;; not the same advice as "the namespace is there and the var is not".
+  (let [[tags warning] (expand-add-data-readers
+                        (h/fresh-env) {'my/nowhere (with-meta identity
+                                                    {:sym 'nowhere.at.all/read-thing})})]
+    (is (= #{} tags))
+    (is (str/includes? warning "there is no ClojureScript namespace of that name"))))
+
+(deftest test-one-table-can-keep-one-tag-and-drop-another
+  ;; The property the whole change rests on: this is a filter and not a switch.
+  (let [cenv (h/fresh-env)]
+    (intern (env/cljs-ns cenv 'app.tags) 'read-thing)
+    (env/cljs-ns cenv 'app.other)
+    (let [[tags warning] (expand-add-data-readers
+                          cenv {'my/kept    (with-meta identity {:sym 'app.tags/read-thing})
+                                'my/dropped (with-meta identity {:sym 'app.other/read-thing})})]
+      (is (= '#{my/kept} tags))
+      (is (str/includes? warning "1 data reader will not be"))
+      (is (str/includes? warning "#my/dropped"))
+      (is (not (str/includes? warning "#my/kept"))))))
+
+(deftest test-a-dropped-tag-is-named-once-and-not-once-per-run
+  ;; cljs.reader is compiled afresh by every run - the driver's state is per-run -
+  ;; so a REPL session doing fifty requires would otherwise hear the same four lines
+  ;; fifty times. clojure.cljs.output keeps the same kind of atom for the same
+  ;; reason. Once per FACT rather than once per run, so a classpath that changes
+  ;; still says so.
+  (let [cenv (h/fresh-env)
+        tags {'my/twice (with-meta identity {:sym 'nowhere.twice/read-thing})}]
+    (is (str/includes? (second (expand-add-data-readers cenv tags)) "#my/twice"))
+    (is (= "" (second (expand-add-data-readers cenv tags)))
+        "the same tag was named a second time")))
+
+(h/deftest-when h/node? test-a-dropped-tag-still-reads-while-compiling
+  ;; THE ASSERTION THE WHOLE CHANGE RESTS ON, end to end, in flatland/ordered's own
+  ;; shape and under node: a JVM function that returns a ClojureScript form, a
+  ;; ClojureScript namespace of the same name that does not define it, and a
+  ;; program that both writes the tag in its source and reads one at run time.
+  ;;
+  ;; Before §5.49 this program did not compile at all - No such var - which is what
+  ;; 236 of one real application's 414 namespaces were dying of, for a tag none of
+  ;; them reads.
+  (let [jvm (create-ns 'app.tags)]
+    (intern jvm 'read-thing (fn [x] (list 'clojure.string/upper-case x))))
+  (with-data-readers-file "{my/thing app.tags/read-thing}"
+    (with-redefs [reader/user-data-readers #'reader/user-data-readers*]
+      (let [src (h/write-sources!
+                 (h/temp-dir)
+                 '{app.tags "(ns app.tags)"
+                   app.core "(ns app.core (:require [cljs.reader :as r]))
+                             (js/console.log #my/thing \"ab\")
+                             (js/console.log (try (r/read-string \"#my/thing \\\"ab\\\"\")
+                                                  (catch :default e (.-message e))))"})
+            out (h/temp-dir)
+            err (java.io.StringWriter.)]
+        (try
+          (let [result (binding [*err* err]
+                         (driver/compile-namespace!
+                          (env/compile-env {:ns 'cljs.user}) 'app.core
+                          {:out-dir out :source-paths [src]}))]
+            ;; cljs.reader really is compiled here - it is the namespace the old
+            ;; failure happened in, so a test that did not compile it would prove
+            ;; nothing
+            (is (some #{'cljs.reader} (:compiled result))))
+          (is (str/includes? (str err) "#my/thing"))
+          (let [{:keys [out exit]} (sh/sh "node" (.getPath (io/file out "ns/app/core.js")))]
+            (is (zero? exit))
+            ;; first line: the tag READ WHILE COMPILING, by the JVM function, into
+            ;; a form that was then analysed and emitted like any other
+            ;; second line: the same tag at RUN TIME, where it is not registered -
+            ;; the answer read-string already has for a tag nobody gave it, naming
+            ;; the tag. ClojureScript's answer here is a TypeError on undefined.
+            (is (= ["AB" "No reader function for tag my/thing."]
+                   (str/split-lines (str/trim out)))))
+          (finally (h/delete-tree! out) (h/delete-tree! src)))))))
