@@ -361,11 +361,36 @@
   One environment is shared by every caller - building a second would mean
   compiling core.cljs again - so the isolation fresh-env gives by starting over is
   given here by a fresh NAMESPACE instead: two tests cannot see each other's defs
-  because they are not defining into the same place."
+  because they are not defining into the same place.
+
+  THE MODULE IS FORCED BEFORE THE CURSOR IS MOVED, and that order is the whole of
+  what makes the sentence above true. env/compile-env positions the cursor at its
+  :ns while it builds (env.clj), so forcing this delay lands it on cljs.core - and
+  the delay is built by whichever call happens to arrive first. Moving the cursor
+  first meant that ONE caller per JVM, an arbitrary one, compiled its program into
+  cljs.core itself. Every var it defined was then referred by every namespace
+  handed out afterwards, so a protocol defined that way captured the dispatch of
+  every later protocol of the same name, in any namespace: the emitted check reads
+  cljs$core$$IDup$_gd$arity$1 while the implementations are written under
+  app$t2$$IDup$_gd$arity$1, and the call answers `No implementation of method`.
+
+  It presented as an unrelated, long-standing test failing as soon as a new test
+  was added, because which caller is first is a hash order over the test names.
+
+  The check afterwards is cheap and permanent. Anything else that builds an
+  environment in here moves the cursor the same way, and silence is what made this
+  expensive to find."
   ([] (core-env (symbol (str "app.t" (swap! core-env-counter inc)))))
   ([ns-sym]
-   (env/set-current-ns! ns-sym)
-   ^clojure.cljs.env.CompileEnv (:cenv @core-module)))
+   (let [cenv ^clojure.cljs.env.CompileEnv (:cenv @core-module)]
+     (env/set-current-ns! ns-sym)
+     (when-not (= ns-sym env/*current-ns*)
+       (throw (ex-info (str "core-env was asked for " ns-sym
+                            " and left the cursor on " env/*current-ns*
+                            " - something in here built a compile environment after"
+                            " the cursor was moved")
+                       {:asked ns-sym :left-on env/*current-ns*})))
+     cenv)))
 
 (defn run-with-core
   "run-js. Kept as a name because it says what a test means, and because it was the
