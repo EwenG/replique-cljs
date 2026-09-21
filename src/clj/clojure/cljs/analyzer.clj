@@ -2300,23 +2300,33 @@
   exists. Measured before they went - (find-ns 'cljs.user) answered nil, and
   (ns-name (find-ns 'cljs.user)) was a TypeError on that nil.
 
+  MOST OF THAT BLOCK IS BACK (§5.48), because the registry can answer what
+  goog.global could not: find-ns-obj reads it, and find-ns, create-ns and the
+  Namespace type are upstream's own code working over a lookup that is now right.
+  What is still here is what the registry does not make right.
+
+  ns-interns* is the interesting one of those. Nothing is wrong with its idea - a
+  namespace object's properties ARE its vars here - but it names them by putting
+  the property through cljs.core/demunge, which decodes cljs.compiler's spelling,
+  and a var is spelled by clojure.cljs.names/munge: cljs.core/*e is the property
+  $STAR$e here and _STAR_e there. So it would answer, and be wrong for every name
+  with a character in it. ns-interns asks the compiler instead, which knows.
+
   They are gone from the file (core-test declares every removed line), so a
   program naming one gets the error a missing name already gets. This map only
   adds the REASON to it, which is the difference between \"there is no such var\"
   and \"there is no such var, and here is what replaced it\".
 
-  WHAT IS NOT HERE MARKS THE EDGE OF THE RULE. cljs.core/ns-name stayed: given a
-  Namespace it answers correctly, it is merely unreachable now, and the vendored
-  cljs/repl.cljs calls it in print-doc on a namespace its caller supplies - a file
-  that compiles today and would have stopped. cljs.core/*eval* went with eval,
-  which is self-hosting's entry point and nothing else's. The rule is: remove what
-  answers WRONGLY, keep what is merely unreachable."
-  '{find-ns        "a namespace is a registry entry here, not a path off goog.global"
-    find-macros-ns "macros live in JVM namespaces here - there is no $macros half"
-    find-ns-obj    "a namespace is a registry entry here, not a path off goog.global"
-    ns-interns*    "it answered {} for every namespace; ns-interns asks the compiler"
-    create-ns      "a namespace object is made by whatever first assigns to it ($ns)"
-    NS_CACHE       "the cache behind find-ns, which answered nil for everything"
+  WHAT IS NOT HERE MARKS THE EDGE OF THE RULE. cljs.core/ns-name stayed even while
+  find-ns was gone: given a Namespace it answers correctly, it was merely
+  unreachable, and the vendored cljs/repl.cljs calls it in print-doc on a namespace
+  its caller supplies - a file that compiles today and would have stopped.
+  cljs.core/*eval* went with eval, which is self-hosting's entry point and nothing
+  else's. The rule is: remove what answers WRONGLY, keep what is merely
+  unreachable - and restore what the registry made answerable."
+  '{find-macros-ns "macros live in JVM namespaces here - there is no $macros half"
+    NS_CACHE       "the cache in front of the goog.global walk find-ns-obj replaced"
+    ns-interns*    "it demunges cljs.compiler's spelling; ns-interns asks the compiler"
     eval           "self-hosted ClojureScript's entry point; there is no eval here"
     *eval*         "self-hosted ClojureScript's entry point; there is no eval here"})
 

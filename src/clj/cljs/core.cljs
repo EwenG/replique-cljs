@@ -12093,6 +12093,69 @@ reduces them without incurring seq initialization"
                          m))]
     (with-meta ret (meta m))))
 
+;; -----------------------------------------------------------------------------
+;; Bootstrap helpers - incompatible with advanced compilation
+
+;; Bootstrap only
+;;
+;; ADAPTED: upstream's Namespace also answers findInternedVar, which computes a
+;; property name with cljs.core/munge and reads it off obj. That munge is
+;; cljs.compiler's spelling and ours is clojure.cljs.names/munge - cljs.core/*e is
+;; the property $STAR$e here and _STAR_e there - so it would have looked up a
+;; property no namespace has for every name with a character in it. ns-interns*
+;; and ns-lookup went with it, and for the same reason: they demunge the same
+;; spelling in the other direction. See clojure.cljs.analyzer/removed-core-vars.
+(deftype Namespace [obj name]
+  Object
+  (getName [_] name)
+  (toString [_]
+    (str_ name))
+  IEquiv
+  (-equiv [_ other]
+    (if (instance? Namespace other)
+      (= name (.-name other))
+      false))
+  IHash
+  (-hash [_]
+    (hash name)))
+
+(defn find-ns-obj
+  "Bootstrap only."
+  [ns]
+  ;; ADAPTED, and this line is the whole of what made the block answer again.
+  ;; Upstream munges the name, splits it on dots and walks the segments as
+  ;; properties of goog.global - the addressing doc/cljs-repl.md 3.1 replaced with
+  ;; a registry, and the reason every function below it once answered for no
+  ;; namespace at all. Here a namespace IS an entry in that registry, so the walk
+  ;; is one Map lookup and the answer is right.
+  ;;
+  ;; $CLJS is runtime.js's registry, read as a bare global because that is the only
+  ;; way a module reaches it without importing it - the route js/COMPILED takes,
+  ;; and for the same reason: this file is compiled rather than written by hand,
+  ;; and the prelude sits above it.
+  ;;
+  ;; .get and NOT $CLJS.ns(), which CREATES the entry when it is missing. That is
+  ;; what a module body wants and the exact opposite of what find-ns means.
+  (.get (.-namespaces js/$CLJS) (str_ ns)))
+
+(defn create-ns
+  "Create a new namespace named by the symbol. Bootstrap only."
+  ([sym]
+   (create-ns sym (find-ns-obj sym)))
+  ([sym ns-obj]
+   (Namespace. ns-obj sym)))
+
+(defn find-ns
+  "Returns the namespace named by the symbol or nil if it doesn't exist.
+  Bootstrap only."
+  [ns]
+  ;; ADAPTED: upstream memoises in NS_CACHE, a cache in front of the walk above.
+  ;; The registry is already a Map and Namespace equality is by name (-equiv), so
+  ;; there is no identity left for a cache to preserve.
+  (let [obj (find-ns-obj ns)]
+    (when-not (nil? obj)
+      (create-ns ns obj))))
+
 (defn ns-name
   "Returns the name of the namespace, a Namespace object.
   Bootstrap only."

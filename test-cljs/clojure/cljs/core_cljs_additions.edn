@@ -1,0 +1,42 @@
+;; Every line our vendored cljs/core.cljs has that ClojureScript's does not. One
+;; pr-str'd string per line; order is sorted, not source.
+;;
+;; THE FILE IS A SUBSET EVERYWHERE ELSE, and this is the whole of the exception.
+;; Four of the 28 are code, in two function bodies of the "Bootstrap helpers"
+;; block: find-ns-obj reads the namespace registry runtime.js keeps on globalThis
+;; instead of walking munged segments off goog.global (doc/cljs-repl.md 3.1), and
+;; find-ns drops the NS_CACHE that was a cache in front of that walk. The Namespace
+;; type and create-ns above them are upstream's, line for line, and were already
+;; right - they only ever needed the lookup underneath them to be.
+;;
+;; The other 24 are the comment saying that, which is the proportion to expect: the
+;; adaptation is small and the argument for it is not.
+
+"      (create-ns ns obj))))"
+"    (when-not (nil? obj)"
+"  (.get (.-namespaces js/$CLJS) (str_ ns)))"
+"  (let [obj (find-ns-obj ns)]"
+"  ;;"
+"  ;; $CLJS is runtime.js's registry, read as a bare global because that is the only"
+"  ;; .get and NOT $CLJS.ns(), which CREATES the entry when it is missing. That is"
+"  ;; ADAPTED, and this line is the whole of what made the block answer again."
+"  ;; ADAPTED: upstream memoises in NS_CACHE, a cache in front of the walk above."
+"  ;; The registry is already a Map and Namespace equality is by name (-equiv), so"
+"  ;; Upstream munges the name, splits it on dots and walks the segments as"
+"  ;; a registry, and the reason every function below it once answered for no"
+"  ;; and for the same reason: this file is compiled rather than written by hand,"
+"  ;; and the prelude sits above it."
+"  ;; is one Map lookup and the answer is right."
+"  ;; namespace at all. Here a namespace IS an entry in that registry, so the walk"
+"  ;; properties of goog.global - the addressing doc/cljs-repl.md 3.1 replaced with"
+"  ;; there is no identity left for a cache to preserve."
+"  ;; way a module reaches it without importing it - the route js/COMPILED takes,"
+"  ;; what a module body wants and the exact opposite of what find-ns means."
+";;"
+";; ADAPTED: upstream's Namespace also answers findInternedVar, which computes a"
+";; and ns-lookup went with it, and for the same reason: they demunge the same"
+";; cljs.compiler's spelling and ours is clojure.cljs.names/munge - cljs.core/*e is"
+";; property name with cljs.core/munge and reads it off obj. That munge is"
+";; property no namespace has for every name with a character in it. ns-interns*"
+";; spelling in the other direction. See clojure.cljs.analyzer/removed-core-vars."
+";; the property $STAR$e here and _STAR_e there - so it would have looked up a"

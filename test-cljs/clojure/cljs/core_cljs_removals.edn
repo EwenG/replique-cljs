@@ -1,12 +1,24 @@
-;; Every line of ClojureScript's cljs/core.cljs that our vendored copy no longer
-;; has. One pr-str'd string per line; order is sorted, not source.
+;; Every line of ClojureScript's cljs/core.cljs our vendored copy no longer has.
+;; One pr-str'd string per line; order is sorted, not source.
 ;;
-;; All of them are the "Bootstrap helpers" block and cljs.core/eval: namespace
-;; reflection that walks munged segments off goog.global, which is the addressing
-;; doc/cljs-repl.md 3.1 replaced with a registry, and self-hosted ClojureScript's
-;; eval entry point. They did not merely go unused here - find-ns answered nil for
-;; every namespace that exists. See clojure.cljs.analyzer/removed-core-vars, which
-;; carries the same list and the reason each one went.
+;; It was 98 - the whole "Bootstrap helpers" block plus cljs.core/eval - while a
+;; namespace was being looked for by walking munged segments off goog.global, which
+;; is the addressing doc/cljs-repl.md 3.1 replaced with a registry: find-ns
+;; answered nil for every namespace that exists. 19 of those lines came back once
+;; find-ns-obj was pointed at the registry instead (core_cljs_additions.edn).
+;;
+;; What is still gone, and why each one stays gone:
+;;
+;;   find-ns-obj*   the walk itself, which has nothing left to walk
+;;   NS_CACHE       the cache in front of that walk
+;;   find-macros-ns looks for a $macros half; macros live in JVM namespaces here
+;;   ns-lookup      }  both spell a var name with cljs.core/munge, which is
+;;   ns-interns*    }  cljs.compiler's spelling and not ours - a var is the
+;;   findInternedVar}  property $STAR$e here and _STAR_e there
+;;   eval, *eval*   self-hosted ClojureScript's entry point
+;;
+;; clojure.cljs.analyzer/removed-core-vars carries the same list as the sentence a
+;; program naming one of them gets.
 
 "                            (symbol (str_ sym) (str_ var-sym)) {:ns ns}))))]"
 "                          ctxt))"
@@ -44,39 +56,27 @@
 "       (when-not (nil? ns-obj)"
 "      \"nodejs\" (if ^boolean js/COMPILED"
 "      (\"default\" \"webworker\") (find-ns-obj* goog/global segs)"
-"      (= name (.-name other))"
 "      (let [ns-obj (find-ns-obj ns)]"
 "      (reduce step {} (js-keys ns-obj)))))"
 "      (throw (js/Error. (str_ \"find-ns-obj not supported for target \" *target*))))))"
 "      (when (gobject/containsKey obj k)"
 "      the-ns"
 "    (case *target*"
-"    (hash name)))"
-"    (if (instance? Namespace other)"
 "    (if-not (nil? the-ns)"
 "    (let [k (munge (str_ sym))]"
 "    (letfn [(step [ret k]"
 "    (nil? ctxt) nil"
 "    (nil? xs) ctxt"
 "    (set! NS_CACHE (atom {})))"
-"    (str_ name))"
 "    (throw (js/Error. \"cljs.core/*eval* not bound\"))))"
 "    :else (recur (gobject/get ctxt (first xs)) (next xs))))"
-"   (Namespace. ns-obj sym)))"
-"   (create-ns sym (find-ns-obj sym)))"
-"  \"Bootstrap only.\""
-"  \"Create a new namespace named by the symbol. Bootstrap only.\""
 "  \"Evaluates the form data structure (not text!) and returns the result."
 "  \"Returns a map of the intern mappings for the namespace."
 "  \"Returns the macros namespace named by the symbol or nil if it doesn't exist."
-"  \"Returns the namespace named by the symbol or nil if it doesn't exist."
 "  (*eval* form))"
-"  ([sym ns-obj]"
-"  ([sym]"
 "  (findInternedVar [this sym]"
 "  (fn [] (gobject/get ns-obj k)))"
 "  (fn [_]"
-"  (getName [_] name)"
 "  (let [munged-ns (munge (str_ ns))"
 "  (let [ns-obj (find-ns-obj sym)"
 "  (let [ns-str (str_ ns)"
@@ -88,21 +88,14 @@
 "  [ctxt xs]"
 "  [form]"
 "  [ns-obj k]"
-"  [ns]"
 "  [sym]"
 "  ^{:doc \"Bootstrap only.\" :jsdoc [\"@type {*}\"]}"
 "  ^{:doc \"Runtime environments may provide a way to evaluate ClojureScript"
 "  forms. Whatever function *eval* is bound to will be passed any forms which"
 "  should be evaluated.\" :dynamic true}"
 "  which sets up an implementation of cljs.core/*eval* for that environment.\""
-"(defn create-ns"
 "(defn eval"
 "(defn find-macros-ns"
-"(defn find-ns"
-"(defn find-ns-obj"
 "(defn ns-interns*"
 "(defn- find-ns-obj*"
 "(defn- ns-lookup"
-"(deftype Namespace [obj name]"
-";; Bootstrap helpers - incompatible with advanced compilation"
-";; Bootstrap only"

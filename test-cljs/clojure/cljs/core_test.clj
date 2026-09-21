@@ -77,14 +77,28 @@
 (def ^:private declared-cljs-removals
   "Every line of ClojureScript's core.cljs our copy no longer has.
 
-  98 of them, and they are one block: the \"Bootstrap helpers\" - find-ns, its
-  family and the NS_CACHE behind them - plus cljs.core/eval and *eval*. They find
-  a namespace by walking munged segments off goog.global, which is the addressing
-  cljs-repl.md §3.1 replaced with a registry, so (find-ns 'cljs.user) answered nil
-  for a namespace that certainly exists."
+  79 of them. It was 98 until find-ns came back (§5.48): the \"Bootstrap helpers\"
+  block answered for no namespace at all while it addressed goog.global - (find-ns
+  'cljs.user) was nil for a namespace that certainly exists - and 19 of its lines
+  answer correctly now that find-ns-obj asks the registry cljs-repl.md §3.1 put
+  namespaces in.
+
+  What stays gone is what the registry does not make right: the walk and its cache,
+  the $macros half there is none of, the three functions that spell a var name with
+  cljs.compiler's munge rather than ours, and self-hosting's eval. The removals
+  file names each and says why."
   (declared-in "clojure/cljs/core_cljs_removals.edn"))
 
-(h/deftest-when cljs-jar? test-every-removal-from-core-cljs-is-declared
+(def ^:private declared-cljs-additions
+  "Every line our core.cljs has that ClojureScript's does not.
+
+  28, of which four are code: the body of find-ns-obj, which is one Map lookup
+  where upstream walked goog.global, and the body of find-ns, which is the same
+  function minus the cache that walk needed. The other 24 are the comment saying
+  so."
+  (declared-in "clojure/cljs/core_cljs_additions.edn"))
+
+(h/deftest-when cljs-jar? test-every-difference-from-core-cljs-is-declared
   ;; THIS USED TO BE BYTE EQUALITY. Starting from an unmodified copy was worth a
   ;; great deal while M5 was being built - it made "does core.cljs compile" a
   ;; question about the compiler and nothing else - but it was a scaffold, not a
@@ -94,30 +108,45 @@
   ;; every line we dropped is named in a file, and every name in that file is a
   ;; line we really dropped.
   ;;
-  ;; NOTHING WAS ADDED, and that half is still byte-exact: our copy is a SUBSET of
-  ;; theirs, line for line. §4.4's finding is why it can be - core.cljs contains
-  ;; zero literal cljs$lang$ / cljs$core$ names, so the calling convention it
-  ;; compiles into is decided entirely by core.cljc.
+  ;; THE ADDED HALF USED TO BE EMPTY, and was asserted so. It stopped being empty
+  ;; when find-ns came back (§5.48): the namespace registry can answer what
+  ;; goog.global could not, but only if something reads it, and the something is
+  ;; two function bodies in a file that is otherwise upstream's. So this half is
+  ;; now declared rather than forbidden, in the same shape as the other three - and
+  ;; the declaration file is where the argument for each added line lives.
+  ;;
+  ;; §4.4's finding is still why the file can be a near-subset at all:
+  ;; core.cljs contains zero literal cljs$lang$ / cljs$core$ names, so the calling
+  ;; convention it compiles into is decided entirely by core.cljc.
   (let [theirs (set (str/split-lines (jar-copy "cljs/core.cljs")))
         ours   (set (str/split-lines (slurp (io/resource "cljs/core.cljs"))))]
-    (doseq [line (into (sorted-set) (remove theirs) ours)]
-      (is false (str "core.cljs has a line ClojureScript's does not - this file is"
-                     " vendored, and the emission contract lives in core.cljc: "
-                     (pr-str line))))
-    (doseq [line (into (sorted-set) (remove ours) theirs)]
-      (is (contains? @declared-cljs-removals line)
-          (str "core.cljs line removed but not declared in core_cljs_removals.edn: "
-               (pr-str line))))
-    (doseq [line @declared-cljs-removals]
-      (is (not (contains? ours line))
-          (str "core_cljs_removals.edn names a line core.cljs still has - stale: "
-               (pr-str line))))))
+    ;; One difference is a line PRESENT IN one copy and ABSENT FROM the other, so
+    ;; both halves are the same two questions with the two sets swapped.
+    (doseq [[label file declared present-in absent-from]
+            [["removed" "core_cljs_removals.edn"  @declared-cljs-removals  theirs ours]
+             ["added"   "core_cljs_additions.edn" @declared-cljs-additions ours   theirs]]]
+      ;; every difference is declared
+      (doseq [line (into (sorted-set) (remove absent-from) present-in)]
+        (is (contains? declared line)
+            (str "core.cljs line " label " but not declared in " file ": "
+                 (pr-str line))))
+      ;; and every declaration is a difference that is really there, which takes
+      ;; BOTH halves of what a difference is. Asking only that the line is absent
+      ;; from the other copy lets a declaration name a line neither copy has ever
+      ;; had - stale in the way a diff goes stale, and invisible.
+      (doseq [line declared]
+        (is (contains? present-in line)
+            (str file " names a line that is in neither copy - stale: "
+                 (pr-str line)))
+        (is (not (contains? absent-from line))
+            (str file " names a line that is not " label " - stale: "
+                 (pr-str line)))))))
 
 (h/deftest-when cljs-jar? test-support-cljc-is-vendored-unmodified
   (is (= (jar-copy "cljs/support.cljc") (slurp (io/resource "cljs/support.cljc")))
       "cljs/support.cljc has been edited - it is six lines and needs nothing from us"))
 
-(deftest test-the-bootstrap-namespace-family-is-gone-and-says-why
+(deftest test-the-bootstrap-namespace-family-answers-or-says-why-not
   ;; core.cljs carried a block of "Bootstrap helpers" that found a namespace by
   ;; munging its name and walking the segments as properties of goog.global.
   ;; cljs-repl.md §3.1 replaced that addressing scheme with a registry, so every
@@ -127,23 +156,29 @@
   ;;   (ns-name (find-ns 'cljs.user)) => TypeError on that nil
   ;;   (ns-interns* ...)              => {}
   ;;
-  ;; They are removed (declared above, line by line). What this pins is that the
-  ;; error says WHY rather than only that the name is missing - the answer §5.5
-  ;; gave for goog.Uri: do not do nothing silently.
+  ;; THEY WERE ALL REMOVED, AND MOST OF THEM CAME BACK (§5.48). What made the
+  ;; difference is one function: find-ns-obj now reads the registry, and every
+  ;; caller of it above was already right. So the split this pins is no longer
+  ;; gone/not-gone but ANSWERS/CANNOT ANSWER, which is the same rule stated once
+  ;; more - remove what would answer wrongly, keep what answers.
   (let [c (h/core-env)]
-    (doseq [sym '[find-ns find-macros-ns find-ns-obj ns-interns* create-ns NS_CACHE
-                  eval]]
+    ;; what answers: it resolves like any other cljs.core var, and the node test
+    ;; below is where it is actually called
+    (doseq [sym '[find-ns find-ns-obj create-ns Namespace ns-name]]
+      (is (nil? (h/message #(h/analyze c sym)))
+          (str "cljs.core/" sym " no longer resolves")))
+    ;; what cannot: a $macros half there is none of, the walk and its cache, and
+    ;; self-hosting's eval. Each says why rather than only that it is missing -
+    ;; the answer §5.5 gave for goog.Uri: do not do nothing silently.
+    (doseq [sym '[find-macros-ns NS_CACHE ns-interns* eval]]
       (let [msg (str (h/message #(h/analyze c sym)))]
         (is (re-find #"was removed from this fork's core.cljs" msg)
             (str "cljs.core/" sym " does not say why it is gone: " msg))))
     ;; qualified too, which is a different error site
     (is (re-find #"was removed from this fork's core.cljs"
-                 (str (h/message #(h/analyze c 'cljs.core/find-ns)))))
+                 (str (h/message #(h/analyze c 'cljs.core/eval)))))
     ;; NOT a blanket ban on cljs.core: an ordinary var still resolves
-    (is (nil? (h/message #(h/analyze c 'inc))))
-    ;; and ns-name STAYED: it answers correctly for a Namespace and is merely
-    ;; unreachable, and the vendored cljs/repl.cljs calls it (§5.29)
-    (is (nil? (h/message #(h/analyze c 'ns-name))))))
+    (is (nil? (h/message #(h/analyze c 'inc))))))
 
 (def ^:private mechanical
   "The one rewrite applied wholesale: cljs.analyzer, in both of the two spellings
@@ -319,6 +354,32 @@
                (js/console.log (-unbox (js/Date. 1000)))
                (js/console.log (-unbox (reify IBox (-unbox [this] \"from-reify\"))))"))))
 
+(h/deftest-when h/node? test-find-ns-answers-from-the-registry
+  ;; THE MEASUREMENT THE REMOVAL WAS MADE ON, taken again. (find-ns 'cljs.user) was
+  ;; nil for a namespace that certainly exists, because find-ns-obj walked munged
+  ;; segments off goog.global and nothing has lived there since doc/cljs-repl.md
+  ;; §3.1 put namespaces in a registry. find-ns-obj reads that registry now, and
+  ;; everything above it in the block is upstream's code unchanged.
+  ;;
+  ;; cljs.core is the namespace to ask about: it is the one a test program is
+  ;; certain to have loaded beside it.
+  (is (= "cljs.core\ntrue\nfalse"
+         (run "(js/console.log (str (ns-name (find-ns 'cljs.core))))
+               (js/console.log (some? (find-ns 'cljs.core)))
+               (js/console.log (some? (find-ns 'no.such.namespace)))")))
+  ;; AND ASKING DOES NOT CREATE ONE. $CLJS.ns() would have - it is the call every
+  ;; module body makes - so the difference between the two is the whole reason
+  ;; find-ns-obj reaches for .get, and a second ask is where it would show.
+  (is (= "false\nfalse"
+         (run "(js/console.log (some? (find-ns 'no.such.namespace)))
+               (js/console.log (some? (find-ns 'no.such.namespace)))")))
+  ;; A Namespace is by NAME, not by identity: no cache stands behind find-ns any
+  ;; more, so two asks give two objects, and -equiv is what makes them the same
+  ;; namespace.
+  (is (= "true\nfalse"
+         (run "(js/console.log (= (find-ns 'cljs.core) (find-ns 'cljs.core)))
+               (js/console.log (identical? (find-ns 'cljs.core) (find-ns 'cljs.core)))"))))
+
 ;; --- how far core.cljs gets ---------------------------------------------------
 
 (def ^:private core-cljs-floor
@@ -331,9 +392,10 @@
   next refuses a count larger than the file.
 
   946 until the \"Bootstrap helpers\" and eval were removed, which took eleven
-  top-level forms with them - see the removals file. The number counts what the
-  file HAS, so it moves when the file does."
-  935)
+  top-level forms with them - see the removals file. 939 since four of those eleven
+  came back (§5.48). The number counts what the file HAS, so it moves when the
+  file does."
+  939)
 
 (deftest test-how-much-of-core-cljs-compiles
   (let [c     (env/compile-env {:ns 'cljs.core :core-macros 'cljs.core})
@@ -357,14 +419,14 @@
                                          (catch Throwable _ false)))))
                                  forms))))]
     (testing "the file reads"
-      (is (= 935 (count forms))
-          (str "core.cljs no longer has 935 top-level forms - either the jar"
+      (is (= 939 (count forms))
+          (str "core.cljs no longer has 939 top-level forms - either the jar"
                " version moved, or something was removed from our copy without"
                " moving this number and core-cljs-floor with it")))
     (testing "and this much of it compiles"
       (is (>= ok core-cljs-floor)
           (str "core.cljs regressed: " ok " forms compile, was " core-cljs-floor))
-      (is (<= ok 935)))))
+      (is (<= ok 939)))))
 
 ;; --- what the collection literals unblocked ----------------------------------
 
