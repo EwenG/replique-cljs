@@ -107,7 +107,11 @@
   ;; URL from a name with nothing to ask the JVM. Two statements of one rule drift
   ;; unless something runs them against each other, so this does - it is the only
   ;; reason the JVM half is public.
-  (let [names '[app app.core a.b.c.d my-lib.core x9.core-2]
+  ;; closurejs.widget is a Closure file on the classpath rather than a compiled
+  ;; namespace (§5.52). It is in this list because it is written under ns-dir at the
+  ;; same path as everything else in it, which is the reason urlFor needed no third
+  ;; branch when that arrived - and a rule nothing runs against is a rule that drifts.
+  (let [names '[app app.core a.b.c.d my-lib.core x9.core-2 closurejs.widget]
         js    (str "console.log(JSON.stringify(["
                    (str/join ", " (map #(str "\"" % "\"") names))
                    "].map((n) => $CLJS.urlFor(n))));")]

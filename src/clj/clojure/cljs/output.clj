@@ -56,7 +56,8 @@
   on the JVM (7.3) - so changing the layout makes an output directory stale rather
   than wrong. It is known here and in runtime.js, and nowhere else."}
   clojure.cljs.output
-  (:require [clojure.cljs.goog :as goog]
+  (:require [clojure.cljs.env :as env]
+            [clojure.cljs.goog :as goog]
             [clojure.cljs.names :as names]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -238,19 +239,44 @@
   "Write into `dir` the Closure files the namespaces `required` name, and what those
   require in turn.
 
-  `required` is any collection of namespace symbols - a whole requires set, goog
+  `required` is any collection of namespace symbols - a whole requires set, Closure
   names and ClojureScript names mixed - because that is what its callers have, and
   telling them apart is this function's job rather than theirs.
 
+  BOTH KINDS OF CLOSURE NAMESPACE, which is why the filter is closure-ns? and not
+  goog-ns?: a name in the goog tree, and a Closure-style JavaScript file found on
+  the classpath at the name's own path - com.cognitect.transit out of transit-js's
+  jar. The second kind is written under ns-dir rather than the goog tree, which
+  goog/ns->path decides; everything else about the two is the same, down to the
+  converter.
+
   Called where a module's imports or a script's requires have just been decided:
-  both spell a goog name as a path under this root, and a path that nothing wrote
-  is a 404 at load. Cheap to call often - in library mode nothing is converted
-  twice (clojure.cljs.goog/written), and in subset mode there are twenty files."
-  [dir required]
-  (let [names (into [] (comp (filter goog/goog-ns?) (map str) (distinct)) required)]
-    (when (seq names)
-      (goog/write-goog! dir names))
-    dir))
+  both spell a Closure name as a path under this root, and a path that nothing
+  wrote is a 404 at load. Cheap to call often - in library mode nothing is
+  converted twice (clojure.cljs.goog/written), in subset mode there are twenty
+  files, and a name that is neither is answered from a cache after the first ask
+  (clojure.cljs.goog/classpath-entry)."
+  ([dir required] (ensure-goog! nil dir required))
+  ([cenv dir required]
+   (let [closure? (fn [ns-sym]
+                    ;; THE SAME RULE clojure.cljs.analyzer/closure-ns? states, and
+                    ;; it has to be the same: a namespace that was compiled from a
+                    ;; .cljs must not then have a .js of its own name converted
+                    ;; over the top of the module this run just emitted. The
+                    ;; analyzer decides that a declared namespace is not a Closure
+                    ;; one, the driver looks for a source before it looks on the
+                    ;; classpath, and this is the third place it is decided -
+                    ;; because this is the only one holding the file handle.
+                    ;;
+                    ;; cenv is optional because write-prelude! has none and needs
+                    ;; none: with no compile environment there is nothing declared,
+                    ;; and the goog half of the question does not depend on one.
+                    (and (goog/closure-ns? ns-sym)
+                         (not (and cenv (env/declared? cenv ns-sym)))))
+         names    (into [] (comp (filter closure?) (map str) (distinct)) required)]
+     (when (seq names)
+       (goog/write-goog! dir names))
+     dir)))
 
 ;; --- what the bundler still owes ---------------------------------------------
 

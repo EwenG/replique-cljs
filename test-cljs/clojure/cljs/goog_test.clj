@@ -930,3 +930,176 @@
   ;; what goog.expose assigned.
   (is (= "true" (goog-js ["goog.string"]
                          "console.log(goog.module.get('goog.string') === goog.string);"))))
+
+;; --- a Closure file anywhere on the classpath --------------------------------
+;;
+;; doc/cljs-compiler.md §5.52. transit-js ships com/cognitect/transit.js in a jar
+;; and shadow-cljs ships shadow/loader.js; neither is the Closure Library, neither
+;; declares itself in a deps.cljs, and both are the same kind of input as
+;; everything above. The fixtures under test-cljs/closurejs are that shape, small
+;; enough to read, and on the test classpath as a DIRECTORY - which io/resource
+;; cannot tell from a jar entry, and which is the whole of what this needs.
+
+(deftest test-a-closure-file-is-found-at-the-path-its-name-spells
+  (is (= "closurejs/widget.js" (goog/js-path 'closurejs.widget)))
+  (is (= "com/cognitect/transit.js" (goog/js-path "com.cognitect.transit")))
+  (let [e (goog/classpath-entry "closurejs.widget")]
+    (is (= "closurejs/widget.js" (:path e)))
+    ;; :root nil, because the path is already the resource's whole name - the
+    ;; subset and the library each have a root to sit under and this has none
+    (is (nil? (:root e)))
+    (is (= ["closurejs.widget"] (:provides e)))
+    ;; DOUBLE QUOTES read, which is the shape transit-js writes and the Closure
+    ;; Library never does
+    (is (= [{:name "closurejs.util"} {:name "goog.object"}] (:requires e))))
+  (testing "a goog.module is read the same way"
+    (let [e (goog/classpath-entry "closurejs.modular")]
+      (is (= ["closurejs.modular"] (:provides e)))
+      (is (= [{:name "closurejs.util" :binding "util"}] (:requires e))))))
+
+(deftest test-a-file-that-does-not-claim-the-name-is-not-an-answer
+  ;; Anything may sit on a classpath at any path, so "is there a .js there" is not
+  ;; the question. These three are all the ways the answer is no.
+  (is (nil? (goog/classpath-entry "closurejs.plain")))
+  (is (nil? (goog/classpath-entry "closurejs.mismatch")))
+  (is (nil? (goog/classpath-entry "closurejs.no.such.thing")))
+  (is (false? (goog/js-ns? 'closurejs.plain)))
+  (is (true?  (goog/js-ns? 'closurejs.widget))))
+
+(deftest test-a-goog-name-is-never-answered-by-the-classpath
+  ;; Which Closure tree is in use is a CHOICE - see *closure-library* - and a third
+  ;; answer found by probing the classpath is exactly the silent substitution that
+  ;; choice exists to prevent.
+  (is (nil? (goog/classpath-entry "goog.object")))
+  (is (nil? (goog/classpath-entry "goog")))
+  (is (false? (goog/js-ns? 'goog.object)))
+  (is (true?  (goog/closure-ns? 'goog.object)))
+  (is (true?  (goog/closure-ns? 'closurejs.widget)))
+  (is (false? (goog/closure-ns? 'cljs.core))))
+
+(deftest test-a-classpath-file-is-written-beside-the-namespaces
+  ;; NOT a fourth tree. A converted Closure file registers its provide into
+  ;; $CLJS.namespaces exactly as an emitted module registers its own, so it is a
+  ;; namespace by the same rule and goes in the same directory at the same path -
+  ;; which is why runtime.js's urlFor needs no branch for it.
+  (is (= "ns/closurejs/widget.js" (goog/ns->path "closurejs.widget")))
+  (is (= "ns/com/cognitect/transit.js" (goog/ns->path "com.cognitect.transit")))
+  (is (= "goog-subset/goog/math/Long.js" (goog/ns->path "goog.math.Long")))
+  ;; and the two statements of the rule agree, as output_test holds urlFor to them
+  (is (= (clojure.cljs.output/ns->path 'closurejs.widget)
+         (goog/ns->path "closurejs.widget"))))
+
+(deftest test-the-root-of-a-name-that-is-not-googs-is-bound
+  ;; transit.js opens `var transit = com.cognitect.transit;` and means the object
+  ;; its own provide made. Under Closure's loader that object is globalThis.com;
+  ;; here it hangs off goog.roots_, so the free variable has to be bound - once, in
+  ;; the one line convert adds at the top.
+  (let [idx  (goog/index)
+        head #(first (str/split-lines (goog/convert % idx)))]
+    (is (str/includes? (head "closurejs.widget") "const closurejs = goog.root(\"closurejs\");"))
+    (is (str/includes? (head "closurejs.widget") "import \"./util.js\";"))
+    ;; across the two trees, from ns/closurejs/ up to goog-subset/
+    (is (str/includes? (head "closurejs.widget")
+                       "import \"../../goog-subset/goog/object.js\";"))
+    ;; a module binds its require AFTER the root the require is read out of
+    (is (str/includes? (head "closurejs.modular")
+                       "const closurejs = goog.root(\"closurejs\"); const util = closurejs.util;"))
+    ;; and a goog file gets none of it: goog arrives as an import, which is where
+    ;; this tree's isolation lives, so the subset's headers are byte for byte what
+    ;; they were
+    (is (not (str/includes? (head "goog.math.Long") "goog.root")))))
+
+(h/deftest-when h/node? test-a-classpath-closure-file-compiles-and-runs
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             '{app.core "(ns app.core
+                           (:require [closurejs.widget :as w]
+                                     [closurejs.modular :as m]))
+                         (js* \"console.log(~{})\" (w/describe (js* \"({a: 1, b: 2})\")))
+                         (js* \"console.log(~{})\" (m/quadruple 5))"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            res  (driver/compile-namespace! cenv 'app.core
+                                            {:out-dir out :source-paths [src]})]
+        ;; NOT compiled - converted. It has no .cljs and nothing analysed it.
+        (is (= '[cljs.core app.core] (:compiled res)))
+        (is (.isFile (File. out "ns/closurejs/widget.js")))
+        (is (.isFile (File. out "ns/closurejs/util.js")))
+        (is (.isFile (File. out "ns/closurejs/modular.js")))
+        ;; the goog namespace widget.js requires came along, in its own tree
+        (is (.isFile (File. out "goog-subset/goog/object.js")))
+        ;; a module reaches it as an ordinary namespace object: $ns("closurejs.widget")
+        (let [text (slurp (File. out "ns/app/core.js"))]
+          (is (str/includes? text "import \"../closurejs/widget.js\""))
+          (is (str/includes? text "$ns(\"closurejs.widget\")")))
+        (is (= "a,b:42\n20" (node (File. out "ns/app/core.js")))))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(h/deftest-when h/node? test-a-source-beats-a-javascript-file-of-the-same-name
+  ;; closurejs/both.cljs and closurejs/both.js are both on the classpath and both
+  ;; say they are closurejs.both. The source wins, and it wins in one place - the
+  ;; driver looks for a source before it looks on the classpath - with the analyzer
+  ;; agreeing from the other side because env/declared? answers by then.
+  (let [src (h/write-sources!
+             (h/temp-dir)
+             ;; :refer, which is the assertion that this is a ClojureScript
+             ;; namespace and not merely one that happens to answer: a Closure
+             ;; namespace has no Vars and check-goog-require! refuses it outright.
+             '{app.core "(ns app.core (:require [closurejs.both :as b :refer [origin]]))
+                         (js* \"console.log(~{})\" b/origin)
+                         (js* \"console.log(~{})\" origin)"})
+        out (h/temp-dir)]
+    (try
+      (let [cenv (env/compile-env {:ns 'cljs.user})
+            res  (driver/compile-namespace! cenv 'app.core
+                                            {:out-dir out :source-paths [src]})]
+        (is (= '[cljs.core closurejs.both app.core] (:compiled res)))
+        (is (= "clojurescript\nclojurescript" (node (File. out "ns/app/core.js"))))
+        ;; and the .js was never converted over the top of the module just emitted
+        (is (str/includes? (slurp (File. out "ns/closurejs/both.js")) "$ns")))
+      (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+(deftest test-a-classpath-closure-file-is-refused-the-same-things-goog-is
+  ;; It is JavaScript either way, so the rules are the same rules: no vars to
+  ;; refer, and no JVM namespace of the name for :include-macros to reach.
+  (let [msg (refuses "(ns app.core (:require [closurejs.widget :refer [describe]]))")]
+    (is (re-find #"Cannot :refer" msg))
+    (is (re-find #"closurejs.widget" msg)))
+  (is (re-find #"Closure namespace"
+               (refuses "(ns app.core (:require [closurejs.widget :include-macros true]))")))
+  ;; and a var in one is UNCHECKED, like a goog var and for the same reason -
+  ;; nothing analysed the file and a JavaScript object's properties cannot be
+  ;; enumerated at compile time
+  (is (nil? (refuses "(ns app.core (:require [closurejs.widget :as w])) (w/nosuchthing 1)"))))
+
+(deftest test-a-closure-file-a-required-file-names-is-named-when-it-is-missing
+  ;; shadow/loader.js requires five goog namespaces the subset does not have, and
+  ;; "No such Closure namespace: goog.string.Const" on its own sends the reader
+  ;; looking in their own code. The name that wanted it is the useful half.
+  (let [e (try (goog/closure (goog/index) ["closurejs.needsmore"]) nil
+               (catch Exception e e))]
+    (is (some? e))
+    (is (re-find #"goog.no.such.thing" (ex-message e)))
+    (is (re-find #"required by closurejs.needsmore" (ex-message e)))))
+
+(deftest test-a-file-out-of-a-jar-is-converted-once-and-one-of-ours-every-time
+  ;; The asymmetry `source` has, one level up. A .js on the classpath cannot be
+  ;; edited under a running process, so converting it twice into the same directory
+  ;; is waste - and it is waste a REPL pays on EVERY FORM, since compile-form calls
+  ;; ensure-goog! each time and transit-js alone is ten files. The subset is ours,
+  ;; and a file someone is editing has to take effect without a restart.
+  (let [dir (h/temp-dir)]
+    (try
+      (let [first-time  (goog/write-goog! dir ["closurejs.widget"])
+            second-time (goog/write-goog! dir ["closurejs.widget"])]
+        (is (contains? first-time "closurejs.widget"))
+        (is (contains? first-time "goog.object"))
+        ;; out of a jar: written once
+        (is (not (contains? second-time "closurejs.widget")))
+        ;; ours: written again
+        (is (contains? second-time "goog.object"))
+        ;; and the file is still there either way - skipping a conversion is not
+        ;; skipping the output
+        (is (.isFile (io/file dir "ns/closurejs/widget.js"))))
+      (finally (h/delete-tree! dir)))))

@@ -296,7 +296,7 @@
            ;; to be there. A require typed at a REPL compiles no ClojureScript at
            ;; all when what it names is a goog namespace, so the driver's own call
            ;; never happens and this is the only one that can.
-           _     (when (:out-dir opts) (output/ensure-goog! (:out-dir opts) reqs))
+           _     (when (:out-dir opts) (output/ensure-goog! cenv (:out-dir opts) reqs))
            ;; and the same courtesy for the other tree, which we do NOT write: a
            ;; string require this namespace made spells an await $CLJS.requireJs,
            ;; and a module the bundler has not built is a 404 one line later.

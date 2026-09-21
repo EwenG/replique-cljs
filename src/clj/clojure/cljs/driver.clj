@@ -409,27 +409,43 @@
       (if (env/declared? cenv ns-sym)
         (update state :done conj ns-sym)
 
-        ;; clojure.test WITH NO FILE OF ITS OWN MEANS cljs.test, and it means it
-        ;; here rather than at the ns form because this is where the evidence is:
-        ;; the source paths are the driver's, and "there is no clojure.test" is a
-        ;; statement about them. The analyzer reaches the same conclusion from what
-        ;; it has analysed a moment later (analyzer/aliased-clj-ns), which it can
-        ;; only do because this compiled the target first.
+        ;; A CLOSURE-STYLE JAVASCRIPT FILE ON THE CLASSPATH is the other way there
+        ;; is to be a namespace without a .cljs: com.cognitect.transit is
+        ;; com/cognitect/transit.js in transit-js's jar, with a goog.provide at the
+        ;; top of it. Nothing to compile - clojure.cljs.goog converts it, and
+        ;; clojure.cljs.output/ensure-goog! writes it out with everything it
+        ;; requires, at the end of the run and for the same reason the goog subset
+        ;; is written then: what has to be on disk is decided by what was required.
         ;;
-        ;; Asked LAST, after the file and after declared?: a clojure.* namespace
-        ;; that does exist is itself and nothing else, which is what keeps
-        ;; clojure.string out of this.
-        (let [alt (ana/clj-ns->cljs-ns ns-sym)]
-          (if-let [src (and (not= alt ns-sym) (find-source (:source-paths opts) alt))]
-            (-> (compile-one! cenv opts (update state :done conj ns-sym) src alt)
-                (update :compiled conj ns-sym))
-            (throw (ex-info (str "Could not locate " (ns->source-path ns-sym ".cljs")
-                                 (when (not= alt ns-sym)
-                                   (str " or " (ns->source-path alt ".cljs")))
-                                 " on the source path: "
-                                 (str/join ", " (map str (:source-paths opts))))
-                            {:ns ns-sym
-                             :source-paths (mapv str (:source-paths opts))}))))))))
+        ;; ASKED AFTER THE SOURCE PATH, which is the whole of how a .cljs wins over
+        ;; a .js of the same name. The analyzer reaches the same conclusion from the
+        ;; other side a moment later (analyzer/closure-ns?, which asks env/declared?
+        ;; first) and can only do so because this marked the namespace done rather
+        ;; than compiling something into it.
+        (if (ana/closure-ns? cenv ns-sym)
+          (update state :done conj ns-sym)
+
+          ;; clojure.test WITH NO FILE OF ITS OWN MEANS cljs.test, and it means it
+          ;; here rather than at the ns form because this is where the evidence is:
+          ;; the source paths are the driver's, and "there is no clojure.test" is a
+          ;; statement about them. The analyzer reaches the same conclusion from what
+          ;; it has analysed a moment later (analyzer/aliased-clj-ns), which it can
+          ;; only do because this compiled the target first.
+          ;;
+          ;; Asked LAST, after the file and after declared?: a clojure.* namespace
+          ;; that does exist is itself and nothing else, which is what keeps
+          ;; clojure.string out of this.
+          (let [alt (ana/clj-ns->cljs-ns ns-sym)]
+            (if-let [src (and (not= alt ns-sym) (find-source (:source-paths opts) alt))]
+              (-> (compile-one! cenv opts (update state :done conj ns-sym) src alt)
+                  (update :compiled conj ns-sym))
+              (throw (ex-info (str "Could not locate " (ns->source-path ns-sym ".cljs")
+                                   (when (not= alt ns-sym)
+                                     (str " or " (ns->source-path alt ".cljs")))
+                                   " on the source path: "
+                                   (str/join ", " (map str (:source-paths opts))))
+                              {:ns ns-sym
+                               :source-paths (mapv str (:source-paths opts))})))))))))
 
 (def ^:private empty-state
   {:done #{} :visiting [] :compiled [] :written [] :scripts []})
@@ -523,7 +539,7 @@
           ;; compiled nothing because everything was already analysed still has to
           ;; fill a directory that has none of it. The set is small and the writes
           ;; are skipped when the files are already there.
-          (output/ensure-goog! (:out-dir opts)
+          (output/ensure-goog! cenv (:out-dir opts)
                                (mapcat #(env/requires cenv (.getName ^clojure.lang.Namespace %))
                                        (env/all-cljs-ns cenv)))
           ;; and the one thing that can be said about npm/ from here: which of

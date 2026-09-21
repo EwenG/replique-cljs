@@ -1335,16 +1335,44 @@
                                         (alias-only? opts)))]
                      target)))))
 
-(defn- check-goog-require!
-  "A (:require [goog.object :as gobject]) entry, checked.
+(defn closure-ns?
+  "Is `target` a CLOSURE namespace here - one whose implementation is a JavaScript
+  file the compiler converts, rather than a ClojureScript file it compiles?
 
-  Three things are refused rather than passed through. A goog name we do not have,
-  because the alternative is a module import for a file that is not there and a
-  404 at load; :refer, because a goog var is not a Var and there is nothing to map
-  - :import is how Closure gives a bare name, and it is what cljs.core uses; and
+  Two kinds. A `goog.` name, which is syntactic and reserved; and a Closure-style
+  JavaScript file sitting on the classpath at the name's own path -
+  com.cognitect.transit out of transit-js's jar, shadow.loader out of shadow-cljs's.
+  After this line the two are one thing: both are converted by clojure.cljs.goog,
+  both register their provide into $CLJS.namespaces, and a var in either is a
+  property of the object $ns hands back.
+
+  A NAMESPACE THAT HAS BEEN DECLARED IS NOT ONE, whatever sits on the classpath
+  beside it. That is what gives a .cljs precedence over a .js of the same name
+  without anyone having to rule on the ambiguity: by the time an ns form is
+  analysed, a compilation driver has already compiled everything it requires
+  (driver/ensure!), so a namespace with a source has an ns form behind it and
+  answers false here. env/declared? is that question and is asked FIRST, before the
+  classpath is touched - which is also what keeps this cheap enough to ask about
+  every require and every qualified symbol's prefix.
+
+  Public because clojure.cljs.driver asks it of a namespace it could not find a
+  source for, and the two must agree."
+  [cenv target]
+  (or (goog/goog-ns? target)
+      (and (not (env/declared? cenv target)) (goog/js-ns? target))))
+
+(defn- check-goog-require!
+  "A (:require [goog.object :as gobject]) entry, checked. A classpath Closure file -
+  (:require [com.cognitect.transit :as t]) - passes through here too, and the rules
+  are the same rules: it is JavaScript either way.
+
+  Three things are refused rather than passed through. A Closure name we do not
+  have, because the alternative is a module import for a file that is not there and
+  a 404 at load; :refer, because a Closure var is not a Var and there is nothing to
+  map - :import is how Closure gives a bare name, and it is what cljs.core uses; and
   the macro options, because there is no JVM namespace called goog.object."
   [spec target refers macros]
-  (when-not (goog/known? target)
+  (when-not (goog/provided? target)
     (analysis-error
      spec
      (if goog/*closure-library*
@@ -1650,7 +1678,12 @@
         (alias-only? opts)
         {:target written :as (:as-alias opts) :alias-only true}
 
-        (goog/goog-ns? target)
+        ;; A CLOSURE NAMESPACE - goog's tree, or a .js on the classpath at the
+        ;; name's own path. Nothing here is compiled, nothing is interned, and
+        ;; there are no vars to refer: what the require buys is the alias and the
+        ;; import, which apply-ns-require! records the same way it records one for
+        ;; a namespace we compiled. See closure-ns? for why a .cljs wins.
+        (closure-ns? cenv target)
         (let [macros (when (or (:include-macros opts) (:refer-macros opts))
                        {:target target :as (:as opts) :refers (:refer-macros opts)})]
           (check-goog-require! spec target asked macros)
@@ -2527,11 +2560,11 @@
         ^Namespace target (env/resolve-ns cenv nsym)
         ;; the goog name this prefix stands for, through an alias or as itself
         gns   (if (some? target)
-                (let [n (.getName target)] (when (goog/goog-ns? n) n))
-                (when (goog/goog-ns? nsym) nsym))
+                (let [n (.getName target)] (when (closure-ns? cenv n) n))
+                (when (closure-ns? cenv nsym) nsym))
         prov  (when gns
                 (let [p (symbol (str gns "." (name sym)))]
-                  (when (goog/known? p) p)))
+                  (when (goog/provided? p) p)))
         ;; String/.toUpperCase, Object/new - a host member as a value. Asked when
         ;; the prefix is not a ClojureScript NAMESPACE, which is how cljs.analyzer
         ;; asks it (analyzer.cljc:4143): my.ns/.foo in a namespace that requires
@@ -2555,7 +2588,7 @@
 
       prov (goog-ns-node env (require-goog! cenv prov) form)
 
-      (and gns (goog/known? gns))
+      (and gns (goog/provided? gns))
       (goog-var-node env sym form (require-goog! cenv gns))
 
       ;; a name in the goog tree that this fork does not ship. Not a JavaScript
@@ -2868,7 +2901,7 @@
 
           :else
           (if-let [^Namespace aliased (.lookupAlias here sym)]
-            (if (goog/goog-ns? (.getName aliased))
+            (if (closure-ns? cenv (.getName aliased))
               (goog-ns-node env (.getName aliased))
               (analysis-error sym (str sym " is a namespace alias, not a value.")))
             ;; a.b - not a var, not a goog name, not an alias, so the dots are

@@ -120,9 +120,35 @@ goog.inherits ??= function(childCtor, parentCtor) {
 // both provide something under `goog.string`, and whichever runs second has to
 // find the object the first one made rather than replace it - along with
 // everything already hung on it.
+// Where a provide's FIRST segment lives.
+//
+// Under Closure, goog.provide('goog.math.Long') and goog.provide('com.cognitect.
+// transit') are one rule: walk the name from the GLOBAL OBJECT, making what is
+// missing. goog is a global there, so its own names land on it by coincidence of
+// layout rather than by a rule of their own.
+//
+// Ours is not global - see the note on $CLJS above, which is the whole of our
+// isolation from a page's real Closure - so there is nowhere for a name that is
+// not goog's to go. This object is that somewhere, and registering `goog` in it
+// as its own first segment is what keeps the two cases one rule: provide walks
+// from roots_[parts[0]], and for every goog name that is goog itself, landing
+// exactly where it always did.
+//
+// A library out of a jar therefore gets the same isolation the subset gets. A page
+// holding a real Closure AND a real com.cognitect.transit sees neither of ours.
+goog.roots_ ??= { goog: goog };
+
+// The first segment of a name, created if it is missing. What a converted file
+// binds at the top so that its body can name it: `const com = goog.root("com")`
+// is how transit.js's `var transit = com.cognitect.transit` finds anything at all,
+// where under Closure's loader `com` was a free variable on the global object.
+// See clojure.cljs.goog/convert.
+goog.root ??= function(seg) { return (goog.roots_[seg] ??= {}); };
+
 goog.provide ??= function(name) {
-  let o = goog;
-  for (const part of name.split(".").slice(1)) { o = (o[part] ??= {}); }
+  const parts = name.split(".");
+  let o = goog.root(parts[0]);
+  for (const part of parts.slice(1)) { o = (o[part] ??= {}); }
   return o;
 };
 
@@ -132,10 +158,17 @@ goog.provide ??= function(name) {
 // provide because a module's exports replace the object rather than extend it -
 // goog.math.Long IS the Long constructor, not a namespace holding one.
 goog.expose ??= function(name, exports) {
-  const parts = name.split(".").slice(1);
-  let o = goog;
-  for (const part of parts.slice(0, -1)) { o = (o[part] ??= {}); }
-  o[parts[parts.length - 1]] = exports;
+  const parts = name.split(".");
+  if (parts.length === 1) {
+    // a module whose name has no dot in it - shadow.loader has one, transit has
+    // one under it, and a one-segment name IS its own root, so there is no
+    // container to walk to and the assignment is into roots_ itself.
+    goog.roots_[parts[0]] = exports;
+  } else {
+    let o = goog.root(parts[0]);
+    for (const part of parts.slice(1, -1)) { o = (o[part] ??= {}); }
+    o[parts[parts.length - 1]] = exports;
+  }
   register(name);
 };
 
@@ -167,12 +200,13 @@ goog.expose ??= function(name, exports) {
 // goog.math.Long), which asks for a module by its provide name.
 function register(name) {
   const parts = name.split(".");
-  let o = goog;
+  let o = goog.roots_[parts[0]];
+  if (o == null) return;
   for (const part of parts.slice(1)) { o = o[part]; if (o == null) return; }
   $CLJS.namespaces.set(name, o);
   if (parts.length > 1) {
     const parent = parts.slice(0, -1).join(".");
-    let p = goog;
+    let p = goog.roots_[parts[0]];
     for (const part of parts.slice(1, -1)) { p = p[part]; if (p == null) return; }
     if (!$CLJS.namespaces.has(parent)) $CLJS.namespaces.set(parent, p);
   }

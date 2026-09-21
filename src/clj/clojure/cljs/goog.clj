@@ -135,12 +135,32 @@
   object either way). A fourth is `canonical`: 193 of its files provide more than
   one name, and only one of them can hold the body.
 
+  ## A third place, and it needs no list at all
+
+  transit-js ships com/cognitect/transit.js in a jar; shadow-cljs ships
+  shadow/loader.js. Neither is the Closure Library and neither declares itself
+  anywhere, and both are the same kind of input as everything above - a Closure
+  header over a body. What was missing for them was never the converter; it was
+  somewhere to look, because a jar that is neither of the two trees has no list and
+  publishes no deps.js.
+
+  ClojureScript scans the whole classpath for .js files and reads their provide
+  lines. This does not, because the path is DERIVABLE FROM THE NAME: dots to
+  slashes, which is the rule `ns->path` and clojure.cljs.output/ns->path already
+  state and the rule those jars are laid out by. So one io/resource replaces a scan.
+  See `classpath-entry`, and doc/cljs-compiler.md 5.52.
+
+  Closure's own tree is the exception that proves it - goog.asserts is
+  asserts/asserts.js, and no rule connects those - which is exactly why the subset
+  needs `files` and the library needs deps.js.
+
   ## Not here
 
-  The index is built by parsing the tree, so a provide is declared in one place -
-  the file that provides it. `files` is the one list that has to be maintained, and
-  it is paths only: a jar has no directory to enumerate. In library mode there is no
-  such list, because deps.js is one."}
+  The index for the subset is built by parsing the tree, so a provide is declared in
+  one place - the file that provides it. `files` is the one list that has to be
+  maintained, and it is paths only: a jar has no directory to enumerate. In library
+  mode there is no such list, because deps.js is one; on the classpath there is none
+  because the name is the path."}
   clojure.cljs.goog
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
@@ -250,6 +270,32 @@
   than wrong - see clojure.cljs.output."
   "goog-subset")
 
+(def js-out-dir
+  "Where a Closure file found on the CLASSPATH is written under an output root, and
+  it is `ns` - the very directory an emitted ClojureScript module goes in, at the
+  same dots-to-slashes path.
+
+  ONE TREE, because these are namespaces by the same rule everything in it is. The
+  converted file registers its provide into $CLJS.namespaces exactly as an emitted
+  module registers its own, so $ns(\"com.cognitect.transit\") answers for both; a
+  module importing one spells the same relative path it spells for the other; and
+  runtime.js's urlFor needs no third branch, because the one it already has for a
+  name that is not goog's computes ./ns/com/cognitect/transit.js and is right.
+
+  The goog tree is the one that has to be kept apart, and `out-dir` says why: a real
+  Closure Library unpacks as goog/, and a name in it is reserved from ClojureScript
+  so nothing emitted can collide. A classpath Closure name is reserved from nothing -
+  com.cognitect.transit could have been written in ClojureScript, and if it had been,
+  the file would be at this very path. That is not a collision waiting to happen; it
+  is the same namespace arriving by the other door, and only one of the two doors is
+  ever open (see classpath-entry, and the driver's ensure!, which looks for the
+  source first).
+
+  Spelled here rather than read from clojure.cljs.output/ns-dir because that
+  namespace requires this one. The two state one rule twice, as runtime.js states it
+  a third time, and goog-test holds all of them to it."
+  "ns")
+
 (def base
   "The one file that is already an ES module, and so the one file the rewrite
   copies rather than converts. It is also the only file in the tree that imports
@@ -310,10 +356,11 @@
   which is where the two files that are ours in both modes live."
   ([path] (source root path))
   ([from path]
-   (or (some-> (io/resource (str from "/" path)) slurp)
-       (throw (ex-info (str "The Closure tree is missing " path
-                            ". Expected it on the classpath at " from "/" path ".")
-                       {:path path :root from})))))
+   (let [res (if from (str from "/" path) path)]
+     (or (some-> (io/resource res) slurp)
+         (throw (ex-info (str "The Closure tree is missing " path
+                              ". Expected it on the classpath at " res ".")
+                         {:path path :root from}))))))
 
 ;; --- reading a Closure header -----------------------------------------------
 
@@ -325,11 +372,25 @@
   semicolon refused the file rather than reading it."
   "\\s*(?://.*)?$")
 
-(def ^:private provide-re  (re-pattern (str "^goog\\.provide\\('([^']+)'\\);" eol)))
-(def ^:private module-re   (re-pattern (str "^goog\\.module\\('([^']+)'\\);" eol)))
+(def ^:private q
+  "A Closure name where a header line quotes one.
+
+  EITHER QUOTE. The Closure Library and this subset write single quotes; transit-js
+  writes double ones, on every line of every file it ships. Both are JavaScript
+  string literals and Closure's own parser reads both, so a grammar that insisted on
+  one was refusing a real Closure file over its author's spacing habits - which is
+  what `parse` refuses things FOR, and this is not one of them.
+
+  Not a general string literal: no escapes, and the closing quote need not match the
+  opening one. A Closure name is a dotted JavaScript identifier, so anything either
+  of those would buy cannot appear in one."
+  "['\"]([^'\"]+)['\"]")
+
+(def ^:private provide-re  (re-pattern (str "^goog\\.provide\\(" q "\\);" eol)))
+(def ^:private module-re   (re-pattern (str "^goog\\.module\\(" q "\\);" eol)))
 (def ^:private legacy-re   (re-pattern (str "^goog\\.module\\.declareLegacyNamespace\\(\\);" eol)))
-(def ^:private require-re  (re-pattern (str "^goog\\.require\\('([^']+)'\\);" eol)))
-(def ^:private bound-re    (re-pattern (str "^(?:const|let|var)\\s+(\\w+)\\s*=\\s*goog\\.require\\('([^']+)'\\);" eol)))
+(def ^:private require-re  (re-pattern (str "^goog\\.require\\(" q "\\);" eol)))
+(def ^:private bound-re    (re-pattern (str "^(?:const|let|var)\\s+(\\w+)\\s*=\\s*goog\\.require\\(" q "\\);" eol)))
 
 ;; Three more shapes, none of which the subset uses and all of which the library
 ;; does - 337 of its files requireType, 80 destructure a require, and it was the
@@ -345,10 +406,10 @@
 ;; Closure's own loader does not fetch it either. So it contributes a binding when
 ;; it has one - so the annotations still parse as JavaScript - and no import, and
 ;; nothing to the closure of files that have to be written.
-(def ^:private pattern-re  (re-pattern (str "^(?:const|let|var)\\s+(\\{[^}]*\\})\\s*=\\s*goog\\.require\\('([^']+)'\\);" eol)))
-(def ^:private type-re     (re-pattern (str "^goog\\.requireType\\('([^']+)'\\);" eol)))
+(def ^:private pattern-re  (re-pattern (str "^(?:const|let|var)\\s+(\\{[^}]*\\})\\s*=\\s*goog\\.require\\(" q "\\);" eol)))
+(def ^:private type-re     (re-pattern (str "^goog\\.requireType\\(" q "\\);" eol)))
 (def ^:private bound-type-re
-  (re-pattern (str "^(?:const|let|var)\\s+(\\w+|\\{[^}]*\\})\\s*=\\s*goog\\.requireType\\('([^']+)'\\);" eol)))
+  (re-pattern (str "^(?:const|let|var)\\s+(\\w+|\\{[^}]*\\})\\s*=\\s*goog\\.requireType\\(" q "\\);" eol)))
 
 (def ^:private header-call-re
   "A line that is TRYING to be one of the five forms: it calls goog.provide,
@@ -495,6 +556,149 @@
   [ns-sym]
   (contains? (index) (str ns-sym)))
 
+;; --- the third place a Closure file can come from: anywhere on the classpath --
+;;
+;; transit-js ships com/cognitect/transit.js in a jar, with goog.provide at the top
+;; and nine more files under it; shadow-cljs ships shadow/loader.js, a goog.module
+;; that declares a legacy namespace. Neither is the Closure Library and neither is in
+;; any list here, and both are the same kind of input as everything above - a Closure
+;; header over a body, which `convert` turns into an ES module and base.js makes
+;; loadable.
+;;
+;; WHAT WAS MISSING WAS NEVER THE MACHINERY. It was the index: `subset-index` walks a
+;; list we maintain, `library-index` reads a deps.js the library publishes, and a jar
+;; that is neither has no list and no deps.js to read. ClojureScript's answer is to
+;; SCAN - every classpath entry, every .js in it, read each one's provide line, and
+;; build a map. Ours is not, and the reason is the reason doc/cljs-output-layout.md
+;; 7.3 gives for everything else here:
+;;
+;;     THE PATH IS DERIVABLE FROM THE NAME, so there is nothing to index.
+;;
+;; com.cognitect.transit is at com/cognitect/transit.js, shadow.loader at
+;; shadow/loader.js, and com.cognitect.transit.impl.decoder at
+;; com/cognitect/transit/impl/decoder.js - dots to slashes, which is the same rule
+;; `ns->path`, clojure.cljs.output/ns->path and runtime.js's urlFor already state,
+;; and the rule these libraries lay their jars out by because it is the one Closure's
+;; own debug loader resolves a name with. So a lookup replaces a scan: one
+;; io/resource for a name we are asked about, instead of several hundred jars read
+;; ahead of being asked.
+;;
+;; The subset is the exception that proves it. Closure's own tree is NOT derivable -
+;; goog.asserts is asserts/asserts.js, goog.debug.Error is debug/error.js - which is
+;; exactly why those two need a list and a deps.js, and why the subset is written OUT
+;; at derived names rather than at Closure's own.
+
+(defn js-path
+  "Where a Closure name is looked for on the classpath: com.cognitect.transit ->
+  com/cognitect/transit.js.
+
+  Dots to slashes and nothing else. NO MUNGING, unlike a ClojureScript source path:
+  a Closure name is a dotted JavaScript identifier - it is evaluated as a property
+  path by the library's own body - so there is no hyphen for a munge to map, and a
+  name carrying one is a name no Closure file can provide."
+  [provide]
+  (str (str/replace (str provide) "." "/") ".js"))
+
+(def ^:private classpath-cache
+  "provide name -> its entry, or ::none. Both directions are kept, and the negative
+  half is the one that matters: the analyzer asks whether a name is a Closure file
+  for every prefix it cannot otherwise place, and Math/floor must not cost a
+  classpath walk twice.
+
+  Cached for `library-cache`'s reason and with its limit - a jar does not change
+  under a running process. A .js a developer is EDITING is the case this gets wrong,
+  and it gets it wrong once per name per JVM."
+  (atom {}))
+
+(defn- claims?
+  "Does `src` open by providing `provide`? The cheap half of the question, asked
+  before `parse`.
+
+  IT IS ASKED FIRST ON PURPOSE. `parse` is strict - a goog.require it does not
+  recognise is refused rather than passed through - and that strictness is right for
+  a file we are about to convert and wrong for a file that merely happens to sit at
+  a path we probed. Anything on the classpath can be at com/example/thing.js, and a
+  compiler that threw while deciding whether a namespace was JavaScript at all would
+  be refusing files it was never going to touch. So: does this file say it is the
+  thing we asked for? Only then is it ours to be strict about."
+  [src provide]
+  (boolean (some #(or (= [provide] (rest (re-matches provide-re %)))
+                      (= [provide] (rest (re-matches module-re %))))
+                 (str/split-lines src))))
+
+(defn classpath-entry
+  "The index entry for a Closure-style JavaScript file on the classpath providing
+  `provide`, or nil when there is none.
+
+  The same shape every other index hands back, so `convert`, `closure` and
+  `write-goog!` need no case of their own: {:root :path :provides :requires}, with
+  :root nil because the path is already the resource's whole name.
+
+  THE FILE MUST CLAIM THE NAME. A file at the derived path that provides something
+  else, or that is not a Closure file at all - an emitted ES module, a bundle, a
+  plain script - is not an answer, and nil here is what lets a ClojureScript
+  namespace called com.cognitect.transit go on being one. That check is also what
+  keeps this safe to ask about EVERY name: the question is not `is there a .js
+  there`, it is `is there a Closure file there that says it is this`.
+
+  A goog name is never one of these. Its tree is chosen - subset or library - and
+  a third answer found by probing the classpath would be exactly the silent
+  substitution `*closure-library*` exists to prevent."
+  [provide]
+  (let [provide (str provide)
+        cached  (get @classpath-cache provide ::miss)]
+    (if (not= ::miss cached)
+      (when-not (= ::none cached) cached)
+      (let [entry (when-not (goog-ns? provide)
+                    (let [path (js-path provide)]
+                      (when-let [src (some-> (io/resource path) slurp)]
+                        (when (claims? src provide)
+                          (let [{:keys [provides requires]} (parse src)]
+                            {:root nil :path path
+                             :provides provides :requires requires})))))]
+        (swap! classpath-cache assoc provide (or entry ::none))
+        entry))))
+
+(defn entry
+  "The Closure file that provides `name`, from `idx` or from the classpath.
+
+  ONE LOOKUP FOR BOTH TREES. `idx` is whichever goog index is in use and is a map
+  because it can be enumerated; the classpath cannot, so it is asked by name. The
+  goog one is asked first: a name in that tree is answered by the tree that was
+  chosen, never by something a jar happened to put at the same path."
+  [idx name]
+  (or (get idx name) (classpath-entry name)))
+
+(defn js-ns?
+  "Is `ns-sym` a Closure-style JavaScript file on the classpath rather than a
+  ClojureScript namespace?
+
+  What the analyzer asks to decide that (:require [com.cognitect.transit :as t]) is
+  a require of JavaScript - no vars to refer, nothing to compile, an import of a
+  file this converts. Its callers ask it LAST, after a namespace that was actually
+  declared has already answered, so a .cljs always wins over a .js of the same name
+  and the ambiguity never has to be resolved here."
+  [ns-sym]
+  (some? (classpath-entry ns-sym)))
+
+(defn closure-ns?
+  "Is `ns-sym` a Closure namespace - one whose implementation is a JavaScript file
+  this compiler CONVERTS rather than a ClojureScript file it compiles?
+
+  Two kinds, and after this line almost nothing downstream cares which: a goog name,
+  which is syntactic and reserved, or a file on the classpath at the name's own path.
+  Both end up as an ES module registered into $CLJS.namespaces, so both are reached
+  by $ns(\"the.name\") and a var in either is a property of that object."
+  [ns-sym]
+  (or (goog-ns? ns-sym) (js-ns? ns-sym)))
+
+(defn provided?
+  "Is `name` a Closure namespace this compilation can actually reach? `known?`
+  widened to the classpath, and the question every place that would have asked
+  `known?` about a name that might not be goog's should ask instead."
+  [name]
+  (or (known? name) (some? (classpath-entry name))))
+
 ;; --- what the reductions actually provide -----------------------------------
 
 (def reduced-vars
@@ -604,9 +808,13 @@
   directory goog/string/, which every filesystem allows.
 
   Sound only because each file in this subset provides exactly ONE name - checked
-  by `index`, which refuses two files providing one name, and by goog-test."
+  by `index`, which refuses two files providing one name, and by goog-test.
+
+  A CLASSPATH CLOSURE FILE GOES UNDER `ns` INSTEAD - see js-out-dir - and the rule
+  inside that tree is this same one for the third time."
   [provide]
-  (str out-dir "/" (str/replace provide "." "/") ".js"))
+  (str (if (goog-ns? provide) out-dir js-out-dir)
+       "/" (str/replace provide "." "/") ".js"))
 
 (def base-path
   "base.js sits at the root of the output subtree, as runtime.js does at the root of
@@ -659,8 +867,8 @@
   the body registers every name it provides, so importing it is all this has to do.
   `ns->path` stays a pure function of a name, which is the constraint this exists
   to satisfy."
-  [provide entry]
-  (str "import \"" (relative (ns->path provide) (ns->path (canonical entry))) "\";\n"))
+  [provide this]
+  (str "import \"" (relative (ns->path provide) (ns->path (canonical this))) "\";\n"))
 
 (defn convert
   "One Closure file as an ES module.
@@ -683,7 +891,7 @@
   has nothing left to decide. It has to be this way for the library, where 781 files
   are modules and 91 declare a legacy name."
   [provide idx]
-  (let [{:keys [root path] :as entry} (get idx provide)
+  (let [{:keys [root path] :as this} (entry idx provide)
         src      (source root path)
         {:keys [kind provides requires]} (parse src)
         _        (when-not kind
@@ -693,7 +901,7 @@
                                         " built.")
                                    {:path path})))
         _        (doseq [{n :name t :type-only?} requires]
-                   (when-not (or t (get idx n))
+                   (when-not (or t (entry idx n))
                      (throw (ex-info (str path " requires " n ", which no file in the"
                                           " Closure tree in use provides. "
                                           (get-real-closure))
@@ -706,7 +914,35 @@
                        (map (fn [{:keys [name]}]
                               (str "import \"" (relative here (ns->path name)) "\";")))
                        loads)
-        bindings (into (if (= kind :module) ["let exports = {};"] [])
+        ;; THE ROOT SEGMENT OF A NAME THAT IS NOT GOOG'S, bound so the body can
+        ;; name it. transit.js opens `var transit = com.cognitect.transit;` and
+        ;; means the object its own goog.provide made - under Closure's loader
+        ;; that object is globalThis.com, because provide walks the global, and
+        ;; `com` is then a free variable every file in the jar can see.
+        ;;
+        ;; Here it is not global. base.js hangs a provide off goog.roots_ instead,
+        ;; which is the same isolation the goog object itself gets and for the same
+        ;; reason - a page may hold a real Closure, and two Closures must not share
+        ;; a namespace. So the free variable has to be BOUND, once, at the top of
+        ;; the module: const com = goog.root("com").
+        ;;
+        ;; Every name the file provides or requires contributes its first segment,
+        ;; because under Closure every one of them was reachable that way and a
+        ;; vendored body may name any of them - a bare goog.require with no binding
+        ;; means exactly `I will write this name out`. goog's own is not among them:
+        ;; that one arrives as an import, which is where this tree's isolation lives.
+        ;;
+        ;; goog.root creates what is missing rather than reading what is there, so
+        ;; the order of the line does not matter: a file whose only `com` name is the
+        ;; one it provides binds it before its own goog.provide runs, and finds the
+        ;; same object when it does.
+        roots    (into (sorted-set)
+                       (comp (remove goog-ns?)
+                             (map #(subs % 0 (or (str/index-of % ".") (count %)))))
+                       (concat provides (map :name requires)))
+        bindings (into (into (if (= kind :module) ["let exports = {};"] [])
+                             (map #(str "const " % " = goog.root(\"" % "\");"))
+                             roots)
                        (keep (fn [{:keys [name binding]}]
                                (when binding
                                  ;; the provide name IS the expression: goog.asserts
@@ -732,9 +968,9 @@
       (throw (ex-info (str path " is a goog.module providing " (count provides)
                            " names. A module provides exactly one.")
                       {:path path :provides provides})))
-    (when-not (= provide (canonical entry))
+    (when-not (= provide (canonical this))
       (throw (ex-info (str provide " is not the canonical provide of " path
-                           " - " (canonical entry) " is. A file is converted once,"
+                           " - " (canonical this) " is. A file is converted once,"
                            " under the name it is written at; the rest get a stub.")
                       {:path path :provide provide})))
     (str/join "\n" (concat [header] body trailer [""]))))
@@ -755,28 +991,36 @@
   import of a file that has to be there. Nothing else would ask for it: the program
   never names it, and no other file requires it."
   [idx names]
-  (loop [seen #{} todo (vec names)]
-    (if-let [n (peek todo)]
+  ;; `todo` carries [name who-asked-for-it], and the second half is only ever read
+  ;; by the error below - which is the difference between "No such Closure
+  ;; namespace: goog.string.Const" and knowing that shadow.loader is what wanted
+  ;; it. A name nobody asked for is one the caller named itself, and the message
+  ;; says so by leaving the clause out.
+  (loop [seen #{} todo (mapv (fn [n] [n nil]) names)]
+    (if-let [[n from] (peek todo)]
       (if (seen n)
         (recur seen (pop todo))
-        (let [entry (or (get idx n)
-                        (throw (ex-info (str "No such Closure namespace: " n ". "
-                                             (get-real-closure))
-                                        {:provide n})))]
+        (let [this (or (entry idx n)
+                       (throw (ex-info (str "No such Closure namespace: " n
+                                            (when from (str ", required by " from))
+                                            ". " (get-real-closure))
+                                       (cond-> {:provide n} from (assoc :from from)))))]
           (recur (conj seen n)
-                 (into (conj (pop todo) (canonical entry))
-                       (comp (remove :type-only?) (map :name))
-                       (:requires entry)))))
+                 (into (conj (pop todo) [(canonical this) n])
+                       (comp (remove :type-only?) (map (fn [r] [(:name r) n])))
+                       (:requires this)))))
       seen)))
 
 (def ^:private written
   "What this process has already converted into which directory, as {dir #{provide}}.
 
-  Only consulted in library mode, and that asymmetry is `source`'s: the subset's
-  files are ours and someone may be editing one, so those are converted on every
-  call, which is twenty files at most. A jar is not edited under a running process,
-  and the library is 1,600 files of which a REPL would otherwise reconvert its
-  closure on every form."
+  WHAT MAY BE SKIPPED IS WHAT NOBODY IS EDITING, and that asymmetry is `source`'s.
+  The subset's twenty files are ours, so one someone edits has to take effect
+  without a restart and they are converted on every call. A jar is not edited under
+  a running process, so the library's 1,600 and anything found on the classpath are
+  converted once per output directory and then remembered - which is what a REPL
+  needs, since compile-form calls write-goog! for every form and transit-js alone is
+  ten files of it."
   (atom {}))
 
 (defn write-goog!
@@ -801,18 +1045,20 @@
         ;; `goog` is always in: goog.js is what a require of the bare name fetches,
         ;; and cljs.core names goog/typeOf without requiring anything.
         want  (closure idx (cons "goog" names))
-        todo  (if *closure-library* (remove seen want) want)
+        ;; a file out of a jar - the library's, or one found on the classpath, which
+        ;; is what a nil :root means. See `written` for why only those are skipped.
+        jar?  (fn [n] (or *closure-library* (nil? (:root (entry idx n)))))
+        todo  (remove #(and (seen %) (jar? %)) want)
         put!  (fn [path text]
                 (let [f (File. dir ^String path)]
                   (.mkdirs (.getParentFile f))
                   (spit f text)))]
     (put! base-path (source base))
     (doseq [provide todo]
-      (let [entry (get idx provide)]
+      (let [this (entry idx provide)]
         (put! (ns->path provide)
-              (if (= provide (canonical entry))
+              (if (= provide (canonical this))
                 (convert provide idx)
-                (stub provide entry)))))
-    (when *closure-library*
-      (swap! written update (str dir) (fnil into #{}) want))
+                (stub provide this)))))
+    (swap! written update (str dir) (fnil into #{}) (filter jar? want))
     (set todo)))
