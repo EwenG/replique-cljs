@@ -294,41 +294,50 @@
         text      (slurp src)
         rdr       (reader/push-back-reader text)]
     (names/with-name-scope
-      (let [body (loop [acc []]
-                   (let [form (reader/read-one cenv rdr EOF)]
-                     (if (identical? form EOF)
-                       acc
-                       ;; The &env PER FORM, not once for the file. It carries
-                       ;; {:ns {:name ...}} as a VALUE, read as (-> &env :ns :name)
-                       ;; by defprotocol, defmulti and deftype among others - and
-                       ;; the file's ns form moves the cursor, so one built before
-                       ;; the loop names whatever namespace the driver happened to
-                       ;; be in when it opened the file. That is cljs.user for the
-                       ;; first file of a run and the PREVIOUS file for every one
-                       ;; after it, which is how a protocol in one namespace got
-                       ;; method names qualified with another.
-                       ;;
-                       ;; LINES, not one string per form, and source-info before
-                       ;; emitting: a line is what a source map maps, emit-top
-                       ;; would join the lines into text whose interior boundaries
-                       ;; nothing can find again, and the emitter attributes a line
-                       ;; to a node from the position that pass writes (§5.43).
-                       (recur (into acc
-                                    (emitter/emit-top-lines
-                                     (si/source-info
-                                      (ana/analyze-top
-                                       cenv (env/analysis-env cenv) form)
-                                      (assoc (meta form) :file label))))))))
-            module (sm/cat (module-text cenv ns-sym body)
-                           "//# sourceMappingURL=" (map-name ns-sym) "\n")
-            ^File out-map (io/file (str out ".map"))]
-        {:written (write-if-changed! out module)
-         :mapped  (write-if-changed!
-                   out-map
-                   (sm/encode {:file      (.getName out)
-                               :positions (sm/line-positions module)
-                               :content   {label text}}))
-         :script  (body-script cenv ns-sym body)}))))
+     ;; THE LABEL IS ALSO WHAT A VAR RECORDS. It is already the name this file
+     ;; goes under in its source map, and a var's :file is the same question asked
+     ;; by an editor instead of by a stack frame - so the two are one string and
+     ;; not two spellings of one file. Bound around the read, because the interning
+     ;; happens inside analyze-top and nothing it is handed could carry this.
+     ;;
+     ;; Re-entrant on purpose: a form analysed here can send the driver back into
+     ;; another file, and that compilation binds a label of its own over this one.
+     (binding [ana/*source-file* label]
+       (let [body (loop [acc []]
+                    (let [form (reader/read-one cenv rdr EOF)]
+                      (if (identical? form EOF)
+                        acc
+                        ;; The &env PER FORM, not once for the file. It carries
+                        ;; {:ns {:name ...}} as a VALUE, read as (-> &env :ns :name)
+                        ;; by defprotocol, defmulti and deftype among others - and
+                        ;; the file's ns form moves the cursor, so one built before
+                        ;; the loop names whatever namespace the driver happened to
+                        ;; be in when it opened the file. That is cljs.user for the
+                        ;; first file of a run and the PREVIOUS file for every one
+                        ;; after it, which is how a protocol in one namespace got
+                        ;; method names qualified with another.
+                        ;;
+                        ;; LINES, not one string per form, and source-info before
+                        ;; emitting: a line is what a source map maps, emit-top
+                        ;; would join the lines into text whose interior boundaries
+                        ;; nothing can find again, and the emitter attributes a line
+                        ;; to a node from the position that pass writes (§5.43).
+                        (recur (into acc
+                                     (emitter/emit-top-lines
+                                      (si/source-info
+                                       (ana/analyze-top
+                                        cenv (env/analysis-env cenv) form)
+                                       (assoc (meta form) :file label))))))))
+             module (sm/cat (module-text cenv ns-sym body)
+                            "//# sourceMappingURL=" (map-name ns-sym) "\n")
+             ^File out-map (io/file (str out ".map"))]
+         {:written (write-if-changed! out module)
+          :mapped  (write-if-changed!
+                    out-map
+                    (sm/encode {:file      (.getName out)
+                                :positions (sm/line-positions module)
+                                :content   {label text}}))
+          :script  (body-script cenv ns-sym body)})))))
 
 (defn- read-ns-form
   "The first form of `src`, which has to be the ns form it declares.

@@ -59,6 +59,33 @@
   holds the same var and cljs.compiler reads it in the same place."
   true)
 
+(def ^:dynamic *source-file*
+  "The file the forms being analysed were read from, as a var's :file records it,
+  or nil where they were not read from a file at all.
+
+  A PATH UNDER A SOURCE DIRECTORY - my_lib/core.cljs - and not where the file was
+  found on this machine, which is clojure.cljs.driver/source-label's rule and the
+  same one Clojure follows: (:file (meta #'clojure.string/join)) is
+  \"clojure/string.clj\", because *file* is bound to the resource a load went
+  through rather than to a path somebody's checkout happens to have. An editor
+  resolves it against the classpath, which is the one thing that can, and an
+  absolute path here would be the one thing that cannot be resolved by anyone
+  else.
+
+  DYNAMIC, because there is no other way for it to arrive. The var is interned
+  during analysis and the file is the driver's to know: the reader does not read
+  it out of the text, no enclosing form carries it - the (ns ...) form is one form
+  among the rest and a def is not inside it - and threading it through analyze
+  would put a parameter on every pass for the two that use it. Clojure answers the
+  same question the same way, with Compiler/SOURCE_PATH bound by load.
+
+  NIL AT A REPL, deliberately. A form typed at a prompt was not read from a file,
+  and Clojure's answer there - \"NO_SOURCE_PATH\", a string that names no file
+  and that every tool then has to know is a lie - is worse than an absent key. A
+  client asking where such a var was written is told nothing, which is the truth,
+  and clojure.cljs.repl binds nothing."
+  nil)
+
 (def ^:dynamic *cljs-ns*
   "The namespace being compiled, as a symbol.
 
@@ -537,8 +564,15 @@
           _         (when (and (not= 'cljs.core env/*current-ns*)
                                (env/core-name? cenv sym))
                       (env/add-excludes! cenv env/*current-ns* #{sym}))]
+      ;; WHERE IT WAS WRITTEN, which is a position and the file the position is in.
+      ;; The position comes off the form, because the reader read it; the file
+      ;; comes from *source-file*, because nothing in the form says it. Both are
+      ;; merged rather than assoc'd over a redefinition, and a def in a file
+      ;; therefore MOVES a var that a REPL had defined before it, which is what
+      ;; somebody jumping to the definition wants: the last place it was written.
       (alter-meta! v merge
                    (cond-> (select-keys m [:line :column :end-line :end-column])
+                     *source-file* (assoc :file *source-file*)
                      doc (assoc :doc doc)
                      (meta sym) (merge (meta sym))))
       (let [init (when init?
@@ -950,8 +984,20 @@
                          (update :locals into
                                  (map (fn [b] [(:name b) (assoc b :self self)]))
                                  bs))]
+          ;; :file beside the position, for the same reason parse-def records it: a
+          ;; type is a definition somebody asks to be taken to.
+          ;;
+          ;; THE POSITION IS THE NAME'S, and the form's only if the name has none.
+          ;; deftype* is written by a macro and carries no metadata of its own -
+          ;; cljs.core's deftype builds the form out of `do` and syntax-quote,
+          ;; neither of which copies &form's - while the type symbol inside it is
+          ;; the one the reader read, vary-meta'd rather than rebuilt. Taking the
+          ;; form's first would have given every type a file and line 1, which
+          ;; reads like a position and is not one.
           (alter-meta! v merge
-                       (select-keys (meta form) [:line :column :end-line :end-column])
+                       (select-keys (if (seq (meta tsym)) (meta tsym) (meta form))
+                                    [:line :column :end-line :end-column])
+                       (when *source-file* {:file *source-file*})
                        {:type true :record record?
                         :fields (mapv :name bs)})
           (cond-> {:op :deftype :form form :env env

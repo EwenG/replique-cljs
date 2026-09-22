@@ -243,6 +243,60 @@
                                             {:out-dir out :source-paths [src]}))))
       (finally (delete-tree! src) (delete-tree! out)))))
 
+(deftest test-a-var-records-the-file-it-was-written-in
+  ;; WHERE A DEFINITION WAS WRITTEN, which is what an editor opens when somebody
+  ;; asks to be taken to it. The position was always here - the reader read it -
+  ;; and the file was not, because nothing in a form says which file it came out
+  ;; of; clojure.cljs.analyzer/*source-file* is how it arrives.
+  ;;
+  ;; THE PATH IS THE ONE UNDER A SOURCE DIRECTORY, not the one this machine
+  ;; happens to hold, which is the same rule Clojure follows for a var of its own
+  ;; and the only spelling another process's classpath can resolve. It is also
+  ;; source-label, so a file has ONE name here and in its source map rather than
+  ;; two spellings of itself.
+  ;; written with its own newlines rather than as an indented literal, because
+  ;; the columns asserted below are columns of THIS text
+  (let [src  (write-sources! (temp-dir)
+                             {'app.core (str "(ns app.core)\n"
+                                             "(def greet (fn* ([x] x)))\n"
+                                             "(deftype Box [v])\n")})
+        out  (temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})]
+    (try
+      (driver/compile-namespace! cenv 'app.core {:out-dir out :source-paths [src]})
+      (let [written (ns-interns (env/find-cljs-ns cenv 'app.core))
+            at      #(select-keys (meta (get written %)) [:file :line :column])]
+        (is (= {:file "app/core.cljs" :line 2 :column 6}  (at 'greet)))
+        ;; A TYPE IS PLACED BY ITS NAME and not by the form it is defined in.
+        ;; deftype* is built by a macro out of syntax-quote, which copies no
+        ;; metadata, while the symbol inside it is the one the reader read - so
+        ;; taking the form's position would have given every type line 1, which
+        ;; reads like a position and is not one. The form begins at column 1 and
+        ;; the name at column 10, so the column is what says which one answered.
+        (is (= {:file "app/core.cljs" :line 3 :column 10} (at 'Box))))
+      ;; AND EACH FILE ANSWERS FOR ITSELF. cljs.core is compiled by this same call,
+      ;; underneath it, and what its vars record is cljs.core's file rather than
+      ;; the one whose compilation went and fetched it.
+      (is (= "cljs/core.cljs"
+             (:file (meta (.findInternedVar ^clojure.lang.Namespace
+                                            (env/find-cljs-ns cenv 'cljs.core)
+                                            'map)))))
+      (finally (delete-tree! src) (delete-tree! out)))))
+
+(deftest test-a-var-defined-at-a-repl-records-no-file
+  ;; NIL RATHER THAN A NAME THAT NAMES NOTHING. A form typed at a prompt was not
+  ;; read from a file, and Clojure's answer there - "NO_SOURCE_PATH" - is a string
+  ;; every tool downstream then has to know is a lie. An absent key says the same
+  ;; thing and says it once.
+  (let [cenv (h/fresh-env 'app.core)]
+    (h/analyze cenv '(def typed 1))
+    (let [v (get (ns-interns (env/find-cljs-ns cenv 'app.core)) 'typed)]
+      (is (some? v))
+      (is (nil? (:file (meta v))))
+      ;; the position is still there: it is the reader's and it was never the
+      ;; driver's to supply
+      (is (contains? (meta v) :line)))))
+
 (deftest test-the-same-source-compiles-to-the-same-text
   ;; what write-if-changed! rests on. The name counter restarts per compilation
   ;; unit, every set that reaches the output - the requires, in the imports and in
