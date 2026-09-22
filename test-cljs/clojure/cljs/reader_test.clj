@@ -365,6 +365,37 @@
                       (catch Exception e (.getMessage e))))
           content))))
 
+(deftest test-a-host-tag-is-read-only-where-the-host-added-it
+  ;; The tags of the thing DRIVING the reader, which is neither the language's nor
+  ;; the program's: a REPL host whose client says things in band - Replique's
+  ;; #replique/ns - has to be able to read its own directives, and *data-readers*
+  ;; here is bound rather than added to, so there is nowhere else for them to come
+  ;; from.
+  (let [cenv (env/compile-env {:ns 'cljs.user})
+        read #(read-one cenv (reader/push-back-reader %))]
+    ;; nil by default, which is what a compilation reads with
+    (is (thrown-with-msg? Exception #"No reader function for tag host/ns" (read "#host/ns foo.bar")))
+    (binding [reader/*host-data-readers* {'host/ns (fn [sym] [::moved sym])}]
+      (is (= [::moved 'foo.bar] (read "#host/ns foo.bar")))
+      ;; and the language keeps its own - these are added to what was there, not
+      ;; put in its place
+      (is (= '(cljs.core/into cljs.core.PersistentQueue.EMPTY [1 2])
+             (read "#queue [1 2]"))))
+    ;; and they are gone again outside the binding, so a file the same process
+    ;; compiles next is read in the language and nothing else
+    (is (thrown-with-msg? Exception #"No reader function for tag host/ns" (read "#host/ns foo.bar")))))
+
+(deftest test-a-host-tag-wins-a-collision
+  ;; Which is the reverse of what a program would want for its own tags and is
+  ;; right for these: a host that cannot read the directives it documents cannot
+  ;; be driven at all, while whoever collided with the host's name has shadowed
+  ;; something they do not own. Asserted against the LANGUAGE's table, which is
+  ;; the one this file can put a known tag in without a classpath.
+  (let [cenv (env/compile-env {:ns 'cljs.user})
+        read #(read-one cenv (reader/push-back-reader %))]
+    (binding [reader/*host-data-readers* {'queue (fn [_] ::the-hosts)}]
+      (is (= ::the-hosts (read "#queue [1 2]"))))))
+
 (deftest test-a-registered-tag-is-read-while-compiling
   ;; the compile-time half, end to end: the tag is read by the compiler's reader,
   ;; and what it hands back is analysed and emitted like any other form. Nothing in

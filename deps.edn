@@ -9,4 +9,10 @@
 ;; CONSUMER that must name it, because it stands in for org.clojure/clojure - which
 ;; the Clojure CLI's root deps.edn always puts on the classpath, and which only the
 ;; consuming project can override.
-{:paths ["src/clj"]}
+{;; src/clj FIRST, and target/classes only for what is not in it: the websocket
+ ;; framing under clojure.cljs.ws is Java (src/java), so the only build of it is
+ ;; Maven's and a consumer reading this source tree has nowhere else to find it -
+ ;; without it clojure.cljs.browser will not load and a browser REPL is missing.
+ ;; Maven also copies the .clj sources in there, which is why the order matters:
+ ;; the live ones shadow the copies rather than the other way round.
+ :paths ["src/clj" "target/classes"]}

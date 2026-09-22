@@ -635,10 +635,12 @@
 (defn- pump!
   "Copy `in` to `out` on a thread of its own, for as long as it lasts.
 
-  This is where a runtime's own output goes - console.log from evaluated code, and
-  anything node says about itself. Before M5 there is no *print-fn* and so no
-  :print channel (§8); the process's stdout is that channel, which means program
-  output and values interleave by arrival rather than by turn."
+  WHAT IS LEFT ON THIS CHANNEL, which used to be everything: what node says about
+  itself, and anything printed before the socket was up or after it broke. A
+  console.log from evaluated code travels on the socket now, in order with the
+  value of the form that printed it - see the :print channel in runtime_node.js -
+  because two channels meant the JVM saw them in whichever order the scheduler
+  happened to produce."
   [in ^Writer out]
   (doto (Thread. #(with-open [^BufferedReader r (io/reader in)]
                     (loop []
@@ -718,17 +720,39 @@
                            {:got hello :dir (str dir)}))))
        (reify
          IJsRuntime
+         ;; One script out, and then every message back until the one that is the
+         ;; answer. A print is not an answer - it is something the script did on
+         ;; its way to having one - so it is written where the runtime's output
+         ;; goes and the read goes round again.
          (-evaluate [_ js]
            (doto w (.write ^String (json-string js)) (.write "\n") (.flush))
-           (if-let [line (.readLine in)]
-             (try
-               (edn/read-string line)
-               (catch Exception e
-                 {:status :error :phase :transport
-                  :value  (str "Unreadable result: " (ex-message e))
-                  :got    line}))
-             {:status :error :phase :transport
-              :value  "The runtime disconnected."}))
+           (loop []
+             (if-let [line (.readLine in)]
+               (let [msg (try (edn/read-string line)
+                              (catch Exception e
+                                {:type :result
+                                 :content (pr-str {:status :error :phase :transport
+                                                   :value (str "Unreadable message: "
+                                                               (ex-message e))
+                                                   :got line})}))]
+                 (case (:type msg)
+                   :print  (do (locking out
+                                 (.write ^Writer out ^String (str (:content msg)))
+                                 (.flush ^Writer out))
+                               (recur))
+                   :result (try
+                             (edn/read-string (:content msg))
+                             (catch Exception e
+                               {:status :error :phase :transport
+                                :value  (str "Unreadable result: " (ex-message e))
+                                :got    line}))
+                   ;; something this version does not know about. Skipped rather
+                   ;; than taken for an answer: a newer runtime saying more than
+                   ;; this asked for must not end the turn with a message that is
+                   ;; not the result.
+                   (recur)))
+               {:status :error :phase :transport
+                :value  "The runtime disconnected."})))
          java.io.Closeable
          (close [_] (bye)))))))
 

@@ -251,12 +251,37 @@
   the reader's dominant cost."
   (memoize user-data-readers*))
 
+(def ^:dynamic *host-data-readers*
+  "Tags the thing DRIVING this reader adds, on top of the language's and the
+  program's. Nil, which is what a compilation uses.
+
+  It exists because `with-cljs-reader*' below binds *data-readers* rather than
+  adding to it - it has to, since the JVM's own tags are read with the JVM's
+  reader conditional and so cannot simply be inherited (see load-data-reader-file)
+  - and a REPL host that speaks to its client in tagged literals is then unable to
+  read its own directives. Replique's #replique/ns is the case: a client says
+  which namespace to read the next form in, in band, and the reader that must
+  understand it is this one.
+
+  THE HOST'S TAGS WIN, which is the reverse of what a program would want for its
+  own and is right for these: a host that cannot read the directives it documents
+  cannot be driven at all, while a program that defined a tag under the host's
+  name has shadowed something it does not own.
+
+  DYNAMIC, because it is a property of the caller rather than of the environment:
+  one REPL reading on one thread adds them, and another thread compiling in the
+  same environment does not. A host binds it around the READ and not around what
+  follows - a form that sends the driver into a file must not put the host's tags
+  into that file's language."
+  nil)
+
 (defn with-cljs-reader*
   "Invoke `thunk` with the vendored reader configured to read ClojureScript in
   `cenv`, resolving against whichever namespace `cenv` names.
 
   Five bindings, three of them the switches the fork added:
-    *data-readers*      the language's tags plus the program's (user-data-readers)
+    *data-readers*      the language's tags, the program's (user-data-readers),
+                        and the host's (*host-data-readers*)
     *reader-resolver*   resolution goes to the ClojureScript world, not the JVM's
     PLATFORM_FEATURE    :cljs, replacing :clj, so #?(:clj a :cljs b) yields b
     RECORD_POSITIONS    spans on symbols/keywords/collections, with no sink
@@ -267,7 +292,8 @@
                    Compiler/RECORD_POSITIONS   true
                    #'*read-eval*          false
                    #'*data-readers*       (merge cljs-data-readers
-                                                 (user-data-readers))}
+                                                 (user-data-readers)
+                                                 *host-data-readers*)}
     thunk))
 
 (defn push-back-reader
