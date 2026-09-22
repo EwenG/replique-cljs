@@ -23,6 +23,7 @@
             [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env]
             [clojure.cljs.names :as names]
+            [clojure.cljs.npm :as npm]
             [clojure.cljs.output :as output]
             [clojure.cljs.reader :as reader]
             [clojure.cljs.repl :as repl]
@@ -56,6 +57,17 @@
        true
        (catch Throwable _ false)))
 
+(def esbuild?
+  "Is there an esbuild clojure.cljs.npm can find without installing one?
+
+  MACHINE STATE, exactly as `node?` is, and it skips rather than fails for the
+  same reason. It is true on any machine where a compile has ever built an npm/
+  tree, because that is what puts one in the cache under the user's home
+  (clojure.cljs.npm/acquire-esbuild!); `(clojure.cljs.npm/acquire-esbuild!)` at a
+  REPL is how to make it true on purpose. Nothing here ever installs one - a test
+  suite that talks to a network is a test suite that fails on an aeroplane."
+  (boolean (npm/locate-esbuild {})))
+
 (defmacro deftest-when
   "clojure.test/deftest, but the test is defined only when `pred` holds at load
   time. A missing prerequisite skips these tests; it never fails them."
@@ -84,6 +96,27 @@
        (.mkdirs (.getParentFile f))
        (spit f src)))
    dir))
+
+(defn fake-project!
+  "A directory that is a JavaScript project as far as node's resolver is
+  concerned: `packages` is {name [file-name source]}, each written as its own
+  package under <dir>/node_modules.
+
+  BY HAND AND NOT BY npm install, which is the whole point of it - the packages
+  a build test bundles have to be ones this repository controls, so that what is
+  being tested is the build rather than the internet. node resolves one of these
+  exactly as it resolves a real one: a directory under node_modules with a
+  package.json naming its entry point."
+  ^File [packages]
+  (let [dir (temp-dir)]
+    (doseq [[pkg [entry src]] packages]
+      (let [pd (io/file dir "node_modules" pkg)]
+        (.mkdirs pd)
+        (spit (File. pd "package.json")
+              (str "{\"name\": \"" pkg "\", \"version\": \"1.0.0\", \"main\": \""
+                   entry "\"" (when (str/ends-with? entry ".mjs") ", \"type\": \"module\"") "}\n"))
+        (spit (File. pd ^String entry) src)))
+    dir))
 
 ;; --- compiling --------------------------------------------------------------
 

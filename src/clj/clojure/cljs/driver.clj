@@ -67,6 +67,7 @@
             [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
             [clojure.cljs.names :as names]
+            [clojure.cljs.npm :as npm]
             [clojure.cljs.output :as output]
             [clojure.cljs.reader :as reader]
             [clojure.cljs.source-info :as si]
@@ -426,11 +427,12 @@
           (update state :done conj ns-sym)
 
           ;; A JAVASCRIPT MODULE REQUIRED BY ITS BARE NAME - shadow-cljs's
-          ;; spelling, (:require [react :as React]). Nothing to compile and
-          ;; nothing to write: npm/ is built by a bundler out of node_modules,
-          ;; and all this run owes it is the specifier, which the ns form's
-          ;; analysis records a moment later (analyzer/js-module-ns?, which asks
-          ;; the same question and can only answer because this got here).
+          ;; spelling, (:require [react :as React]). Nothing to COMPILE: npm/ is
+          ;; bundled out of node_modules rather than emitted, and all this run
+          ;; owes it is the specifier, which the ns form's analysis records a
+          ;; moment later (analyzer/js-module-ns?, which asks the same question
+          ;; and can only answer because this got here). What happens to that
+          ;; specifier is run!*'s business, at the end - see clojure.cljs.npm.
           ;;
           ;; AFTER the source path and after the classpath, which is what makes
           ;; a name with a file behind it mean the file. It can never be confused
@@ -526,14 +528,19 @@
       (binding [emitter/*static-dispatch* (boolean (:static-dispatch opts))
                 cgoog/*closure-library* (cgoog/library-option opts)]
         (let [result (select-keys (f opts) [:compiled :written :scripts])
-              ;; THE BUNDLER'S INPUT, and the reason this is reported rather than
-              ;; acted on. Everything else under the output root is written here;
-              ;; npm/ is built by a bundler from node_modules, and
-              ;; doc/cljs-advanced.md §3 says not to vendor one or make one
-              ;; mandatory. So what crosses the line is this list and the mapping
-              ;; beside it (clojure.cljs.output/js->path) - which is a better input
-              ;; than scanning sources for string requires, because it is what the
-              ;; compiler actually resolved rather than what a regex found.
+              ;; THE BUNDLER'S INPUT. npm/ is built by esbuild from node_modules,
+              ;; and this list plus the mapping beside it
+              ;; (clojure.cljs.output/js->path) is the whole of what the bundler
+              ;; is told - which is a better input than scanning sources for
+              ;; string requires, because it is what the compiler actually
+              ;; resolved rather than what a regex found.
+              ;;
+              ;; The list has not changed; what happens to it has.
+              ;; clojure.cljs.npm now SCHEDULES that bundler rather than leaving
+              ;; the scheduling to a person, which serves doc/cljs-advanced.md §3
+              ;; better than reporting did: nothing is vendored, nothing is
+              ;; mandatory, and the build step nobody has to run is more absent
+              ;; than the build step everybody has to run by hand.
               ;;
               ;; EVERY NAMESPACE IN THE ENVIRONMENT, for ensure-goog!'s reason
               ;; below: a compile env outlives an output directory, and a run that
@@ -556,13 +563,17 @@
           (output/ensure-goog! cenv (:out-dir opts)
                                (mapcat #(env/requires cenv (.getName ^clojure.lang.Namespace %))
                                        (env/all-cljs-ns cenv)))
-          ;; and the one thing that can be said about npm/ from here: which of
-          ;; those the bundler has not built yet. A warning rather than a failure,
-          ;; because on a first build into a fresh directory every one of them is
-          ;; missing - this run is what produced the list.
-          (assoc result
-                 :js-requires (vec js-req)
-                 :js-missing  (output/report-missing-js! (:out-dir opts) js-req)))))))
+          ;; and the other tree, which used to be a sentence and is now a build.
+          ;; clojure.cljs.npm schedules a bundler over exactly this list: it finds
+          ;; one, or installs one once, or says what doc/cljs-npm.md 6 always said
+          ;; - and a project with no string require never reaches any of it,
+          ;; because js-req is then empty. The report still runs afterwards, and
+          ;; on a build that worked it has nothing left to report.
+          (let [{:keys [missing build]} (npm/ensure-js! (:out-dir opts) js-req opts)]
+            (assoc result
+                   :js-requires (vec js-req)
+                   :js-build    build
+                   :js-missing  missing)))))))
 
 (defn compile-namespace!
   "Compile `ns-sym` and everything it requires into an output directory.
@@ -585,7 +596,10 @@
     :js-requires  every specifier a string require named, sorted - what a bundler
                   has to build npm/ out of. See run!*.
     :js-missing   those of them that are not under npm/ yet, which is a 404 waiting
-                  to happen and is warned about besides"
+                  to happen and is warned about besides
+    :js-build     what the bundler did, or why it did not run - see
+                  clojure.cljs.npm/ensure-js!, and nil when there was nothing to
+                  do. Options for it live under :npm in `opts`"
   [cenv ns-sym opts]
   (run!* cenv opts #(ensure! cenv % (seed-state cenv %) ns-sym)))
 

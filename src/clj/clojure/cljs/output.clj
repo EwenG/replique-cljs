@@ -47,10 +47,12 @@
   runtime.js states the same rule in JavaScript. output-test runs the two against
   each other rather than trusting them to stay in step.
 
-  ONE OF THOSE TREES IS NOT OURS TO WRITE. npm/ is built by a bundler out of
-  node_modules, one file per specifier; what this namespace owns is the NAME each
-  specifier is filed under (js->path), which the compiler emits imports against
-  and reports as a list for the bundler to build. See doc/cljs-npm.md.
+  ONE OF THOSE TREES IS NOT WRITTEN HERE. npm/ is built by esbuild out of
+  node_modules, one file per specifier, and clojure.cljs.npm is what schedules it.
+  What THIS namespace owns is the NAME each specifier is filed under (js->path),
+  which the compiler emits imports against and which the bundler is told rather
+  than asked - so the mapping has exactly one statement on the JVM side however
+  the tree gets built. See doc/cljs-npm.md.
 
   Nothing durable records a path - no deps file, no manifest, no load-time ordering
   on the JVM (7.3) - so changing the layout makes an output directory stale rather
@@ -95,12 +97,13 @@
   "The directory a JavaScript module a string require names is fetched from, beside
   ns-dir and the goog tree.
 
-  ITS CONTENTS ARE NOT OURS TO WRITE. Everything else under an output root is
-  emitted by this compiler; this one is built by a bundler from node_modules, one
-  file per specifier, and all the compiler owns is the NAME each specifier is
-  filed under - which is js->path below, and which the bundler is told rather than
-  asked. doc/cljs-advanced.md 3 is why: a bundler is not vendored and not made
-  mandatory, so what crosses the line is a mapping and a list."
+  ITS CONTENTS ARE NOT EMITTED. Everything else under an output root is emitted
+  by this compiler; this one is BUNDLED - esbuild reads node_modules and writes one
+  file per specifier, scheduled by clojure.cljs.npm - and all that is owned here is
+  the NAME each specifier is filed under, which is js->path below and which the
+  bundler is told rather than asked. doc/cljs-advanced.md 3 is why it is that way
+  round: no bundler is vendored and none is mandatory, so what crosses the line is
+  a mapping and a list, whoever ends up running the tool over them."
   "npm")
 
 (defn js->path
@@ -356,7 +359,15 @@
   first build into a fresh output directory every specifier is missing, because
   the list is what the bundler has not been given yet. So this is a build-time
   answer to `what do I have to bundle`, and the compile it interrupts is the one
-  that produced the answer."
+  that produced the answer.
+
+  NOBODY CALLS THIS DIRECTLY ANY MORE. clojure.cljs.npm/ensure-js! tries to BUILD
+  the missing modules first and then asks this what is left, so on a machine with
+  a bundler there is usually nothing here to say. It is still the whole answer
+  when there is no bundler, no node_modules or no node - which is the mode this
+  compiler shipped in until the build was wired in, and is why this did not move
+  into that namespace: what a path says about a file is this namespace's question
+  (doc/cljs-npm.md 6)."
   [dir specifiers]
   (let [missing (missing-js dir specifiers)
         seen    (get @reported (str dir) #{})
@@ -369,8 +380,9 @@
                       " required and not under " (File. (io/file dir) js-dir) ":"))
         (doseq [s fresh]
           (println (str "  " s "  ->  " (js->path s))))
-        (println (str "  " js-dir "/ is built by a bundler rather than by this"
-                      " compiler, so each of those has to end up at the path beside"
-                      " it, as an ES module, or it is a 404 when the program"
-                      " loads."))))
+        (println (str "  " js-dir "/ is built by esbuild out of node_modules, and"
+                      " clojure.cljs.npm runs it when it can find one. Reaching"
+                      " this line means it could not, so each of those has to end"
+                      " up at the path beside it, as an ES module, or it is a 404"
+                      " when the program loads."))))
     missing))

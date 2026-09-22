@@ -54,6 +54,7 @@
             [clojure.cljs.env :as env]
             [clojure.cljs.goog :as cgoog]
             [clojure.cljs.names :as names]
+            [clojure.cljs.npm :as npm]
             [clojure.cljs.source-info :as si]
             [clojure.cljs.source-map :as sm]
             [clojure.cljs.stacktrace :as stacktrace]
@@ -297,14 +298,15 @@
            ;; all when what it names is a goog namespace, so the driver's own call
            ;; never happens and this is the only one that can.
            _     (when (:out-dir opts) (output/ensure-goog! cenv (:out-dir opts) reqs))
-           ;; and the same courtesy for the other tree, which we do NOT write: a
-           ;; string require this namespace made spells an await $CLJS.requireJs,
-           ;; and a module the bundler has not built is a 404 one line later.
-           ;; Said once per directory and specifier, so a session in a namespace
-           ;; whose package is missing is told once rather than once a form.
+           ;; and the same courtesy for the other tree, which used to be a
+           ;; sentence and is now a build: a string require this namespace made
+           ;; spells an await $CLJS.requireJs, and a module nothing has built is a
+           ;; 404 one line later. clojure.cljs.npm builds it if it can and says so
+           ;; if it cannot, once per directory and specifier - so a session in a
+           ;; namespace whose package is missing is told once rather than once a
+           ;; form, and a session whose package CAN be built is not told at all.
            _     (when (:out-dir opts)
-                   (output/report-missing-js! (:out-dir opts)
-                                              (env/js-requires cenv nsym)))
+                   (npm/ensure-js! (:out-dir opts) (env/js-requires cenv nsym) opts))
            chunk (emitter/script
                   (into (emitter/script-prologue nsym reqs
                                                  (env/js-requires cenv nsym))
@@ -431,13 +433,13 @@
         ;; nothing there to take
         bodies  (filterv #(env/declared? cenv %) targets)]
     (ana/require-libs! cenv specs)
-    ;; A STRING REQUIRE COMPILES NOTHING, so the driver's own report never fires
-    ;; for one and this is the only place that can say it while the user is still
-    ;; looking at what they typed. Asked of the whole namespace rather than of
-    ;; these specs alone, because report-missing-js! is told once per specifier
-    ;; anyway and the question is the same one.
-    (output/report-missing-js! (:out-dir opts)
-                               (env/js-requires cenv env/*current-ns*))
+    ;; A STRING REQUIRE COMPILES NOTHING, so the driver never runs for one and
+    ;; this is the only place that can build it - or say why not - while the user
+    ;; is still looking at what they typed. That is the whole of how
+    ;; (require '["react" :as R]) at a REPL fetches react. Asked of the whole
+    ;; namespace rather than of these specs alone, because the build is keyed on
+    ;; the list anyway and the question is the same one.
+    (npm/ensure-js! (:out-dir opts) (env/js-requires cenv env/*current-ns*) opts)
     (ship! runtime
            (cond
              (:reload-all flags) scripts

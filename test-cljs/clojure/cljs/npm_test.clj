@@ -23,6 +23,7 @@
             [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
             [clojure.cljs.names :as names]
+            [clojure.cljs.npm :as npm]
             [clojure.cljs.output :as output]
             [clojure.cljs.repl :as repl]
             [clojure.cljs.test-harness :as h]
@@ -694,3 +695,266 @@
                 #(repl/eval-src cenv rt "(require '[nope3 :as n])" opts))
                "npm/nope3.js"))))
       (finally (h/delete-tree! src) (h/delete-tree! out)))))
+
+;; --- scheduling the bundler ---------------------------------------------------
+;;
+;; doc/cljs-npm.md §6. The mapping and the list did not change; who runs the
+;; bundler over them did. clojure.cljs.npm locates an esbuild, else installs one
+;; once, else says what §6 always said - so the tests below come in two kinds, and
+;; only the second kind needs a bundler on the machine running them.
+
+(defn- built
+  "Compile `sources`' first namespace into a fresh directory with `npm` options,
+  and hand back [result warnings out]. The out directory is the caller's to
+  delete, because most of these look at what is in it."
+  ([sources ns-sym npm] (built sources ns-sym npm (h/temp-dir)))
+  ([sources ns-sym npm out]
+   (let [src (h/write-sources! (h/temp-dir) sources)
+         box (atom nil)]
+     (try
+       (let [said (h/warnings
+                   #(reset! box (driver/compile-namespace!
+                                 (env/compile-env {:ns 'cljs.user}) ns-sym
+                                 {:out-dir out :source-paths [src] :npm npm})))]
+         [@box said out])
+       (finally (h/delete-tree! src))))))
+
+(deftest test-a-project-with-no-package-never-notices
+  ;; The rule doc/cljs-advanced.md §3 is really protecting, and the one the build
+  ;; had to keep: a project that makes no string require must not acquire
+  ;; anything, look for anything or say anything. Nothing here could work - the
+  ;; root and the bundler both name a path that does not exist - and the compile
+  ;; is silent anyway, because the list is empty and nothing is reached.
+  (let [[result said out] (built '{probe.core "(ns probe.core) (defn run [] 1)"}
+                                 'probe.core
+                                 {:root "/no/such/project" :esbuild "/no/such/esbuild"})]
+    (try
+      (is (= [] (:js-requires result)))
+      (is (nil? (:js-build result)))
+      (is (= "" said))
+      (finally (h/delete-tree! out)))))
+
+(deftest test-a-tree-somebody-else-wrote-is-left-alone
+  ;; npm/ full and no manifest of ours beside it: another bundler's output, a
+  ;; hand-written stand-in, doc/cljs-npm.md §8's own fixtures. Building over it
+  ;; would be this compiler taking ownership of a directory it was told it does
+  ;; not own, so the file is still there, byte for byte, and no build ran.
+  (let [out  (h/temp-dir)
+        mine "export const hello = 1;\n"]
+    (.mkdirs (.getParentFile (io/file out (output/js->path "greeter"))))
+    (spit (io/file out (output/js->path "greeter")) mine)
+    (try
+      (let [[result said] (built '{probe.core "(ns probe.core (:require [\"greeter\" :as g]))
+                                               (defn run [] g/hello)"}
+                                 'probe.core {} out)]
+        (is (= [] (:js-missing result)))
+        (is (nil? (:js-build result)))
+        (is (= "" said))
+        (is (= mine (slurp (io/file out (output/js->path "greeter")))))
+        ;; and nothing of ours was filed beside it either
+        (is (not (.isFile (io/file out (str output/js-dir "/.build.edn"))))))
+      (finally (h/delete-tree! out)))))
+
+(deftest test-what-it-says-when-it-cannot-build
+  ;; The three ways not to build, each of which leaves §6's report exactly as it
+  ;; was - which is the mode this compiler shipped in until the build was wired
+  ;; in, and is what a machine with no node_modules still gets.
+  ;;
+  ;; The :no-bundler case needs a REAL project to be about anything: with no
+  ;; node_modules the answer is :no-root and the bundler is never asked for, which
+  ;; is the line between the second and third rows below.
+  (let [proj (h/fake-project! {"greeter" ["index.js" "module.exports = {};\n"]})]
+    (try
+      (are [npm why]
+          (let [[result said out]
+                (built '{probe.core "(ns probe.core (:require [\"greeter\" :as g]))
+                                     (defn run [] g/hello)"}
+                       'probe.core npm)]
+            (try
+              (and (= why (:why (:js-build result)))
+                   (= ["greeter"] (:js-missing result))
+                   ;; the specifier AND the path, still: that is what the report is for
+                   (str/includes? said "npm/greeter.js"))
+              (finally (h/delete-tree! out))))
+
+        {:build false}                                        :disabled
+        {:root "/no/such/project"}                            :no-root
+        {:root (str proj) :esbuild "/no/such/esbuild"
+         :acquire false}                                      :no-bundler)
+      (finally (h/delete-tree! proj)))))
+
+(deftest test-the-project-root-is-the-nearest-node-modules
+  ;; node's own rule and not one invented here, because esbuild resolves a bare
+  ;; specifier by walking up exactly this way - a root found any other way is a
+  ;; root esbuild disagrees with.
+  (let [proj (h/fake-project! {"greeter" ["index.js" "module.exports = {};\n"]})
+        deep (io/file proj "a" "b" "c")]
+    (try
+      (.mkdirs deep)
+      (is (= (.getCanonicalFile proj) (.getCanonicalFile (npm/project-root deep))))
+      (is (= (.getCanonicalFile proj) (.getCanonicalFile (npm/project-root proj))))
+      ;; and nil is an answer: no node_modules means no package to resolve, so
+      ;; there was never anything a bundler could have built
+      (is (nil? (npm/project-root (io/file (h/temp-dir) "nothing" "here"))))
+      (finally (h/delete-tree! proj)))))
+
+;; The rest of this section needs an esbuild on the machine, which is machine
+;; state exactly as node is - h/esbuild? skips rather than fails, and
+;; (clojure.cljs.npm/acquire-esbuild!) at a REPL is how to make it true. The
+;; packages they bundle are written by hand into a node_modules of their own, so
+;; what is under test is the build and not the internet.
+
+(def ^:private two-packages
+  {"greeter" ["index.js"  "module.exports = { hello: function (n) { return \"hello \" + n; } };\n"]
+   "shouty"  ["index.mjs" (str "export function shout(s) { return s.toUpperCase() + \"!\"; }\n"
+                              "export default function (s) { return \"<\" + s + \">\"; }\n")]})
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-package-is-built-rather-than-owed
+  ;; End to end, and the whole point of the exercise: a CommonJS package and an ES
+  ;; one, required by a namespace, bundled by a compile that was told nothing but
+  ;; where the project is - and then RUN. Nobody typed a build command.
+  (let [proj (h/fake-project! two-packages)
+        [result said out]
+        (built '{probe.core "(ns probe.core (:require [\"greeter\" :as g]
+                                                      [\"shouty\" :refer [shout] :default wrap]))
+                             (defn run [] (str (g/hello \"world\") \"|\" (shout \"ok\") \"|\" (wrap \"x\")))"}
+               'probe.core {:root (str proj) :acquire false})]
+    (try
+      (is (= ["greeter" "shouty"] (:js-requires result)))
+      ;; nothing is owed, so §6's report has nothing to say
+      (is (= [] (:js-missing result)))
+      (is (= "" said))
+      ;; and it landed where js->path says it did, which is the mapping the
+      ;; compiler emitted its imports against
+      (is (.isFile (io/file out (output/js->path "greeter"))))
+      (is (.isFile (io/file out (output/js->path "shouty"))))
+      (is (true? (:ok (:js-build result))))
+      (is (= 2 (:modules (:js-build result))))
+      ;; THE CommonJS HALF IS THE INTERESTING ONE: esbuild cannot see a CommonJS
+      ;; package's names statically - `export * from "greeter"` yields no exports
+      ;; at all and says nothing - so node enumerates those, and the build records
+      ;; which kind each specifier turned out to be
+      (is (= :esbuild (get (:kinds (:js-build result)) "shouty")))
+      (is (not= :esbuild (get (:kinds (:js-build result)) "greeter")))
+      (let [entry (io/file out "check.mjs")]
+        (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
+                         "import \"./ns/probe/core.js\";\n"
+                         "console.log($ns(\"probe.core\").run());\n"))
+        (is (= "hello world|OK!|<x>" (node entry))))
+      (finally (h/delete-tree! proj) (h/delete-tree! out)))))
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-second-compile-builds-nothing
+  ;; A compile that changed nothing must not run esbuild again - the manifest
+  ;; beside the tree holds the specifier list, the esbuild and what the project
+  ;; has installed, and an unchanged key is the whole of the answer.
+  (let [proj (h/fake-project! two-packages)
+        srcs '{probe.core "(ns probe.core (:require [\"greeter\" :as g] [\"shouty\" :as s]))
+                           (defn run [] g/hello)"}
+        npm  {:root (str proj) :acquire false}
+        [first-result _ out] (built srcs 'probe.core npm)]
+    (try
+      (is (true? (:ok (:js-build first-result))))
+      (let [[again said _] (built srcs 'probe.core npm out)]
+        (is (nil? (:js-build again)))
+        (is (= [] (:js-missing again)))
+        (is (= "" said)))
+      (finally (h/delete-tree! proj) (h/delete-tree! out)))))
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-dropped-specifier-is-taken-away-again
+  ;; A chunk's name holds a hash of its contents and a specifier can leave an ns
+  ;; form, so a tree nothing prunes only ever grows. Only what the LAST build
+  ;; recorded writing is deleted, which is why the file written here by hand
+  ;; survives: nothing claims it.
+  (let [proj (h/fake-project! two-packages)
+        npm  {:root (str proj) :acquire false}
+        [result _ out]
+        (built '{probe.core "(ns probe.core (:require [\"greeter\" :as g] [\"shouty\" :as s]))
+                             (defn run [] g/hello)"}
+               'probe.core npm)]
+    (try
+      (is (= 2 (:modules (:js-build result))))
+      (is (.isFile (io/file out (output/js->path "shouty"))))
+      (spit (io/file out (str output/js-dir "/not-ours.js")) "export const x = 1;\n")
+      (let [[again _ _] (built '{probe.core "(ns probe.core (:require [\"greeter\" :as g]))
+                                             (defn run [] g/hello)"}
+                               'probe.core npm out)]
+        (is (= ["greeter"] (:js-requires again)))
+        (is (= 1 (:modules (:js-build again))))
+        (is (.isFile (io/file out (output/js->path "greeter"))))
+        (is (not (.isFile (io/file out (output/js->path "shouty")))))
+        (is (.isFile (io/file out (str output/js-dir "/not-ours.js")))))
+      (finally (h/delete-tree! proj) (h/delete-tree! out)))))
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-specifier-nothing-can-resolve-is-tried-once
+  ;; A typo, or a package nobody installed. The build runs, esbuild says it cannot
+  ;; resolve it, and the module is missing afterwards exactly as it was before -
+  ;; so a second compile must NOT take `still missing` as a reason to run node
+  ;; again. Same inputs, same answer, however unsatisfying the answer was: without
+  ;; this the cost is a node process once a compile and once a REPL form, for ever.
+  (let [proj (h/fake-project! two-packages)
+        npm  {:root (str proj) :acquire false}
+        srcs '{probe.core "(ns probe.core (:require [\"greeter\" :as g] [\"nowhere\" :as n]))
+                           (defn run [] g/hello)"}
+        [result _ out] (built srcs 'probe.core npm)]
+    (try
+      ;; what could be built was built, and the one that could not is named
+      (is (true? (:ok (:js-build result))))
+      (is (= ["nowhere"] (mapv first (:failed (:js-build result)))))
+      (is (= ["nowhere"] (:js-missing result)))
+      (is (.isFile (io/file out (output/js->path "greeter"))))
+      (let [[again said _] (built srcs 'probe.core npm out)]
+        (is (nil? (:js-build again)))
+        (is (= ["nowhere"] (:js-missing again)))
+        ;; and the report keeps its own promise: once per directory and specifier
+        (is (= "" said)))
+      (finally (h/delete-tree! proj) (h/delete-tree! out)))))
+
+(h/deftest-when h/node? test-a-build-that-fails-is-not-run-again
+  ;; The other half of `tried once`, for the case where the build produces nothing
+  ;; at all: an :esbuild that is a real file and not an esbuild. The first compile
+  ;; runs node and fails, the second says so without running anything - because a
+  ;; failure writes no manifest, and without a memo of its own it would be retried
+  ;; once a form.
+  (let [proj (h/fake-project! two-packages)
+        fake (io/file proj "not-esbuild.js")
+        _    (spit fake "throw new Error(\"not esbuild\");\n")
+        npm  {:root (str proj) :esbuild (str fake)}
+        srcs '{probe.core "(ns probe.core (:require [\"greeter\" :as g]))
+                           (defn run [] g/hello)"}
+        [result _ out] (built srcs 'probe.core npm)]
+    (try
+      (is (false? (:ok (:js-build result))))
+      (is (= ["greeter"] (:js-missing result)))
+      (let [[again _ _] (built srcs 'probe.core npm out)]
+        (is (= :already-failed (:why (:js-build again)))))
+      (finally (h/delete-tree! proj) (h/delete-tree! out)))))
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-repl-require-builds-the-package
+  ;; The third caller, and the reason the seam is not the driver's alone:
+  ;; (require '["greeter" :as g]) compiles NOTHING, so driver/run!* never runs for
+  ;; it. Typed at a real REPL against a real node runtime, the package is built
+  ;; between the require and the form that calls it - and nobody wrote npm/ by
+  ;; hand, which is the one line of difference from the test above.
+  (let [proj (h/fake-project! two-packages)
+        src  (h/write-sources! '{app.core "(ns app.core) (def n 1)"})
+        out  (h/temp-dir)]
+    (try
+      (with-open [rt (repl/node-runtime {:dir out :out program-out})]
+        (let [cenv (env/compile-env {:ns 'cljs.user})
+              opts {:out-dir out :source-paths [src]
+                    :npm {:root (str proj) :acquire false}}]
+          ;; one ordinary require first, which is what puts cljs.core on disk
+          ;; for the prologue to fetch
+          (is (= ["nil"] (mapv :value (repl/eval-src cenv rt "(require 'app.core)" opts))))
+          (is (not (.isFile (io/file out (output/js->path "greeter")))))
+          ;; THE REQUIRE ON ITS OWN, and the assertion between it and the call is
+          ;; the whole point: this form compiles nothing, so the driver never runs
+          ;; for it, and if the package is not built HERE it is built by the next
+          ;; form's prologue instead - which passes a test that only looks at the
+          ;; answer, and leaves a user who typed nothing else with an npm/ tree
+          ;; that is not there.
+          (is (= ["nil"] (mapv :value (repl/eval-src cenv rt "(require '[\"greeter\" :as g])" opts))))
+          (is (.isFile (io/file out (output/js->path "greeter"))))
+          (is (= ["\"hello repl\""]
+                 (mapv :value (repl/eval-src cenv rt "(g/hello \"repl\")" opts))))))
+      (finally (h/delete-tree! proj) (h/delete-tree! src) (h/delete-tree! out)))))
