@@ -233,24 +233,40 @@
 (defn js-import
   "The import a module carries for a JavaScript module it requires:
 
-      import * as react$js from \"../../npm/react.js\";
+      import { $module as react$js } from \"../../npm/react.js\";
 
   `binding` is clojure.cljs.names/js-alias of the specifier and `specifier` is how
   this module reaches the file, which is the output layout's to compute - the same
   split the two imports above make.
 
-  ALWAYS `import * as`, whatever the ns form asked for. :as names the module, :refer
-  names an export and :default names the export called `default`, and all three are
-  properties of the module's namespace object - so one import serves them all and a
-  reference through any of them is a property read, exactly as a var of ours is a
-  property of a namespace object and a goog var is a property of its provide. The
-  alternative - a named import per :refer - would bind a second kind of name in
-  module scope, and could not be spelled at all by the script counterpart below,
-  which is the half of doc/cljs-repl.md §4 that keeps one body running two ways.
+  ONE IMPORT, WHATEVER THE ns FORM ASKED FOR, and one binding out of it. :as names
+  the module, :refer names an export, :default names the export called `default`,
+  and a $ in the specifier names a path into it; all four are property reads off
+  the one object this line binds, exactly as a var of ours is a property of a
+  namespace object and a goog var is a property of its provide. So :as and :refer
+  of one specifier are one import between them, and every reference through either
+  is a property read.
+
+  THE OBJECT IS `$module`, WHICH IS NOT THE FILE'S NAMESPACE OBJECT, and that
+  distinction is the whole of the CommonJS interop. npm/react.js is written by
+  build_npm.mjs, which gives every module it builds exactly one export: the
+  namespace object when the package is an ES module, and `module.exports` itself
+  when it is CommonJS. `import * as` here would bind the wrapper esbuild puts round
+  a CommonJS package instead - a fresh object with the exports copied onto it and a
+  `default` added - and then (:require [\"debounce\" :as debounce]) would bind
+  something uncallable, because that package's entire value IS the function it
+  assigned to module.exports. See doc/cljs-npm.md §2.1.
+
+  A NAMED IMPORT IS AFFORDABLE BECAUSE THERE IS ONLY EVER ONE. The objection to
+  them is that a named import per :refer would bind a second kind of name in module
+  scope and could not be spelled at all by the script counterpart below, which is
+  the half of doc/cljs-repl.md §4 that keeps one body running two ways. Neither
+  applies to a single fixed name: `$module` is the same word for every specifier,
+  and the script path reads it as the property it is.
 
   Its script counterpart is the await $CLJS.requireJs of script-prologue."
   [binding specifier]
-  (str "import * as " binding " from \"" specifier "\";"))
+  (str "import { $module as " binding " } from \"" specifier "\";"))
 
 (def runtime-globals
   "The line an evaluated script opens with, where runtime-import's is the line a
@@ -1880,8 +1896,10 @@
   A JAVASCRIPT MODULE IS AWAITED AND BOUND, where a namespace is only awaited: a
   namespace's vars are reached through $ns, which needs no import to name them,
   while a module's exports are properties of the object the import statement binds
-  - so the script has to bind the same name js-import does, and binds it to what
-  $CLJS.requireJs resolves. The line count is why they interleave the way they do:
+  - so the script has to bind the same name js-import does, to the same object.
+  $CLJS.requireJs resolves the FILE, whose one export is `$module`, so what
+  js-import spells as a named import is spelled here as the property read it is.
+  The line count is why they interleave the way they do:
   one line per specifier either way, so a body sits at the same line number in the
   module and in the script that reloads it (see `script`)."
   ([ns-sym] (script-prologue ns-sym nil nil))
@@ -1890,7 +1908,7 @@
    (-> (mapv #(str "await $CLJS.require(\"" % "\");")
              (other-namespaces ns-sym required))
        (into (map #(str "const " (names/js-alias %)
-                        " = await $CLJS.requireJs(\"" % "\");"))
+                        " = (await $CLJS.requireJs(\"" % "\")).$module;"))
              js-required)
        (into (ns-prologue ns-sym required)))))
 

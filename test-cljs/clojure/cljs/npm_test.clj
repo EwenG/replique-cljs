@@ -263,8 +263,8 @@
   ;; name or the body between them is not the same text
   (let [cenv (ns-env '(ns app.core (:require ["react" :as React]
                                              ["@visx/scale" :refer [scaleLinear]])))]
-    (is (= ["import * as $CIRCA$visx$SLASH$scale$js from \"../../npm/@visx/scale.js\";"
-            "import * as react$js from \"../../npm/react.js\";"]
+    (is (= ["import { $module as $CIRCA$visx$SLASH$scale$js } from \"../../npm/@visx/scale.js\";"
+            "import { $module as react$js } from \"../../npm/react.js\";"]
            (mapv #(emitter/js-import (names/js-alias %)
                                      (output/specifier 'app.core (output/js->path %)))
                  (env/js-requires cenv 'app.core))))
@@ -273,7 +273,8 @@
       ;; one line per specifier either way, which is what keeps a body at the same
       ;; line number in the module and in the script that reloads it
       (is (= 2 (count (filter #(str/includes? % "requireJs") script))))
-      (is (some #{"const react$js = await $CLJS.requireJs(\"react\");"} script)))))
+      (is (some #{"const react$js = (await $CLJS.requireJs(\"react\")).$module;"}
+                script)))))
 
 (deftest test-a-module-is-imported-once-however-many-names-it-gave
   ;; :as and :refer of one specifier are one import, because both are properties
@@ -287,12 +288,20 @@
 
 (def ^:private npm-tree
   "The npm/ tree a bundler would build, as {path source}. Written by hand here,
-  which is the point: this compiler does not build it and must not need to - what
-  it owns is the NAME each specifier is filed under."
-  {"npm/greeter.js"      (str "export function hello(x) { return \"hello \" + x; }\n"
-                              "export function shout(x) { return x.toUpperCase(); }\n")
-   "npm/greeter/loud.js" "export default function (x) { return x + \"!\"; }\n"
-   "npm/@scope/pkg.js"   "export const answer = 42;\n"})
+  which is the point: what this compiler owns is the NAME each specifier is filed
+  under and the ONE EXPORT it reads back out of it.
+
+  `$module` is that export, and doc/cljs-npm.md §2.1 is why: the module's value,
+  which is a namespace object for an ES package and module.exports for a CommonJS
+  one. A hand-written stand-in cannot be both, so it is written the way the
+  CommonJS half comes out - an object with the names on it - and the ES half is
+  covered where a real esbuild builds a real package, below."
+  {"npm/greeter.js"      (str "export const $module = {\n"
+                              "  hello: function (x) { return \"hello \" + x; },\n"
+                              "  shout: function (x) { return x.toUpperCase(); }\n"
+                              "};\n")
+   "npm/greeter/loud.js" "export const $module = { default: function (x) { return x + \"!\"; } };\n"
+   "npm/@scope/pkg.js"   "export const $module = { answer: 42 };\n"})
 
 (defn- write-npm!
   [^File dir]
@@ -306,7 +315,8 @@
   ;; compiled once as a module and once as a script, gives the same answer. The
   ;; module reaches the package by a relative import and the script by
   ;; $CLJS.requireJs, and nothing between them differs.
-  (h/write-npm! {"pkg" "export const n = 7;\nexport default function (x) { return x * 2; }\n"})
+  (h/write-npm! {"pkg" (str "export const $module = "
+                            "{ n: 7, default: function (x) { return x * 2; } };\n")})
   (let [src "(ns app.both (:require [\"pkg\" :as p :refer [n] :default twice]))
              (str (twice n) \"-\" p.n)"]
     ;; core-env rather than fresh-env: str is a cljs.core var, and the two paths
@@ -652,10 +662,13 @@
     (try
       ;; the bundler's output first, so the run has nothing to report as owed
       (doseq [[path text] {"npm/greeter.js"
-                           (str "export function hello(x) { return \"hello \" + x; }\n"
-                                "export function shout(x) { return x.toUpperCase(); }\n")
+                           (str "export const $module = {\n"
+                                "  hello: function (x) { return \"hello \" + x; },\n"
+                                "  shout: function (x) { return x.toUpperCase(); }\n"
+                                "};\n")
                            "npm/clipboard-polyfill.js"
-                           "export function write(x) { return \"wrote \" + x; }\n"}]
+                           (str "export const $module = "
+                                "{ write: function (x) { return \"wrote \" + x; } };\n")}]
         (let [f (io/file out path)]
           (.mkdirs (.getParentFile f))
           (spit f text)))
@@ -663,9 +676,11 @@
                                  {:out-dir out :source-paths [src]})
       ;; ONE import per specifier, whichever way it was spelled
       (let [text (slurp (File. out "ns/probe/core.js"))]
-        (is (str/includes? text "import * as greeter$js from \"../../npm/greeter.js\""))
-        (is (str/includes? text
-                           "import * as clipboard_polyfill$js from \"../../npm/clipboard-polyfill.js\"")))
+        (is (str/includes?
+             text "import { $module as greeter$js } from \"../../npm/greeter.js\""))
+        (is (str/includes?
+             text (str "import { $module as clipboard_polyfill$js } from "
+                       "\"../../npm/clipboard-polyfill.js\""))))
       (is (= "hello a\nB\nwrote c" (node (File. out "ns/probe/core.js"))))
       (finally (h/delete-tree! src) (h/delete-tree! out)))))
 
@@ -830,17 +845,72 @@
       (is (.isFile (io/file out (output/js->path "shouty"))))
       (is (true? (:ok (:js-build result))))
       (is (= 2 (:modules (:js-build result))))
-      ;; THE CommonJS HALF IS THE INTERESTING ONE: esbuild cannot see a CommonJS
-      ;; package's names statically - `export * from "greeter"` yields no exports
-      ;; at all and says nothing - so node enumerates those, and the build records
-      ;; which kind each specifier turned out to be
-      (is (= :esbuild (get (:kinds (:js-build result)) "shouty")))
-      (is (not= :esbuild (get (:kinds (:js-build result)) "greeter")))
+      ;; and the build says which shape each specifier turned out to have, because
+      ;; that is what decides WHICH OBJECT its alias binds - §2.1, and the test
+      ;; below
+      (is (= :esm (get (:kinds (:js-build result)) "shouty")))
+      (is (= :cjs (get (:kinds (:js-build result)) "greeter")))
       (let [entry (io/file out "check.mjs")]
         (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
                          "import \"./ns/probe/core.js\";\n"
                          "console.log($ns(\"probe.core\").run());\n"))
         (is (= "hello world|OK!|<x>" (node entry))))
+      (finally (h/delete-tree! proj) (h/delete-tree! out)))))
+
+(def ^:private commonjs-packages
+  "Three CommonJS packages, each a shape a namespace object cannot stand in for."
+  {;; module.exports IS the function. Nothing about a namespace object is callable,
+   ;; so an alias bound to one is useless here - this is the shape that made the
+   ;; rule (doc/cljs-npm.md §2.1).
+   "terse"   ["index.js" "module.exports = function (s) { return \"[\" + s + \"]\"; };\n"]
+   ;; the babel and typescript shape: a CommonJS file with __esModule set and a
+   ;; `default` among its exports. A bundler's `import x from` interop UNWRAPS that
+   ;; default, so an alias taken that way would be the default rather than the
+   ;; exports object, and :default would then read a default off a default.
+   "dressed" ["index.js" (str "Object.defineProperty(exports, \"__esModule\","
+                              " { value: true });\n"
+                              "exports.default = function (s) { return \"d:\" + s; };\n"
+                              "exports.named = function (s) { return \"n:\" + s; };\n")]
+   ;; a property no static reading of the file can see
+   "plain"   ["index.js" (str "const m = { visible: 1 };\n"
+                              "Object.defineProperty(m, \"hidden\","
+                              " { value: 2, enumerable: false });\n"
+                              "module.exports = m;\n")]})
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-commonjs-alias-is-the-exports-object
+  ;; STAGE 4, and the defect it fixes: `:as` on a CommonJS package must bind
+  ;; module.exports, which is what shadow-cljs binds and what every one of these
+  ;; three packages needs it to be. The module namespace object esbuild wraps such
+  ;; a package in is a different object with different contents, and binding that
+  ;; instead is undefined-at-a-distance in all three ways at once.
+  (let [proj (h/fake-project! commonjs-packages)
+        [result said out]
+        (built '{probe.core "(ns probe.core
+                               (:require [\"terse\" :as terse]
+                                         [\"dressed\" :as dressed :default dd :refer [named]]
+                                         [\"plain\" :as plain]))
+                             (defn run []
+                               (str (terse \"a\") \"|\" (dd \"b\") \"|\" (named \"c\")
+                                    \"|\" (dressed/named \"d\")
+                                    \"|\" plain/visible \"|\" plain/hidden))"}
+               'probe.core {:root (str proj) :acquire false})]
+    (try
+      (is (= [] (:js-missing result)))
+      (is (= "" said))
+      (is (true? (:ok (:js-build result))))
+      (is (= {"dressed" :cjs "plain" :cjs "terse" :cjs}
+             (:kinds (:js-build result))))
+      (let [entry (io/file out "check.mjs")]
+        (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
+                         "import \"./ns/probe/core.js\";\n"
+                         "console.log($ns(\"probe.core\").run());\n"))
+        ;; [a]     the module called as the function it is
+        ;; d:b     :default, which is a `default` ON the exports and not the
+        ;;         exports themselves - the __esModule unwrapping refused
+        ;; n:c n:d a :refer and the same name through the alias, one object
+        ;; 1       an ordinary property
+        ;; 2       one that is not enumerable, which nothing could have listed
+        (is (= "[a]|d:b|n:c|n:d|1|2" (node entry))))
       (finally (h/delete-tree! proj) (h/delete-tree! out)))))
 
 (h/deftest-when (and h/node? h/esbuild?) test-a-second-compile-builds-nothing

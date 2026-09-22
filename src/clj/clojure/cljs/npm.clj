@@ -47,11 +47,13 @@
   Closure's, which doc/cljs-advanced.md §2 priced out and declined. Writing it in
   JavaScript on node instead is writing esbuild badly.
 
-  Everything node-side is in build_npm.mjs beside this file, and the reason it is
-  one script rather than a pipeline this namespace drives is in its header: only
-  node's loader knows what a CommonJS package exports, so enumeration has to
-  happen there, and esbuild has a JavaScript API so the bundling may as well
-  happen in the same process."}
+  Everything node-side is in build_npm.mjs beside this file. It runs node, but it
+  never LOADS a package: esbuild resolves each specifier, reports its format and
+  bundles it, so a package that touches `document` the moment it is loaded costs
+  nothing here. What the script has to find out about a specifier is one bit -
+  CommonJS or ES module - because that is what decides which object the emitted
+  import binds (doc/cljs-npm.md §2.1), and esbuild answers it from the same
+  resolution it is about to do anyway."}
   clojure.cljs.npm
   (:require [clojure.cljs.output :as output]
             [clojure.edn :as edn]
@@ -312,15 +314,23 @@
   "Build the npm/ tree under `dir` for `specifiers`, with `esbuild`, rooted at the
   project `root`. Returns the node script's own report.
 
-    {:ok true :modules 91 :chunks 50 :bytes 8964512 :rounds 2 :dropped 99
-     :outputs [\"npm/react.js\" …] :kinds {\"react\" :require …} :failed []}
+    {:ok true :modules 91 :chunks 50 :bytes 8853408 :probes 1 :rounds 1
+     :outputs [\"npm/react.js\" …] :kinds {\"react\" :cjs \"@visx/scale\" :esm …}
+     :failed []}
 
   or {:ok false :error :build :detail \"…\"}.
+
+  :kinds IS THE ANSWER TO THE ONE QUESTION THE SCRIPT HAS TO ASK, which is whether
+  a package is CommonJS: an ES module's alias binds its namespace object and a
+  CommonJS package's binds module.exports, and only esbuild can say which a
+  specifier resolves to. It is in the report and in the manifest because it is the
+  fact that decides what the emitted import means - doc/cljs-npm.md §2.1 - and
+  because a person looking at a package that behaves oddly wants to see it.
 
   THE REPORT IS THE SCRIPT'S, read from a file rather than from its stdout: esbuild
   writes to stdout too, and a report that has to be found among build noise is a
   parser waiting to be written. It is EDN because the JVM half has no JSON reader
-  and does not want one for six fields."
+  and does not want one for eight fields."
   [dir root esbuild specifiers dev]
   (let [^File work (work-dir root)
         script     (write-script! work)

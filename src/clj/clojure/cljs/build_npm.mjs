@@ -3,27 +3,31 @@
 //   node build_npm.mjs --esbuild=<path> --entries=<dir> --report=<file> \
 //                      [--dev] <out-dir> <specifier-list-file>
 //
-// clojure.cljs.npm schedules this; doc/cljs-npm.md 6 is why it exists at all and
+// clojure.cljs.npm schedules this; doc/cljs-npm.md §6 is why it exists at all and
 // doc/cljs-output-layout.md is where the paths come from. Everything this writes
 // lands at `<out-dir>/npm/<specifier>.js`, which is output/js->path's answer
 // stated a second time - by --outbase and --outdir rather than by a table, so
 // there is no mapping here to drift out of step with that one.
 //
-// ONE node PROCESS, and that is a finding rather than a preference: only node's
-// loader knows what names a CommonJS package exports - esbuild cannot see them,
-// and `export * from "react"` bundles to a module with no exports at all,
-// silently. So enumeration has to happen on node, and since esbuild has a
-// JavaScript API the bundling may as well happen beside it. The alternative was a
-// pipeline the compiler orchestrates, which is two processes and a wire format
-// for no gain.
+// EVERY OUTPUT EXPORTS ONE NAME, `$module`, AND IT IS THE MODULE'S VALUE: the
+// namespace object of an ES module, and `module.exports` itself of a CommonJS one.
+// That single rule is the whole of the interop, and it is what the ns form's four
+// options are then read off - doc/cljs-npm.md §2. The two halves of it are the two
+// entry shapes below, and which one a specifier gets is the only thing this script
+// has to find out about it.
+//
+// NOTHING IS EXECUTED HERE. esbuild resolves, esbuild reports the format, esbuild
+// bundles; no package is ever loaded into this process. That is not a nicety -
+// lottie-light-react touches `document` the moment it loads, so a script that
+// enumerated a package by importing it would fail on a machine with no DOM, which
+// is every machine this runs on.
 //
 // IT REPORTS IN EDN, written to --report. The JVM half of this has no JSON reader
-// and does not want one for six fields; EDN it can read with clojure.edn, which is
-// in core. The file is written whether the build worked or not, so a failure is a
-// sentence rather than an exit code.
-import { writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
-import { createRequire } from "node:module";
+// and does not want one for eight fields; EDN it can read with clojure.edn, which
+// is in core. The file is written whether the build worked or not, so a failure is
+// a sentence rather than an exit code.
+import { writeFileSync, mkdirSync, rmSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const argv = process.argv.slice(2);
@@ -40,9 +44,9 @@ const [outDir, listFile] = argv.filter((a) => !a.startsWith("--"));
 // --- the report --------------------------------------------------------------
 
 // A KEYWORD IS NOT A STRING, and the difference is the whole reason for this
-// class: `:esbuild` says how a package was enumerated, `"esbuild"` would be a
-// package of that name. Everything else EDN needs is JavaScript's own - a JSON
-// string is a valid EDN string, escapes included.
+// class: `:cjs` says what shape a package has, `"cjs"` would be a package of that
+// name. Everything else EDN needs is JavaScript's own - a JSON string is a valid
+// EDN string, escapes included.
 class Kw {
   constructor(name) { this.name = name; }
 }
@@ -90,91 +94,14 @@ try {
   die("no-esbuild", e && e.message);
 }
 
-// --- enumerating what a package exports ---------------------------------------
-
-const req = createRequire(join(entryDir, "anchor.js"));
-
-const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const RESERVED = new Set(["default","import","export","class","function","var","let","const","new","delete","typeof","in","of","do","if","else","return","this","null","true","false","await","yield","super","case","catch","try","throw","void","with","while","for","switch","break","continue","debugger","enum","extends","instanceof"]);
-// esbuild's own CommonJS interop marker. require() reports it as an export
-// because it IS a property of module.exports; it is never a real name, and a
-// dual package's ESM half does not have it.
-const INTEROP = new Set(["__esModule"]);
-
-function usable(keys) {
-  return keys.filter((k) => IDENT.test(k) && !RESERVED.has(k) && !INTEROP.has(k));
+let specs;
+try {
+  specs = readFileSync(listFile, "utf8").split("\n").map((s) => s.trim()).filter(Boolean);
+} catch (e) {
+  die("no-list", e && e.message);
 }
 
-// ASKED OF ESBUILD FIRST, AND WITHOUT RUNNING ANYTHING. `export * from "x"`
-// re-exports an ES module's named exports, and esbuild's metafile then lists what
-// the output ended up exporting - which is the same resolver and the same
-// conditions the real build will use, so there is nothing to reconcile
-// afterwards. It also never EXECUTES the package: lottie-light-react touches
-// `document` the moment it is loaded, so enumerating it by importing it fails on
-// a machine that has no DOM, which is every machine this runs on.
-//
-// It says nothing about a CommonJS package - `export *` from one yields no names
-// at all, silently - so node answers for those, and node executing them is a cost
-// only they pay. That order is the correction Stage 1 made to Stage 0's plan:
-// esbuild is the authority and node is the fallback, not the other way round.
-const probeDir = join(entryDir, ".probe");
-
-async function esbuildExports(specs) {
-  rmSync(probeDir, { recursive: true, force: true });
-  const byEntry = new Map();
-  for (const spec of specs) {
-    const p = join(probeDir, spec + ".js");
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, `export * from ${JSON.stringify(spec)};\n`);
-    byEntry.set(p, spec);
-  }
-  const out = new Map();
-  // ONE AT A TIME: a probe that cannot resolve must not take the other ninety
-  // with it. This is the slow half of the run and it is the price of finding out
-  // which specifier is the broken one.
-  for (const [p, spec] of byEntry) {
-    try {
-      const r = await esbuild.build({
-        entryPoints: [p], outbase: probeDir, outdir: join(probeDir, "out"),
-        bundle: true, format: "esm", platform: "browser", write: false,
-        define: { "process.env.NODE_ENV": '"production"' },
-        logLevel: "silent", metafile: true,
-      });
-      const o = Object.values(r.metafile.outputs)[0];
-      out.set(spec, usable(o && o.exports ? o.exports : []));
-    } catch (_) {
-      out.set(spec, null);   // null = esbuild could not even resolve it
-    }
-  }
-  rmSync(probeDir, { recursive: true, force: true });
-  return out;
-}
-
-async function describe(spec, fromEsbuild) {
-  if (fromEsbuild && fromEsbuild.length) {
-    return { how: "esbuild", named: fromEsbuild, hasDefault: true };
-  }
-  try {
-    const ns = await import(spec);
-    return { how: "import", named: usable(Object.keys(ns)), hasDefault: true };
-  } catch (e1) {
-    try {
-      const m = req(spec);
-      const keys = (m && typeof m === "object") ? Object.keys(m) : [];
-      return { how: "require", named: usable(keys), hasDefault: true };
-    } catch (e2) {
-      if (fromEsbuild === null) {
-        return { how: "FAILED", err: `unresolvable: ${e2.code || String(e2.message).slice(0, 80)}` };
-      }
-      // esbuild resolves it and it has no named exports: a CommonJS module whose
-      // whole API is its default, or one node will not load. Either way the
-      // default alone is a true answer.
-      return { how: "default-only", named: [], hasDefault: true };
-    }
-  }
-}
-
-// --- the entries -------------------------------------------------------------
+// --- the two entry shapes ------------------------------------------------------
 
 // BESIDE THE PROJECT'S node_modules, not under the output directory, and that is
 // not a tidiness choice: esbuild resolves a bare specifier from the importing
@@ -184,64 +111,135 @@ async function describe(spec, fromEsbuild) {
 // reason.
 function entryPath(spec) { return join(entryDir, spec + ".js"); }
 
-function writeEntry(spec, d) {
-  const lines = [];
-  if (d.named.length) lines.push(`export { ${d.named.join(", ")} } from ${JSON.stringify(spec)};`);
-  if (d.hasDefault)   lines.push(`export { default } from ${JSON.stringify(spec)};`);
-  const p = entryPath(spec);
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, lines.join("\n") + "\n");
-  return p;
+// AN ES MODULE STANDS FOR ITS NAMESPACE OBJECT, which is what `import * as` binds
+// and what `:as` must therefore end up holding. Nothing is copied and nothing is
+// wrapped, so esbuild can still see which of its exports are used and drop the
+// rest.
+const ESM = (spec) =>
+  `import * as $module from ${JSON.stringify(spec)};\nexport { $module };\n`;
+
+// A CommonJS MODULE STANDS FOR `module.exports`, AND ONLY `require` YIELDS IT.
+// `import * as` and `import x from` both go through esbuild's interop, which wraps
+// the exports in a fresh namespace object and - when the package sets
+// `__esModule` - unwraps `.default` on the way. Either is the wrong object:
+// `module.exports` may BE the function the package is (`module.exports = debounce`),
+// and it carries properties no static view of the file can see. `require` returns
+// the object the package assigned, untouched.
+//
+// This is the whole of what doc/cljs-npm.md §2.1 calls the CommonJS rule, and it
+// is shadow-cljs's semantics: an alias on a CommonJS package names its exports
+// object, so `$default` and `:default` read `.default` OFF it rather than being it.
+const CJS = (spec) =>
+  `export const $module = require(${JSON.stringify(spec)});\n`;
+
+const form = new Map(specs.map((s) => [s, ESM]));
+// A specifier only `require` could resolve at all: it never goes back to ESM,
+// because ESM is what already failed for it.
+const forced = new Set();
+let live = new Set(specs);
+const failed = [];
+
+// The directory the entries are in, as THIS process spells it. --entries may name
+// it through a symbolic link - every temporary directory on macOS does, /var being
+// a link to /private/var - and esbuild answers in paths resolved against
+// process.cwd(), which is not. Comparing the two spellings without this finds no
+// entry for any error and no entry in any metafile, so a probe learns nothing and
+// a failure has nobody to blame.
+let entryRoot = entryDir;
+
+function writeEntries() {
+  rmSync(entryDir, { recursive: true, force: true });
+  mkdirSync(entryDir, { recursive: true });
+  entryRoot = realpathSync(entryDir);
+  return [...live].map((spec) => {
+    const p = entryPath(spec);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, form.get(spec)(spec));
+    return p;
+  });
 }
 
-let specs;
-try {
-  specs = readFileSync(listFile, "utf8").split("\n").map((s) => s.trim()).filter(Boolean);
-} catch (e) {
-  die("no-list", e && e.message);
+// esbuild spells a path in an error location and in a metafile key relative to
+// THIS process's directory; the entries are keyed by specifier. One function, so
+// the two ways in agree.
+function specOf(file) {
+  if (!file) return null;
+  const spec = relative(entryRoot, resolve(process.cwd(), file)).replace(/\.js$/, "");
+  return live.has(spec) ? spec : null;
 }
 
-rmSync(entryDir, { recursive: true, force: true });
-mkdirSync(entryDir, { recursive: true });
+// The options are shared between the probe and the build ON PURPOSE: resolution
+// depends on platform and on conditions, so a probe that asked anything else
+// would be answering about a different file than the one that gets bundled.
+const options = (extra) => ({
+  entryPoints: writeEntries(),
+  outbase: entryDir,
+  bundle: true, format: "esm", splitting: true, platform: "browser",
+  // NOT optional: without it esbuild defaults NODE_ENV to "development" for the
+  // browser platform and silently bundles React's development build - 83KB
+  // against 14KB, and no error either way.
+  define: { "process.env.NODE_ENV": dev ? '"development"' : '"production"' },
+  logLevel: "silent", metafile: true,
+  ...extra,
+});
 
-const probed = await esbuildExports(specs);
-const desc = new Map(), failed = [], kinds = new Map();
-for (const spec of specs) {
-  const d = await describe(spec, probed.get(spec));
-  if (d.how === "FAILED") { failed.push([spec, d.err]); continue; }
-  kinds.set(spec, kw(d.how));
-  desc.set(spec, d);
-  writeEntry(spec, d);
-}
+// --- the probe: which specifiers are CommonJS ----------------------------------
 
-// --- the build ---------------------------------------------------------------
-
-// ESBUILD IS THE AUTHORITY, and this loop is how it gets asked. node's require()
-// reports a DUAL package's CommonJS half while esbuild resolves its ESM half, so
-// the two disagree about which names exist and about whether there is a default.
-// Rather than model the difference, build and read the complaint: every error is
-// of the form `No matching export in "..." for import "NAME"`, and it names the
-// entry it came from. Drop exactly those names and build again. Over 91 real
-// specifiers it converges in two rounds and drops ninety-nine names, which is
-// better than modelling it - esbuild's complaint is by definition its own view,
-// so there is nothing left to be wrong about.
-const MATCH = /No matching export in .* for import "([^"]+)"/;
-let round = 0, dropped = 0;
+// ASKED OF esbuild AND OF NOTHING ELSE. A build with `write: false` costs one pass
+// over the same graph the real build walks, and its metafile records each input's
+// `format` - so the answer comes from the resolver that is going to do the work,
+// under the same conditions, rather than from a heuristic about package.json.
+//
+// It is asked with EVERY entry in its ES shape, because that shape resolves both
+// kinds: esbuild will happily `import * as` a CommonJS file, it just gives the
+// wrong object. The probe wants the format, not the object.
+let probes = 0, meta = null;
 for (;;) {
-  round++;
+  probes++;
   try {
-    const result = await esbuild.build({
-      entryPoints: [...desc.keys()].map(entryPath),
-      outbase: entryDir, outdir: join(outDir, "npm"),
-      bundle: true, format: "esm", splitting: true, platform: "browser",
-      // NOT optional: without it esbuild defaults NODE_ENV to "development" for
-      // the browser platform and silently bundles React's development build -
-      // 83KB against 14KB, and no error either way.
-      define: { "process.env.NODE_ENV": dev ? '"development"' : '"production"' },
-      logLevel: "silent", metafile: true,
-    });
+    meta = (await esbuild.build(options({ write: false, outdir: join(entryDir, ".probe") }))).metafile;
+    break;
+  } catch (e) {
+    if (!e.errors || probes > 6) die("resolve", (e.errors || []).map((x) => x.text).join("\n") || (e && e.message));
+    let progress = 0;
+    for (const err of e.errors) {
+      const spec = specOf(err.location && err.location.file);
+      if (!spec) continue;
+      // A package whose "exports" map offers a `require` condition and no `import`
+      // one: unreachable as ESM, and CommonJS by the only route it has left.
+      if (form.get(spec) === ESM) { form.set(spec, CJS); forced.add(spec); progress++; }
+      else { live.delete(spec); failed.push([spec, err.text.slice(0, 200)]); progress++; }
+    }
+    if (!progress) die("resolve", e.errors.map((x) => x.text).join("\n"));
+  }
+}
+
+// The entry imports exactly one file - the package - so the first import it has is
+// the one whose format decides the shape.
+for (const [input, o] of Object.entries(meta.inputs)) {
+  const spec = specOf(input);
+  if (!spec || forced.has(spec)) continue;
+  const imported = (o.imports || []).find((i) => i.kind === "import-statement");
+  const target = imported && meta.inputs[imported.path];
+  if (target && target.format === "cjs") form.set(spec, CJS);
+}
+
+// --- the build -----------------------------------------------------------------
+
+// WHAT THE PROBE CANNOT ANSWER, THE BUILD COMPLAINS ABOUT. `require` of an ES
+// module is refused when that module has a top-level await, and the probe never
+// tried it, so the one specifier this can be wrong about is a CommonJS-shaped
+// answer the real build will not take. Put it back in its ES shape and build
+// again - the probe already proved that shape resolves.
+let rounds = 0;
+for (;;) {
+  rounds++;
+  try {
+    const result = await esbuild.build(options({ outdir: join(outDir, "npm") }));
     const outs = Object.entries(result.metafile.outputs);
     const chunk = (p) => /chunk-[A-Z0-9]+\.js$/.test(p);
+    const kinds = new Map([...live].sort()
+                          .map((s) => [s, kw(form.get(s) === CJS ? "cjs" : "esm")]));
     rmSync(entryDir, { recursive: true, force: true });
     report({
       ok: true,
@@ -251,37 +249,29 @@ for (;;) {
       modules: outs.filter(([p]) => !chunk(p)).length,
       chunks: outs.filter(([p]) => chunk(p)).length,
       bytes: outs.reduce((n, [, o]) => n + o.bytes, 0),
-      rounds: round,
-      dropped: dropped,
+      probes: probes,
+      rounds: rounds,
       dev: dev,
       kinds: kinds,
       failed: failed,
       // EXIT 0 EVEN WITH FAILURES IN IT. The bundle was written; a specifier that
-      // could not be enumerated is a sentence in the report, and the caller is
-      // going to ask output/missing-js which files are actually there anyway. A
-      // non-zero exit here means only that there is nothing worth reading.
+      // could not be resolved is a sentence in the report, and the caller is going
+      // to ask output/missing-js which files are actually there anyway. A non-zero
+      // exit here means only that there is nothing worth reading.
     }, 0);
   } catch (e) {
-    if (!e.errors || round > 6) {
+    if (!e.errors || rounds > 6) {
       die("build", (e.errors || []).map((x) => x.text).join("\n") || (e && e.message));
     }
     let progress = 0;
     for (const err of e.errors) {
-      const m = MATCH.exec(err.text);
-      if (!m || !err.location) continue;
-      const spec = relative(entryDir, join(process.cwd(), err.location.file)).replace(/\.js$/, "");
-      const d = desc.get(spec);
-      if (!d) continue;
-      if (m[1] === "default") {
-        if (d.hasDefault) { d.hasDefault = false; progress++; dropped++; }
-      } else {
-        const i = d.named.indexOf(m[1]);
-        if (i >= 0) { d.named.splice(i, 1); progress++; dropped++; }
-      }
-      writeEntry(spec, d);
+      const spec = specOf(err.location && err.location.file);
+      if (!spec) continue;
+      if (form.get(spec) === CJS && !forced.has(spec)) { form.set(spec, ESM); progress++; }
+      else { live.delete(spec); failed.push([spec, err.text.slice(0, 200)]); progress++; }
     }
-    // NO PROGRESS IS THE END OF IT. Looping on an error the rule above cannot
-    // act on would spin six times and say the same thing, so say it now.
+    // NO PROGRESS IS THE END OF IT. Looping on an error the rule above cannot act
+    // on would spin six times and say the same thing, so say it now.
     if (!progress) die("build", e.errors.map((x) => x.text).join("\n"));
   }
 }

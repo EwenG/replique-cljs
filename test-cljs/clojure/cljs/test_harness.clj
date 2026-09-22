@@ -324,11 +324,16 @@
   clojure.cljs.output/js->path gives them, so that a program compiled with string
   requires can be run beside them.
 
-  A stand-in for the bundler, and deliberately a dumb one: npm/ is the one tree
-  under an output root this compiler does not write, so a test that needed it
-  built by anything of ours would be testing the wrong thing. Both paths reach it
-  from here - a module by the relative specifier the driver computes, a script by
-  the URL $CLJS.requireJs computes from runtime.js's own."
+  A stand-in for the bundler, and deliberately a dumb one: a test that needed npm/
+  built by a real esbuild to say anything about the NAME a specifier is filed
+  under would be testing the wrong thing. Both paths reach it from here - a module
+  by the relative specifier the driver computes, a script by the URL
+  $CLJS.requireJs computes from runtime.js's own.
+
+  ONE EXPORT, CALLED `$module`, is the contract each source has to keep, because
+  that is what the emitted import asks for: the module's value, which is a
+  namespace object for an ES package and module.exports for a CommonJS one
+  (doc/cljs-npm.md §2.1)."
   [sources]
   (doseq [[specifier src] sources]
     (let [f (File. ^File @runtime-dir ^String (output/js->path specifier))]
