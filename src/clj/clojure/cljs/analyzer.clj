@@ -1528,7 +1528,7 @@
       (symbol (str "cljs" (subs s (count "clojure"))))
       sym)))
 
-(defn- aliased-clj-ns
+(defn aliased-clj-ns
   "The cljs.* namespace `target` stands for, or nil if it stands for itself.
 
   (:require [clojure.test :refer [deftest is]]) is how three of ClojureScript's
@@ -1550,7 +1550,15 @@
   for itself (driver/ensure!). Neither half has to reach into the other's evidence.
 
   declared? rather than existence: add-require! creates a namespace on being named,
-  so existence would say only that somebody mentioned the name."
+  so existence would say only that somebody mentioned the name.
+
+  PUBLIC BECAUSE A REPL'S require ASKS IT TOO, and asks it for a third reason.
+  The two above are about NAMES - what a spec means, and what a driver goes
+  looking for. clojure.cljs.repl/do-require asks about a FILE: having compiled
+  what was typed, it has to tell the runtime which module to fetch, and
+  ns/clojure/math.js is not where cljs/math.cljs was written. Reading the rule off
+  `declared?` a second time in repl.clj would be the same three conditions in
+  another file, and the one that drifted would be the one nobody re-read."
   [cenv target]
   (let [alt (clj-ns->cljs-ns target)]
     (when (and (not= alt target)

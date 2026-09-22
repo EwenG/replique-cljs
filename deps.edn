@@ -5,11 +5,29 @@
 ;; The Maven build (pom.xml) is the one that runs the tests and builds a jar; this
 ;; file exists only so tools.deps can see the source tree.
 ;;
-;; NO :deps HERE, deliberately. The one dependency is replique-clj, and it is the
-;; CONSUMER that must name it, because it stands in for org.clojure/clojure - which
-;; the Clojure CLI's root deps.edn always puts on the classpath, and which only the
-;; consuming project can override.
-{;; src/clj FIRST, and target/classes only for what is not in it: the websocket
+;; CLOJURE IS NOT NAMED HERE, deliberately. The compiler runs on replique-clj, and
+;; it is the CONSUMER that must name it, because it stands in for
+;; org.clojure/clojure - which the Clojure CLI's root deps.edn always puts on the
+;; classpath, and which only the consuming project can override.
+{;; THE ONE LIBRARY DEPENDENCY, and it is a ClojureScript one rather than a JVM
+ ;; one: nothing in this compiler calls it. cljs/reader.cljs is vendored beside
+ ;; cljs/core.cljs and opens (:require [cljs.tools.reader :as treader]
+ ;; [cljs.tools.reader.edn :as edn]), so the seven cljs/tools/reader*.cljs files in
+ ;; this jar are sources the COMPILER has to be able to find for a program that
+ ;; reads edn - and clojure/edn.cljs, which is three delegating functions over
+ ;; cljs.reader, is the name most programs reach for.
+ ;;
+ ;; Named here as well as in pom.xml, and that is the point: a consumer arriving by
+ ;; :local/root gets :paths and :deps out of this file and never reads the pom, so
+ ;; a pom-only declaration would leave cljs.reader shipped and unloadable on
+ ;; exactly the path replique uses.
+ ;;
+ ;; 1.3.6 is the version ClojureScript 1.12.145 pins, for the same reason the
+ ;; google-closure-library version is that one: the vendored cljs/reader.cljs was
+ ;; written against it.
+ :deps {org.clojure/tools.reader {:mvn/version "1.3.6"}}
+
+ ;; src/clj FIRST, and target/classes only for what is not in it: the websocket
  ;; framing under clojure.cljs.ws is Java (src/java), so the only build of it is
  ;; Maven's and a consumer reading this source tree has nowhere else to find it -
  ;; without it clojure.cljs.browser will not load and a browser REPL is missing.

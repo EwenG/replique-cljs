@@ -511,8 +511,18 @@
   (let [args    (map unquoted args)
         flags   (set (filter keyword? args))
         specs   (vec (remove keyword? args))
-        targets (ana/ns-form-deps (list* 'ns 'repl [(cons :require specs)]))
-        scripts (ordered-scripts cenv opts targets)
+        written (ana/ns-form-deps (list* 'ns 'repl [(cons :require specs)]))
+        scripts (ordered-scripts cenv opts written)
+        ;; WHAT EACH NAME TURNED OUT TO NAME. (require 'clojure.math) compiles
+        ;; cljs/math.cljs, because a clojure.* name with no file of its own means
+        ;; the cljs.* one (ana/aliased-clj-ns) - and what was written to disk is
+        ;; therefore ns/cljs/math.js. Shipping the name as TYPED asks the runtime
+        ;; for ns/clojure/math.js, which nothing ever wrote: the require compiled,
+        ;; the vars were there to complete, and the form came back
+        ;; `Cannot find module'. An ns form never had this because the analyzer
+        ;; resolves the same alias while it plans the spec; a REPL require never
+        ;; reaches that path, which is why it has to ask here.
+        targets (mapv #(or (ana/aliased-clj-ns cenv %) %) written)
         ;; WHAT EACH TARGET TURNED OUT TO BE, asked after compiling and not before,
         ;; because that is when the answer exists: a name with a source is now
         ;; declared, and one without is whatever driver/ensure! settled on. Three

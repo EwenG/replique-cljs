@@ -43,6 +43,31 @@
       <version>1.12.5-r1</version>
     </dependency>
 
+    <!-- THE ONE LIBRARY DEPENDENCY, and nothing on the JVM side calls it. cljs/reader.cljs is
+         vendored beside cljs/core.cljs and opens with (:require [cljs.tools.reader :as treader]
+         [cljs.tools.reader.edn :as edn]) - so the seven cljs/tools/reader*.cljs files in this
+         jar are SOURCES A COMPILATION READS, the same kind of input as clojure/string.cljs,
+         and without them cljs.reader and clojure.edn are shipped and unloadable.
+
+         1.3.6 is what ClojureScript 1.12.145 pins, for the same reason the
+         google-closure-library version is the one it pins: our copy of cljs/reader.cljs was
+         taken from that release and was written against this reader.
+
+         Clojure is excluded because the fork above stands in for it. Declared in deps.edn too,
+         and that is not duplication: a consumer arriving by :local/root reads that file and
+         never this one. -->
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>tools.reader</artifactId>
+      <version>1.3.6</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
     <!-- Only cljs.analyzer is wanted, as an AST oracle; nothing is ever compiled with it.
          ClojureScript's transitive dependencies are therefore excluded wholesale and the two
          the analyzer actually needs are named below: cljs.env reaches for
