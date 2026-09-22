@@ -7,7 +7,7 @@
 //
 // The wire:
 //
-//   here -> JVM   an EDN map, {:type :result/:print :content "..."}
+//   here -> JVM   an EDN map, {:type :result/:print/:uncaught :content "..."}
 //   JVM -> here   the script to evaluate, as the frame's text, and nothing else
 //
 // Neither side parses its own hard format: the JVM reads EDN with clojure.edn and
@@ -35,7 +35,7 @@
 // (§5): evaluate() returns a promise that is already the whole turn, imports and
 // all, so awaiting it is the entire mechanism.
 
-import { evaluate, print as printValue } from "./runtime.js";
+import { errorEdn, evaluate, print as printValue } from "./runtime.js";
 
 // --- the connection ---------------------------------------------------------
 
@@ -93,6 +93,42 @@ function teeConsole() {
   }
 }
 
+// --- what no turn owns -------------------------------------------------------
+//
+// An exception out of a setTimeout callback, an error in an event handler, a
+// promise nobody caught: none of them belongs to an evaluation, because the form
+// that scheduled the work answered long ago. A browser reports these through its
+// own error-reporting path and NOT by calling console.error, so the tee above does
+// not see them - which is why they need a hook of their own.
+//
+// Whatever is sent is the same error result a form that throws produces, built by
+// the same errorEdn, and that is deliberate: an error nobody was waiting for should
+// read the way one that was reads, down to leaving what was thrown in *e.
+//
+// EXPORTED, and not only for symmetry with connect: the host is what decides where
+// these arrive from, and a page that already has an error reporter of its own can
+// hand this what it caught instead of letting the events do it.
+
+export function reportUncaught(e) {
+  send(message("uncaught", errorEdn(e)));
+}
+
+// NOTHING IS PREVENTED, which is teeConsole's trade again: the devtools console is
+// where a browser user looks first, and a REPL that swallowed an uncaught error to
+// report it elsewhere would be taking away the better of the two reports.
+function watchUncaught() {
+  if (globalThis.__cljsUncaught__) return;   // connect() may be called more than once
+  // A host that has no events to listen to is not a browser - node, under the
+  // tests, which reaches this file for the wire and not for this - and there is
+  // nothing here it could be given.
+  if (typeof addEventListener !== "function") return;
+  globalThis.__cljsUncaught__ = true;
+  // ev.error is null for an error thrown by a cross-origin script, where all the
+  // browser will say is "Script error."; that string is better than silence.
+  addEventListener("error", (ev) => reportUncaught(ev.error || ev.message));
+  addEventListener("unhandledrejection", (ev) => reportUncaught(ev.reason));
+}
+
 // --- the loop ---------------------------------------------------------------
 
 // One script at a time, and the chain is what guarantees it: the JVM serialises
@@ -146,6 +182,7 @@ export async function connect(u) {
   base = u || new URL(".", import.meta.url).href;
   stopped = false;
   teeConsole();
+  watchUncaught();
   for (;;) {
     try {
       open(await wsUrl());

@@ -51,24 +51,29 @@
   what it says to `log`.
 
   It is written into the output directory rather than run from a string so that it
-  imports the client by the same relative specifier a served page uses."
-  [rt ^StringBuffer log]
-  (let [^File dir (:dir rt)]
-    (spit (File. dir "page.js")
-          "import { connect } from \"./runtime_browser.js\";\nconnect(process.argv[2]);\n")
-    (let [p (-> (ProcessBuilder. ["node" "page.js" (:url rt)])
-                (.directory dir)
-                (.redirectErrorStream true)
-                (.start))]
-      (doto (Thread. #(with-open [r (io/reader (.getInputStream p))]
-                        (loop []
-                          (when-let [l (.readLine r)]
-                            (.append log (str l "\n"))
-                            (recur))))
-                     "page-output")
-        (.setDaemon true)
-        (.start))
-      p)))
+  imports the client by the same relative specifier a served page uses. `extra` is
+  a line put in front of the connect, for the one test that needs the page itself
+  to do something node's way."
+  ([rt log] (start-page! rt log ""))
+  ([rt ^StringBuffer log ^String extra]
+   (let [^File dir (:dir rt)]
+     (spit (File. dir "page.js")
+           (str "import { connect, reportUncaught } from \"./runtime_browser.js\";\n"
+                extra
+                "connect(process.argv[2]);\n"))
+     (let [p (-> (ProcessBuilder. ["node" "page.js" (:url rt)])
+                 (.directory dir)
+                 (.redirectErrorStream true)
+                 (.start))]
+       (doto (Thread. #(with-open [r (io/reader (.getInputStream p))]
+                         (loop []
+                           (when-let [l (.readLine r)]
+                             (.append log (str l "\n"))
+                             (recur))))
+                      "page-output")
+         (.setDaemon true)
+         (.start))
+       p))))
 
 (defn- wait-for
   "Poll `f` until it is truthy, for up to `ms`. Returns what it saw, or nil."
@@ -696,3 +701,128 @@
       (is (nil? (:etag r)) "nothing to revalidate against")
       (is (str/includes? (:body r) "\"ws\": \"ws://")))))
 
+
+
+;; --- errors no turn owns ----------------------------------------------------
+
+(deftest test-an-error-nobody-asked-about-reaches-the-output
+  ;; An exception out of an event handler, or a promise nobody caught: there is no
+  ;; turn to complete, so the only place for it is where the page's console goes.
+  ;;
+  ;; Spoken by hand, because what is under test is this end - that a third kind of
+  ;; message is understood at all, and that its stack is read back as
+  ;; ClojureScript on the way. That the CLIENT sends one is the next test.
+  (let [out (StringWriter.)]
+    (with-open [rt (browser/browser-runtime {:out out})]
+      (let [[^WebSocket ws _] (fake-page! rt)]
+        (is (some? (wait-for #(:session rt))) "connected")
+        (.get (.sendText ws (str "{:type :uncaught :content "
+                                 (pr-str (str "{:status :error :value \"Error: out of nowhere\""
+                                              " :stacktrace \"Error: out of nowhere\\n"
+                                              "    at whatever (ns/nope/core.js:3:1)\"}"))
+                                 "}")
+                         true)
+              10000 TimeUnit/MILLISECONDS)
+        (is (wait-for #(str/includes? (str out) ";; uncaught error: Error: out of nowhere"))
+            (str out))
+        (is (str/includes? (str out) "at whatever") "and the frames came with it")
+        (.abort ws)))))
+
+(h/deftest-when h/node? test-the-client-reports-an-error-no-turn-owns
+  ;; The other end of the same channel, and the half of it a real browser reaches
+  ;; through addEventListener("error"/"unhandledrejection"). Node has no such
+  ;; events - it has process.on - so the stand-in page wires its own to the very
+  ;; same reportUncaught the events are wired to, which leaves untested only the
+  ;; two lines of registration that could not run here at all.
+  (let [out (StringWriter.)
+        log (StringBuffer.)]
+    (with-open [rt (browser/browser-runtime {:out out})]
+      (with-core! rt)
+      (let [p (start-page! rt log "process.on(\"unhandledRejection\", reportUncaught);\n")]
+        (try
+          (is (some? (wait-for #(:session rt))) "connected")
+          ;; dropped rather than returned: a promise the turn returns is awaited by
+          ;; the turn, and so is caught after all
+          (values rt 'browser-stray.core
+                  "(js* \"(function(){ Promise.reject(new Error('from the page')); return 1; })()\")")
+          (is (wait-for #(str/includes? (str out) ";; uncaught error: Error: from the page"))
+              (str out))
+          (finally (.destroy p)))))))
+
+
+;; --- a caller that gives up -------------------------------------------------
+
+(deftest test-a-bounded-evaluation-stops-waiting-for-a-page-that-does-not-answer
+  ;; The page took the script and said nothing. -evaluate would wait for as long as
+  ;; that takes, which is right for a form at a prompt and wrong for a completion.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [[^WebSocket ws scripts] (fake-page! rt)]
+      (is (some? (wait-for #(:session rt))) "connected")
+      (let [r (repl/evaluate-within rt "SCRIPT-UNANSWERED" 400)]
+        (is (= "SCRIPT-UNANSWERED" (took scripts)) "it was sent")
+        (is (= :error (:status r)))
+        (is (str/includes? (:value r) "did not answer within 400ms") (:value r)))
+      (.abort ws))))
+
+(deftest test-a-bounded-evaluation-that-never-reached-the-page-says-a-different-thing
+  ;; Which is the distinction the whole deadline is for: nothing was sent, so there
+  ;; is nothing running that this asked for, and whoever asked can say so without
+  ;; hedging. The permit is held by an ordinary evaluation that is still waiting -
+  ;; a form at a prompt, in life.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [[^WebSocket ws scripts] (fake-page! rt)]
+      (is (some? (wait-for #(:session rt))) "connected")
+      (let [held (future (repl/-evaluate rt "SCRIPT-AT-THE-PROMPT"))]
+        (is (= "SCRIPT-AT-THE-PROMPT" (took scripts)))
+        (let [r (repl/evaluate-within rt "SCRIPT-FOR-TOOLING" 300)]
+          (is (= :error (:status r)))
+          (is (str/includes? (:value r) "busy for the whole 300ms") (:value r))
+          (is (nil? (.poll ^LinkedBlockingQueue scripts 200 TimeUnit/MILLISECONDS))
+              "and it never reached the page"))
+        (answer! ws "{:status :success :value \"1\"}")
+        (is (= "1" (:value @held))))
+      (.abort ws))))
+
+(deftest test-giving-up-lets-the-next-evaluation-through
+  ;; What makes a deadline more than a timer: the caller's place in the queue goes
+  ;; with the wait. A bounded call that gave up must not leave the permit held by a
+  ;; thread still listening for an answer nobody wants any more.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [[^WebSocket ws scripts] (fake-page! rt)]
+      (is (some? (wait-for #(:session rt))) "connected")
+      (is (= :error (:status (repl/evaluate-within rt "SCRIPT-ABANDONED" 300))))
+      (is (= "SCRIPT-ABANDONED" (took scripts)))
+      (let [next (future (repl/-evaluate rt "SCRIPT-AFTER"))]
+        (is (= "SCRIPT-AFTER" (took scripts)) "the next one got in")
+        (answer! ws "{:status :success :value \"7\"}")
+        (is (= "7" (:value @next))))
+      ;; AND THE ABANDONED ANSWER GOES NOWHERE, arriving late to a turn that was
+      ;; forgotten on the way out.
+      (.abort ws))))
+
+(deftest test-a-bounded-evaluation-with-no-page-answers-at-once
+  ;; Not a wait at all, bounded or otherwise: a REPL started before the browser is
+  ;; the normal way round, and the useful answer is the URL.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [r (repl/evaluate-within rt "ANYTHING" 30000)]
+      (is (= :error (:status r)))
+      (is (str/includes? (:value r) "No browser is connected") (:value r)))))
+
+
+;; --- starting on a namespace ------------------------------------------------
+
+(deftest test-a-main-given-before-the-page-is-open-says-what-to-open
+  ;; browser-repl passes :main through, and the browser is the transport where
+  ;; that can fail for a reason that is not the program's: there is nowhere to
+  ;; ship it yet. The answer is the one any form gets there, and it is the useful
+  ;; one - it names the url. The namespace COMPILED, which is the half a repl
+  ;; start is really for, so requiring it once the page is there costs nothing.
+  (let [src (h/write-sources! '{page.main "(ns page.main) (def x 1)"})
+        out (StringWriter.)]
+    (try
+      (browser/browser-repl {:in (java.io.StringReader. "") :out out
+                             :main 'page.main :source-paths [src]})
+      (is (str/includes? (str out) "Waiting for a browser on"))
+      (is (str/includes? (str out) "No browser is connected") (str out))
+      (is (str/includes? (str out) "cljs.user=> ") (str out))
+      (finally (h/delete-tree! src)))))

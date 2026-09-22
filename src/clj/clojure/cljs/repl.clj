@@ -68,7 +68,8 @@
            [java.net InetAddress ServerSocket Socket]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+           [java.nio.file.attribute FileAttribute]
+           [java.util.concurrent LinkedBlockingQueue Semaphore TimeUnit]))
 
 ;; --- the runtime ------------------------------------------------------------
 
@@ -112,12 +113,105 @@
 
     It moves where the NEXT evaluation goes and disturbs nothing in flight."))
 
+(defprotocol IJsDeadline
+  "A runtime that can be asked to GIVE UP. OPTIONAL, as IJsRuntimes is, and for a
+  caller that is not a REPL.
+
+  -evaluate has no bound and must not have one: a form you typed may legitimately
+  take minutes, and a REPL that abandoned it after some number of seconds would be
+  deciding for you that your program is wrong. Tooling cannot have that. A
+  completion, a doc lookup or a watch is a question asked on your behalf while you
+  are typing, and the honest answer to `the runtime is not answering` is to say so
+  at once - not to hold the editor until it does.
+
+  Replique reached the same place from the other end (repl_cljs.clj:346): its
+  :timeout-before-submitted exists so that a tooling evaluation gives up on the
+  QUEUE rather than on the evaluation, and it pays for the distinction with a
+  mutable submitted? flag and a cancel-then-get dance, because an executor will not
+  say whether a task has started. Both runtimes here are built on a permit instead,
+  which answers the question for free.
+
+  WHAT GIVING UP DOES NOT DO IS STOP THE JAVASCRIPT. Nothing can: a runtime is one
+  thread and a wedged form owns it until it returns. What ends is the WAIT, and
+  with it the caller's place in the queue - so a tooling question that timed out
+  costs the next one nothing."
+  (-evaluate-within [this js ms]
+    "-evaluate, except that it answers within roughly `ms` whatever the runtime
+    does. The timeout covers the wait for a turn and the turn itself, and an
+    evaluation that outlived it answers nobody: its result is dropped when it
+    arrives."))
+
+(def ^:private unbounded
+  {:status :error :phase :repl
+   :value  "This runtime cannot be asked to give up: it does not implement IJsDeadline."})
+
+(defn busy
+  "The answer when the deadline went by without the runtime ever becoming free.
+
+  Public, with timed-out below it, because both transports answer an IJsDeadline
+  caller and two runtimes saying the same thing two ways would make the distinction
+  below unreadable.
+
+  A DIFFERENT SENTENCE FROM timed-out, and the difference is the one that matters
+  to whoever reads it: nothing was sent. Something else is being evaluated - a form
+  at a prompt, most likely - and this question never got in front of the runtime at
+  all, so there is nothing running that this asked for."
+  [ms]
+  {:status :error :phase :repl
+   :value  (str "The runtime was busy for the whole " ms "ms: nothing was evaluated.")})
+
+(defn timed-out
+  "The answer when the script WAS sent and no result came back in time.
+
+  Which leaves it running - see IJsDeadline - and its result will be dropped."
+  [ms]
+  {:status :error :phase :repl
+   :value  (str "The runtime did not answer within " ms "ms.")})
+
+(def ^:private disconnected
+  {:status :error :phase :transport :value "The runtime disconnected."})
+
+(defn evaluate-within
+  "-evaluate-within where the runtime has it, and a refusal where it does not.
+
+  A refusal rather than a JVM-side timer around -evaluate, which is what the
+  obvious fallback would be and what makes it wrong: a timer bounds the WAIT and
+  not the queue, so the abandoned evaluation stays in front of every later one and
+  the second tooling question is as stuck as the first. A runtime that cannot be
+  asked to give up should say so rather than look as though it can."
+  [runtime js ms]
+  (if (satisfies? IJsDeadline runtime)
+    (-evaluate-within runtime js ms)
+    unbounded))
+
 (defn- broadcast!
   "-evaluate-all where the runtime has it, -evaluate where it does not."
   [runtime js]
   (if (satisfies? IJsRuntimes runtime)
     (-evaluate-all runtime js)
     (-evaluate runtime js)))
+
+;; --- what no turn owns ------------------------------------------------------
+
+(defn uncaught-text
+  "An error no evaluation was waiting for, as the runtime's output should carry it.
+
+  `content` is what the runtime sent on the :uncaught channel, which is the same
+  error result a form that threw produces - both are built by runtime.js's errorEdn,
+  so the message, the stack and *e are the ones a caught error would have had. The
+  difference is only that nobody asked, and so there is nowhere to RETURN it: it is
+  written where the runtime's output goes, beside the console.log it might well
+  have followed.
+
+  Symbolicated with `dir`, for the reason symbolicated gives below - the maps are
+  files in the output directory - and prefixed, because this line is the REPL
+  talking about the program rather than the program talking."
+  [dir content]
+  (let [{:keys [value stacktrace]} (try (edn/read-string content)
+                                        (catch Exception _ nil))
+        trace (stacktrace/trace dir stacktrace)]
+    (str ";; uncaught error: " (or value content) "\n"
+         (when-not (str/blank? trace) (str trace "\n")))))
 
 ;; --- compiling one input ----------------------------------------------------
 
@@ -718,43 +812,109 @@
            (bye)
            (throw (ex-info "The node runtime did not say it was ready."
                            {:got hello :dir (str dir)}))))
-       (reify
-         IJsRuntime
-         ;; One script out, and then every message back until the one that is the
-         ;; answer. A print is not an answer - it is something the script did on
-         ;; its way to having one - so it is written where the runtime's output
-         ;; goes and the read goes round again.
-         (-evaluate [_ js]
-           (doto w (.write ^String (json-string js)) (.write "\n") (.flush))
-           (loop []
-             (if-let [line (.readLine in)]
-               (let [msg (try (edn/read-string line)
-                              (catch Exception e
-                                {:type :result
-                                 :content (pr-str {:status :error :phase :transport
+       ;; A READER OF ITS OWN, where this used to read inside -evaluate.
+       ;;
+       ;; Two things made that untenable and the second is the one that decided it.
+       ;; A message that belongs to no turn - a console.log from a setTimeout, an
+       ;; uncaught error - arrived only when somebody next evaluated, so a runtime
+       ;; that printed while idle was silent until you typed. And a caller that
+       ;; gives up (IJsDeadline) has to leave the socket in a state the next caller
+       ;; can use, which a half-read line is not.
+       ;;
+       ;; So the socket has exactly one reader, for its whole life, and every
+       ;; message is handled the moment it arrives: output is written, and the one
+       ;; kind of message that IS an answer is handed to whoever is waiting.
+       (let [answers (LinkedBlockingQueue.)
+             permit  (Semaphore. 1 true)          ; fair, so callers keep their order
+             dead    (atom nil)
+             note!   (fn [^String s]
+                       (locking out (.write ^Writer out s) (.flush ^Writer out)))
+             ;; the permit goes with the abandoned result and not before it: an
+             ;; answer nobody is waiting for must not become the next caller's
+             abandon! (fn []
+                        (doto (Thread. (fn [] (try (.take answers)
+                                                   (finally (.release permit))))
+                                       "cljs-runtime-abandoned")
+                          (.setDaemon true)
+                          (.start)))]
+         (doto (Thread.
+                (fn []
+                  (loop []
+                    (if-let [line (try (.readLine in) (catch Exception _ nil))]
+                      (let [msg (try (edn/read-string line)
+                                     (catch Exception e
+                                       {:type :result
+                                        :content (pr-str
+                                                  {:status :error :phase :transport
                                                    :value (str "Unreadable message: "
                                                                (ex-message e))
                                                    :got line})}))]
-                 (case (:type msg)
-                   :print  (do (locking out
-                                 (.write ^Writer out ^String (str (:content msg)))
-                                 (.flush ^Writer out))
-                               (recur))
-                   :result (try
-                             (edn/read-string (:content msg))
-                             (catch Exception e
-                               {:status :error :phase :transport
-                                :value  (str "Unreadable result: " (ex-message e))
-                                :got    line}))
-                   ;; something this version does not know about. Skipped rather
-                   ;; than taken for an answer: a newer runtime saying more than
-                   ;; this asked for must not end the turn with a message that is
-                   ;; not the result.
-                   (recur)))
-               {:status :error :phase :transport
-                :value  "The runtime disconnected."})))
-         java.io.Closeable
-         (close [_] (bye)))))))
+                        (case (:type msg)
+                          :print    (note! (str (:content msg)))
+                          :uncaught (note! (uncaught-text dir (:content msg)))
+                          :result   (.put answers
+                                          (try (edn/read-string (:content msg))
+                                               (catch Exception e
+                                                 {:status :error :phase :transport
+                                                  :value (str "Unreadable result: "
+                                                              (ex-message e))
+                                                  :got line})))
+                          ;; something this version does not know about. Skipped
+                          ;; rather than taken for an answer: a newer runtime
+                          ;; saying more than this asked for must not end a turn
+                          ;; with a message that is not the result.
+                          nil)
+                        (recur))
+                      ;; End of stream: the process is gone. Said once to whoever
+                      ;; is waiting, and remembered, because every later caller has
+                      ;; to be told the same thing without waiting to find out.
+                      (do (reset! dead disconnected)
+                          (.put answers disconnected)))))
+                "cljs-runtime-reader")
+           (.setDaemon true)
+           (.start))
+         (let [evaluate*
+               (fn [js ms]
+                 (let [start (System/currentTimeMillis)]
+                   (if-let [d @dead]
+                     d
+                     (if-not (if ms
+                               (.tryAcquire permit ms TimeUnit/MILLISECONDS)
+                               (do (.acquire permit) true))
+                       (busy ms)
+                       ;; The permit is ours from here, and exactly one of four
+                       ;; things lets it go: the answer, the refusal below, the
+                       ;; write that failed, or abandon!.
+                       (try
+                         (if-let [d @dead]
+                           (do (.release permit) d)
+                           (do
+                             (doto w (.write ^String (json-string js))
+                                     (.write "\n") (.flush))
+                             (if-let [r (if ms
+                                          (.poll answers
+                                                 (max 0 (- ms (- (System/currentTimeMillis)
+                                                                 start)))
+                                                 TimeUnit/MILLISECONDS)
+                                          (.take answers))]
+                               (do (.release permit) r)
+                               (do (abandon!) (timed-out ms)))))
+                         ;; Reaching here means the script was written, because
+                         ;; nothing before the wait blocks: the answer is owed.
+                         (catch InterruptedException e
+                           (abandon!)
+                           (throw e))
+                         (catch java.io.IOException e
+                           (.release permit)
+                           {:status :error :phase :transport
+                            :value  (str "The runtime failed: " (ex-message e))}))))))]
+           (reify
+             IJsRuntime
+             (-evaluate [_ js] (evaluate* js nil))
+             IJsDeadline
+             (-evaluate-within [_ js ms] (evaluate* js ms))
+             java.io.Closeable
+             (close [_] (bye)))))))))
 
 ;; --- read, eval, print, loop ------------------------------------------------
 
@@ -784,14 +944,15 @@
   "Read, evaluate, print, loop, against `runtime`, until the input runs out.
 
     :ns            the namespace to start in, default wherever the caller is
+    :main          a namespace to require before the first prompt, if any
     :in            what to read from, default *in*
     :out           where to print, default *out*
     :out-dir       the compiled output directory - the SAME one the runtime fetches
                    modules from, or require would compile where nothing looks
     :source-paths  where .cljs files are found, default the classpath directories
 
-  The last two are what require, load-file and :reload need, and nothing else does;
-  node-repl below fills them in.
+  :out-dir and :source-paths are what require, load-file and :reload need, and
+  nothing else does; node-repl below fills them in.
 
   THE CURSOR IS THIS LOOP'S, not the compile environment's (env/*current-ns*): a
   second REPL on the same environment sees the same vars and keeps its own idea of
@@ -819,6 +980,28 @@
       ;; while a compiler is being built and a poor one to hand a user.
       (when (:out-dir opts)
         (driver/compile-namespace! cenv 'cljs.core eval-opts))
+      ;; AND THE PROGRAM, WHEN THERE IS ONE. A REPL started on a namespace is
+      ;; started on what is in it, which is two things and both of them wanted: the
+      ;; compile, which is the slow half - your whole dependency graph - and which
+      ;; happening here is why the first form you type is not the one that pays for
+      ;; it; and the require, which is what puts the program in the RUNTIME rather
+      ;; than merely on disk. It is Replique's (cljs-repl 'my.app), whose
+      ;; ensure-compiled did only the first half because its browser transport had
+      ;; nowhere to ship to until a page was there.
+      ;;
+      ;; QUIET WHEN IT WORKED, because nothing asked: a value printed here would sit
+      ;; above the first prompt under no form. A failure is printed, and has to be -
+      ;; a REPL whose :main silently did nothing is one standing in a program that
+      ;; is not loaded. A browser with no page open says it has no page, which is
+      ;; the sentence any form gets there and the useful one, since it names the URL
+      ;; to open; the namespace is compiled either way, so requiring it again once
+      ;; the page is there costs nothing.
+      ;;
+      ;; IT DOES NOT MOVE THE CURSOR. :ns is for that, they are separable, and a
+      ;; caller that wants both says both - which is also what Replique did.
+      (when-let [m (:main opts)]
+        (let [r (eval-form cenv runtime (list 'require (list 'quote m)) eval-opts)]
+          (when (= :error (:status r)) (print-result! wr r))))
       (loop []
         (doto wr (.write (str env/*current-ns* "=> ")) (.flush))
         (let [[form text] (try
@@ -842,6 +1025,7 @@
                    is given
     :source-paths  where .cljs files are found, default the classpath directories
     :ns            the namespace to start in, default cljs.user
+    :main          a namespace to require before the first prompt, if any
     :in :out       as repl takes them
     :program-out   where the runtime's own output goes, default :out
 
@@ -850,7 +1034,7 @@
   compile somewhere nothing looks if they differed. Wiring them by hand is still
   available - this is node-runtime and repl, in that order, over one directory."
   ([] (node-repl nil))
-  ([{:keys [dir source-paths ns in out program-out]
+  ([{:keys [dir source-paths ns main in out program-out]
      :or   {ns 'cljs.user in *in* out *out*}}]
    ;; THE CURSOR IS ESTABLISHED HERE, before anything that moves it. env/compile-env
    ;; positions itself with set-current-ns!, which is a set! and so needs a binding
@@ -865,6 +1049,6 @@
            cenv      (env/compile-env {:ns ns :core-macros 'cljs.core})]
        (try
          (with-open [rt (node-runtime {:dir d :out (or program-out out)})]
-           (repl cenv rt {:ns ns :in in :out out
+           (repl cenv rt {:ns ns :main main :in in :out out
                           :out-dir d :source-paths source-paths}))
          (finally (when own (delete-tree! own))))))))

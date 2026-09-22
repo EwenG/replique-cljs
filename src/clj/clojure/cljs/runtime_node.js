@@ -10,7 +10,7 @@
 // The wire, one line each way:
 //
 //   JVM -> here   a JSON string literal holding the script to evaluate
-//   here -> JVM   an EDN map, {:type :result/:print :content "..."}
+//   here -> JVM   an EDN map, {:type :result/:print/:uncaught :content "..."}
 //
 // Neither side parses its own hard format. The JVM writes JSON, which node reads
 // with JSON.parse; node writes EDN, which the JVM reads with clojure.edn. Both
@@ -24,7 +24,7 @@
 // to notice.
 
 import net from "node:net";
-import { evaluate, print as printValue } from "./runtime.js";
+import { errorEdn, evaluate, print as printValue } from "./runtime.js";
 
 // JSON.stringify of a string is a valid EDN string literal - the escapes EDN
 // knows are a superset of the ones V8 emits - which is what lets a result travel
@@ -90,6 +90,43 @@ function captureConsole() {
     };
   }
 }
+
+// --- what no turn owns -------------------------------------------------------
+//
+// An exception thrown out of a setTimeout callback, or a promise nobody caught,
+// belongs to no evaluation: the form that scheduled the work answered long ago.
+// Node's default for the first is to print it and EXIT, which under a REPL is the
+// worst of both - the runtime disappears, and the next form you type reports a
+// broken connection rather than the mistake that broke it.
+//
+// So both are taken and sent on the :uncaught channel. It is the same error result
+// a form that throws produces, built by the same errorEdn, and that is deliberate:
+// an error nobody was waiting for should read the way one that was reads, down to
+// leaving what was thrown in *e.
+//
+// TAKING uncaughtException IS ALSO WHAT KEEPS THE PROCESS ALIVE, and that is a
+// departure from node's default made on purpose. The browser is the argument: a
+// page that throws in an event handler stays open, and a REPL whose two hosts
+// disagree about whether a stray exception ends the session would be a REPL you
+// could not reason about. Node's warning that state may be inconsistent after an
+// uncaught exception is true and the answer to it is to restart the REPL - which
+// is a choice you can only make if you are still there to make it.
+function reportUncaught(e) {
+  // console.error rather than nothing when the socket cannot take it: captureConsole
+  // falls back to the original, so this lands on the process's stdout, which is the
+  // channel the JVM pumps and the only one left before the connection or after it
+  // broke.
+  if (!send(message("uncaught", errorEdn(e)))) console.error(e);
+}
+
+process.on("uncaughtException", reportUncaught);
+// BELT AND BRACES, and knowingly: node's default is --unhandled-rejections=throw,
+// which raises the rejection's reason as an uncaught exception, so the handler
+// above already takes it and a test that removes only this line sees no change.
+// What this line buys is independence from that flag - under `warn` or `none` a
+// dropped rejection would otherwise never reach the REPL at all - and the cost of
+// it is one line.
+process.on("unhandledRejection", reportUncaught);
 
 // One turn at a time. Evaluation is async, so two lines arriving in one chunk
 // would otherwise be evaluated concurrently and answered out of order - and the

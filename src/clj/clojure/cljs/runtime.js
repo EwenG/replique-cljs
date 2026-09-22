@@ -342,6 +342,26 @@ function rememberError(e) {
   } catch (_) { /* no cljs.core yet, or a frozen namespace object; not worth a turn */ }
 }
 
+// One failure, as the wire spells it, and the ONE place that decides how.
+//
+// EXPORTED, because a turn is not the only way a program can fail. An exception
+// thrown out of a setTimeout callback, a rejected promise nobody caught, an error
+// in an event handler - none of them belongs to an evaluation, because the form
+// that scheduled the work answered long ago. Each host transport watches for those
+// and hands them here, so that an error nobody was waiting for is reported exactly
+// as one that was: same message, same stack, same *e. What differs is only which
+// channel carries it, and that is the transport's business rather than this one's.
+export function errorEdn(e) {
+  // *e holds what was THROWN, not what it printed as, so (ex-data *e) works.
+  rememberError(e);
+  // JavaScript lets you throw anything. String() on a thrown object gives
+  // "[object Object]", which tells a REPL user nothing, so anything that is not
+  // an Error goes through the printer like any other value.
+  return resultEdn("error",
+                   e instanceof Error ? e.name + ": " + e.message : print(e),
+                   (e && e.stack) ? String(e.stack) : "");
+}
+
 // Evaluate one script and say what happened. Never throws: a REPL turn that ends
 // without an answer would leave the JVM waiting on a line that is not coming.
 export async function evaluate(src) {
@@ -350,14 +370,7 @@ export async function evaluate(src) {
     // as a rejection, which is why the unit itself carries no try/catch (§5).
     return resultEdn("success", print(await $eval(src)));
   } catch (e) {
-    // *e holds what was THROWN, not what it printed as, so (ex-data *e) works.
-    rememberError(e);
-    // JavaScript lets you throw anything. String() on a thrown object gives
-    // "[object Object]", which tells a REPL user nothing, so anything that is not
-    // an Error goes through the printer like any other value.
-    return resultEdn("error",
-                     e instanceof Error ? e.name + ": " + e.message : print(e),
-                     (e && e.stack) ? String(e.stack) : "");
+    return errorEdn(e);
   }
 }
 

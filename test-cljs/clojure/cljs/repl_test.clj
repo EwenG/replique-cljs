@@ -22,7 +22,7 @@
             [clojure.cljs.source-map :as sm]
             [clojure.cljs.test-harness :as h]
             [clojure.string :as str]
-            [clojure.test :refer [is testing use-fixtures]])
+            [clojure.test :refer [deftest is testing use-fixtures]])
   (:import [clojure.lang Namespace]
            [java.io StringReader StringWriter]))
 
@@ -763,3 +763,105 @@
             (vals-in p "(require 'app.core '[greeter :as g] :reload) (a/use-it)")))
      ;; and :reload-all still ships the whole graph, which is the contrast
      (is (= ["nil" "105"] (vals-in p "(require 'app.core :reload-all) (a/use-it)"))))))
+
+;; --- errors no turn owns, and callers who give up ---------------------------
+;;
+;; Two things that look unrelated and share a mechanism: the socket has a reader of
+;; its own now (see node-runtime), which is what lets a message arriving while
+;; nothing is being evaluated be acted on at once, and what lets a caller stop
+;; waiting without leaving a half-read line behind.
+
+(defn- waited-for
+  "`program-out` once it contains `s`, or nil after two seconds. Output travels on
+  its own thread, so a test that looked once would be asking before the answer."
+  [s]
+  (loop [n 0]
+    (cond (str/includes? (str program-out) s) (str program-out)
+          (< 40 n) nil
+          :else (do (Thread/sleep 50) (recur (inc n))))))
+
+(h/deftest-when h/node? test-an-error-no-turn-owns-is-reported-and-the-runtime-lives
+  ;; The form that scheduled the timer answered long ago, so there is nobody to
+  ;; return the throw to: it goes where the runtime's output goes. And the runtime
+  ;; is still there afterwards, which under node's own default it would not be -
+  ;; an uncaught exception ends the process, and the next form you typed would
+  ;; report a broken connection rather than the mistake that broke it.
+  (values 'stray.core "(js/setTimeout (fn [] (throw (js/Error. \"a stray throw\"))) 10)")
+  (is (waited-for ";; uncaught error: Error: a stray throw") (str program-out))
+  (is (= ["7"] (values 'stray.core "(+ 3 4)"))))
+
+(h/deftest-when h/node? test-a-promise-nobody-caught-is-reported-too
+  ;; The other half, and it needs its own handler: a rejection is not an exception.
+  ;; The promise is created and dropped rather than returned, because a returned one
+  ;; is awaited by the turn (§5) and so is caught after all - that one comes back as
+  ;; an ordinary error result.
+  (values 'stray.core
+          "(js* \"(function(){ Promise.reject(new Error('a dropped promise')); return 1; })()\")")
+  (is (waited-for ";; uncaught error: Error: a dropped promise") (str program-out)))
+
+(h/deftest-when h/node? test-the-runtime-can-print-while-nothing-is-being-evaluated
+  ;; What the socket's own reader bought. The turn that scheduled this ended before
+  ;; the timer fired, and nothing is evaluated afterwards: a transport that read
+  ;; only inside -evaluate would hold the line until somebody typed again.
+  (values 'idle.core "(js/setTimeout (fn [] (js/console.log \"said while idle\")) 200)")
+  (is (waited-for "said while idle") (str program-out)))
+
+(h/deftest-when h/node? test-a-caller-that-gives-up-says-which-way-it-gave-up
+  ;; The distinction IJsDeadline exists for, and the two sentences are different
+  ;; facts: the first call's script is running in the runtime, the second's never
+  ;; got in front of it. Only the first leaves anything behind.
+  (let [wedge "(async function(){ const s = Date.now(); while (Date.now() - s < 3000) {} return 111; })()"
+        first-r (repl/evaluate-within *runtime* wedge 300)
+        busy-r  (repl/evaluate-within *runtime* "(async function(){ return 1; })()" 200)]
+    (is (= :error (:status first-r)))
+    (is (str/includes? (:value first-r) "did not answer within 300ms") (:value first-r))
+    (is (= :error (:status busy-r)))
+    (is (str/includes? (:value busy-r) "busy for the whole 200ms") (:value busy-r))
+    ;; AND THE ABANDONED ANSWER GOES NOWHERE. It is still coming - nothing can stop
+    ;; JavaScript - and the next evaluation must not be handed it: 111 is what the
+    ;; wedge returns and 14 is what was asked for.
+    (is (= ["14"] (values 'gaveup.core "(+ 7 7)")))))
+
+(h/deftest-when h/node? test-a-bounded-call-that-fits-is-an-ordinary-evaluation
+  (is (= {:status :success :value "99"}
+         (repl/evaluate-within *runtime* "(async function(){ return 99; })()" 15000))))
+
+(deftest test-a-runtime-that-cannot-be-asked-to-give-up-says-so
+  ;; Rather than a JVM-side timer around -evaluate, which would bound the wait and
+  ;; not the queue - see evaluate-within.
+  (let [rt (reify repl/IJsRuntime (-evaluate [_ _] {:status :success :value "1"}))
+        r  (repl/evaluate-within rt "1" 10)]
+    (is (= :error (:status r)))
+    (is (str/includes? (:value r) "IJsDeadline") (:value r))))
+
+;; --- starting on a namespace ------------------------------------------------
+
+(h/deftest-when h/node? test-a-repl-started-on-a-namespace-has-it-loaded
+  ;; Replique's (cljs-repl 'my.app), and the half its ensure-compiled could not
+  ;; do: the program is in the RUNTIME before the first prompt, so the first
+  ;; thing you ask about it answers without a require you had to remember.
+  (with-project*
+   two-files
+   (fn [{:keys [cenv rt opts]}]
+     (let [out (StringWriter.)]
+       (repl/repl cenv rt (merge opts {:ns 'main.here :main 'app.core
+                                       :in (StringReader. "(app.core/use-it)\n")
+                                       :out out}))
+       ;; nothing above the first prompt: there was no form, so there is no value
+       (is (= "main.here=> 42\nmain.here=> \n" (str out)))))))
+
+(h/deftest-when h/node? test-a-main-that-will-not-load-is-said-before-the-first-prompt
+  ;; And has to be: a REPL whose :main silently did nothing is one standing in a
+  ;; program that is not loaded.
+  (with-project*
+   two-files
+   (fn [{:keys [cenv rt opts]}]
+     (let [out (StringWriter.)]
+       (repl/repl cenv rt (merge opts {:ns 'main.bad :main 'no.such.program
+                                       :in (StringReader. "(+ 1 2)\n")
+                                       :out out}))
+       (is (str/starts-with? (str out) "error") (str out))
+       ;; named as the file it looked for, which is what the compile knows
+       (is (str/includes? (str out) "no/such/program.cljs") (str out))
+       (is (str/includes? (str out) "main.bad=> 3\n")
+           "and the repl is a repl anyway")))))

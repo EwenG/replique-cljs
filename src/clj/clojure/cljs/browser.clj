@@ -473,36 +473,59 @@
 (defn- evaluate!
   "Run `js` on a virtual thread of its own, one evaluation at a time, and wait for
   the answer. `all?` sends it to every connected page instead of only the one
-  evaluation targets.
+  evaluation targets. `ms` bounds the wait, or nil does not bound it.
 
   The thread is ours rather than the caller's, which is the property that makes
   ending a session safe: a refresh interrupts threads this namespace made, never one
   it was handed. Doing the work on the calling thread would be less machinery and
-  would put an interrupt on the REPL loop."
-  [state ^Writer out js all?]
+  would put an interrupt on the REPL loop.
+
+  AND IT IS WHAT MAKES A DEADLINE POSSIBLE AT ALL (repl/IJsDeadline). Giving up is
+  interrupting that thread, which does the right thing in both places it can be:
+  one still parked on the permit leaves the queue without ever having sent
+  anything, and one that has sent its script stops waiting for the page and lets
+  the permit go, so the evaluation behind it is not held up by a question nobody is
+  listening to the answer to any more. The script itself goes on running in the
+  page - nothing can stop JavaScript - and its result is dropped when it arrives,
+  because the turn it would have completed was forgotten on the way out (see
+  finish-turn!).
+
+  WHICH OF THE TWO IT WAS is worth reporting rather than eliding, so the worker
+  says when it has started: a question that never got in front of the browser and
+  one the browser is still chewing on are different situations for whoever asked."
+  [state ^Writer out js all? ms]
   (let [{:keys [permit workers threads]} @state
-        answer (CompletableFuture.)
-        body   (fn []
-                 (let [me (Thread/currentThread)]
-                   (.add ^java.util.Set workers me)
-                   (try
-                     (.acquire ^Semaphore permit)
-                     (try
-                       (.complete answer (turn state out js all?))
-                       (finally (.release ^Semaphore permit)))
-                     (catch InterruptedException _
-                       (.complete answer (or (:reason @state) broken)))
-                     (catch Throwable t
-                       (.complete answer {:status :error :phase :transport
-                                          :value (str "The runtime failed: "
-                                                      (ex-message t))}))
-                     (finally
-                       (.remove ^java.util.Set workers me)
-                       ;; a future nobody completed is a caller who never returns
-                       (.complete answer broken)))))]
-    (.start ^Thread (.newThread ^ThreadFactory threads ^Runnable body))
+        answer  (CompletableFuture.)
+        started (volatile! false)
+        body    (fn []
+                  (let [me (Thread/currentThread)]
+                    (.add ^java.util.Set workers me)
+                    (try
+                      (.acquire ^Semaphore permit)
+                      (try
+                        (vreset! started true)
+                        (.complete answer (turn state out js all?))
+                        (finally (.release ^Semaphore permit)))
+                      (catch InterruptedException _
+                        (.complete answer (or (:reason @state) broken)))
+                      (catch Throwable t
+                        (.complete answer {:status :error :phase :transport
+                                           :value (str "The runtime failed: "
+                                                       (ex-message t))}))
+                      (finally
+                        (.remove ^java.util.Set workers me)
+                        ;; a future nobody completed is a caller who never returns
+                        (.complete answer broken)))))
+        worker  (.newThread ^ThreadFactory threads ^Runnable body)]
+    (.start ^Thread worker)
     (try
-      (.get answer)
+      (if ms
+        (try
+          (.get answer ms TimeUnit/MILLISECONDS)
+          (catch TimeoutException _
+            (.interrupt ^Thread worker)
+            (if @started (repl/timed-out ms) (repl/busy ms))))
+        (.get answer))
       (catch InterruptedException _ (.interrupt (Thread/currentThread)) broken)
       (catch ExecutionException e
         {:status :error :phase :transport
@@ -528,13 +551,21 @@
   with no turn open is dropped - it answered late, or it answered something nobody
   asked. A print is taken from any page at all, with or without a turn: output is
   not an answer to anything, and a tab someone still has open is a console someone
-  may still be watching."
-  [state ^Writer out conn text]
+  may still be watching.
+
+  AND AN UNCAUGHT ERROR IS TAKEN ON THE SAME TERMS AS A PRINT, because it is the
+  same kind of thing: an exception out of an event handler or a promise nobody
+  caught belongs to no turn, so there is nobody to return it to and the only place
+  for it is the output. Symbolicated on the way (repl/uncaught-text) - the maps are
+  in the directory this server serves, so the frames can be read back as
+  ClojureScript exactly as a caught error's are."
+  [state ^File dir ^Writer out conn text]
   (let [{:keys [type content]} (edn/read-string text)]
     (case type
-      :result (when-let [^CompletableFuture p (get (:pending @state) conn)]
-                (.complete p (edn/read-string content)))
-      :print  (on-print! out content)
+      :result   (when-let [^CompletableFuture p (get (:pending @state) conn)]
+                  (.complete p (edn/read-string content)))
+      :print    (on-print! out content)
+      :uncaught (on-print! out (repl/uncaught-text dir content))
       nil)))
 
 ;; --- serving the output directory, continued -------------------------------
@@ -676,7 +707,7 @@
                     {:port     ws-port
                      :token    token
                      :on-open  (fn [conn req] (start-session! srv conn req))
-                     :on-text  (fn [conn text] (on-text! srv out conn text))
+                     :on-text  (fn [conn text] (on-text! srv dir out conn text))
                      :on-close (fn [conn _] (close-session! srv conn))})
          ;; A VIRTUAL THREAD PER REQUEST. Less load-bearing than it was - the
          ;; twenty-second held poll it was chosen for is gone - but still right for
@@ -694,13 +725,19 @@
      (reify
        repl/IJsRuntime
        (-evaluate [_ js]
-         (or (nobody-connected url srv) (evaluate! srv out js false)))
+         (or (nobody-connected url srv) (evaluate! srv out js false nil)))
+       repl/IJsDeadline
+       ;; What tooling asks with, and the reason the permit is a permit: a
+       ;; completion or a watch must not wait behind the form you are running, and
+       ;; tryAcquire says whether it would have to.
+       (-evaluate-within [_ js ms]
+         (or (nobody-connected url srv) (evaluate! srv out js false ms)))
        repl/IJsRuntimes
        ;; the load path. Every page gets the script; the one evaluation targets is
        ;; the one whose answer is the answer. See this namespace's "who is
        ;; connected" note and repl/IJsRuntimes.
        (-evaluate-all [_ js]
-         (or (nobody-connected url srv) (evaluate! srv out js true)))
+         (or (nobody-connected url srv) (evaluate! srv out js true nil)))
        (-pages [_] (pages-of srv))
        (-select-page! [_ id] (select-page! srv id))
        clojure.lang.ILookup
@@ -733,6 +770,9 @@
     :ws-port       what the socket listens on, default 0
     :source-paths  where .cljs files are found, default the classpath directories
     :ns            the namespace to start in, default cljs.user
+    :main          a namespace to require before the first prompt, if any. A page
+                   that is not open yet cannot be given it, and says so - the
+                   compile happens either way
     :in :out       as clojure.cljs.repl/repl takes them
     :program-out   where the page's console output goes, default :out
 
@@ -744,7 +784,7 @@
   evaluated before a page connects says so and the REPL goes on, which is what lets
   you start the REPL first and open the page when you get to it."
   ([] (browser-repl nil))
-  ([{:keys [dir port ws-port source-paths ns in out program-out]
+  ([{:keys [dir port ws-port source-paths ns main in out program-out]
      :or   {ns 'cljs.user in *in* out *out*}}]
    ;; The cursor is established here, for the reason repl/node-repl says.
    (env/with-current-ns ns
@@ -758,7 +798,7 @@
            (doto ^Writer out
              (.write (str "Waiting for a browser on " (:url rt) "\n"))
              (.flush))
-           (repl/repl cenv rt {:ns ns :in in :out out
+           (repl/repl cenv rt {:ns ns :main main :in in :out out
                                :out-dir d :source-paths source-paths}))
          (finally (when own (delete-tree! own))))))))
 
