@@ -43,13 +43,35 @@
   another describes a region nobody wrote. ClojureScript's own pass merges them
   key by key and can mix them; this one takes the group or leaves it.
 
-  WHAT USES IT: nothing yet, and that is worth saying plainly. It is the
-  precondition for doc/cljs-repl.md R2's symbolicated stacks - a source map needs a
-  source position for every emitted thing - and the half that is still missing is
-  provenance through the emitter, which returns strings with no node attached
-  (§5.1). Error messages would want the positions DURING analysis instead, which is
-  a different and larger change: it means threading them through every analyze call
-  rather than walking once at the end.
+  WHAT USES IT, and it is the head of a chain rather than a pass standing on its
+  own. Two callers run it between analysis and emission: clojure.cljs.driver, on
+  every top-level form of a module, and clojure.cljs.repl, on a typed form when
+  there is an output directory to write to and the form has a line at all. The
+  emitter then attributes each LINE of JavaScript it builds to the position of the
+  node it came from (clojure.cljs.source-map's Src, §5.43), sm/encode writes the
+  .js.map beside the .js, and clojure.cljs.stacktrace reads one back with sm/decode
+  so that
+
+      at demo$core$boom (file:///tmp/out/ns/demo/core.js:9:10)
+
+  reads
+
+      at demo.core/boom (demo/core.cljs:5:12)
+
+  which is doc/cljs-repl.md R2's symbolicated stacks, closed at §5.45. SO A NODE
+  WITH NO POSITION HERE IS A LINE OF JAVASCRIPT A STACK TRACE CANNOT NAME. This
+  docstring said `nothing yet' for as long as that was true, which was most of the
+  way: the three pieces landed apart (§5.41, §5.43, §5.45) and not one of them is
+  worth anything without the other two.
+
+  WHAT STILL WANTS POSITIONS AND DOES NOT GET THEM: error messages, which would
+  need them DURING analysis rather than after it - a different and larger change,
+  because it means threading them through every analyze call rather than walking
+  once at the end. clojure.cljs.analyzer/analyze-seq does thread one, for a single
+  consumer - the &env a macro is handed, which carries :line because somebody
+  else's macro reads it (§5.66) - and carries it under a NAMESPACED key precisely
+  so that this pass remains the only thing a node's :line ever comes from. One
+  position on a node, from one place.
 
   Derived from clojure.tools.analyzer.passes.source-info, which is the same rule
   and the same trick for pushing it down. doc/cljs-compiler.md §5.41."}
