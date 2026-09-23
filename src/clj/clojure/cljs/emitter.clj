@@ -62,7 +62,7 @@
             ;; it: #js is a data reader, so a quoted #js form arrives here as the
             ;; marker type the reader wrapped it in
             [clojure.cljs.reader :as reader])
-  (:import [clojure.cljs.reader JSValue]))
+  (:import [cljs.tagged_literals JSValue]))
 
 (def ^:private str
   "clojure.core/str, composing the source positions of what it concatenates.
@@ -547,9 +547,11 @@
     (instance? java.util.UUID val)
     (str "(new " (core-name 'UUID) "(" (pr-str (str val)) ", "
          (emit-number (hash (str val))) "))")
-    ;; JSValue is a record, so it is a map: it has to be tested first
+    ;; Tested before the map test, which it no longer has to be: JSValue was a
+    ;; defrecord of ours and a record is a map (doc/cljs-compiler.md 5.68). The
+    ;; order stays as the defence it used to be the fix for.
     (instance? JSValue val)
-    (let [v (:val val)]
+    (let [v (.-val ^JSValue val)]
       (if (map? v)
         (js-object-js (keys v) (map const-js (vals v)))
         (js-array-js (map const-js v))))

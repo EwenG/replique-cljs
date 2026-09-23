@@ -26,7 +26,8 @@
             [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]])
-  (:import [clojure.lang LineNumberingPushbackReader]
+  (:import [cljs.tagged_literals JSValue]
+           [clojure.lang LineNumberingPushbackReader]
            [java.io File]
            [java.net URL URLClassLoader]))
 
@@ -167,13 +168,78 @@
         rdr  (reader/push-back-reader "#?(:clj :jvm :cljs :js) #js [1 2]")]
     ;; the platform feature is :cljs, so a reader conditional takes that branch
     (is (= :js (read-one cenv rdr)))
-    ;; and #js is wrapped, not built
-    (is (= (reader/->JSValue [1 2]) (read-one cenv rdr)))))
+    ;; and #js is wrapped, not built - in ClojureScript'S OWN marker type, which
+    ;; is a deftype and so has no value equality of its own: what there is to
+    ;; compare is the type and the form it carries, which is also all any reader
+    ;; of it ever asks (doc/cljs-compiler.md 5.68).
+    (let [v (read-one cenv rdr)]
+      (is (instance? JSValue v))
+      (is (= [1 2] (.-val ^JSValue v))))))
 
 (deftest test-read-eval-is-off
   (let [cenv (h/fresh-env)
         rdr  (reader/push-back-reader "#=(+ 1 1)")]
     (is (thrown? Exception (read-one cenv rdr)))))
+
+;; --- the #js marker is somebody else's type too ------------------------------
+
+(defmacro item-kind
+  "core.async's -item-to-ssa dispatch, transcribed - and it is the ORDER that
+  makes this worth a test rather than a spelling preference.
+
+  ioc_macros.clj rewrites every form in a (go ...) body into a state machine, so
+  it has to say what kind each form is, and it asks map? two lines before it asks
+  (instance? JSValue x). A #js literal whose marker is a RECORD answers the first
+  question - a record is a map - and #js {:a 1} is rewritten as
+  (hash-map :val {:a 1}): a ClojureScript map where a JavaScript object was
+  written, compiled clean and wrong at run time. Upstream can afford that order
+  because its JSValue is a deftype, and so can this compiler, now that it is the
+  same class (doc/cljs-compiler.md 5.68).
+
+  A macro in this file, because a :require-macros target is any JVM namespace -
+  which is what a third-party macro library is (analyzer-test's `twice' says the
+  same thing)."
+  [x]
+  (cond (symbol? x) ":symbol"
+        (seq? x)    ":list"
+        (map? x)    ":map"
+        (set? x)    ":set"
+        (vector? x) ":vector"
+        (instance? JSValue x) ":js-value"
+        :else       ":default"))
+
+(deftest test-the-js-marker-is-the-class-anyone-else-imports
+  ;; The one property the whole of 5.68 rests on: what read-js constructs is the
+  ;; class a macro's (:import [cljs.tagged_literals JSValue]) resolves to. Asked
+  ;; through Class/forName rather than through the import at the top of this file,
+  ;; because that is the question an importer is really asking - the name, off the
+  ;; classpath, with no help from us.
+  (let [cenv (h/fresh-env)
+        v    (read-one cenv (reader/push-back-reader "#js {:a 1}"))]
+    (is (instance? (Class/forName "cljs.tagged_literals.JSValue") v))
+    ;; and it is not a map, which is the half a defrecord got wrong
+    (is (not (map? v)))
+    (is (= {:a 1} (.-val ^JSValue v)))))
+
+(deftest test-a-macro-is-handed-a-js-literal-it-can-recognise
+  ;; End to end through the real reader, because the marker only exists on this
+  ;; path: #js is a data reader, and what a macro receives is whatever the reader
+  ;; wrapped the form in.
+  (let [expand (fn [src]
+                 (h/js (h/fresh-env 'cljs.user)
+                       (str "(ns app.ik (:require-macros"
+                            " [clojure.cljs.reader-test :refer [item-kind]]))\n"
+                            src)))]
+    (is (str/includes? (expand "(item-kind #js {:a 1})") "\":js-value\"")
+        "an object literal - the case a record answered :map for")
+    (is (str/includes? (expand "(item-kind #js [1 2])") "\":js-value\"")
+        "and an array literal, which answered :map too - a record is a map\n         whatever it wraps"))
+  ;; the kinds either side of it in the same cond still answer for themselves
+  (is (str/includes? (h/js (h/fresh-env 'cljs.user)
+                           (str "(ns app.ik2 (:require-macros"
+                                " [clojure.cljs.reader-test :refer [item-kind]]))\n"
+                                "(item-kind {:a 1})"))
+                     "\":map\"")))
 
 ;; --- readers the caller keeps -----------------------------------------------
 

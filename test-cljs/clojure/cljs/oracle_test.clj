@@ -16,7 +16,8 @@
   ;; unconditionally. Only the calls are gated.
   (:require [clojure.cljs.oracle :as o]
             [clojure.cljs.test-harness :as h]
-            [clojure.test :refer [are is use-fixtures]]))
+            [clojure.test :refer [are is use-fixtures]])
+  (:import [cljs.tagged_literals JSValue]))
 
 (use-fixtures :each h/cursor)
 
@@ -127,6 +128,21 @@
     \x
     #"ab"))
 
+(h/deftest-when h/cljs-analyzer? test-a-js-literal
+  ;; The literal this file could not ask about until 5.68, and the reason was not
+  ;; about either analyzer: the marker the reader wrapped it in was a defrecord of
+  ;; this compiler's own, so cljs.analyzer met an unknown RECORD - analyze-record,
+  ;; two lines above its JSValue test - and built something else entirely. The two
+  ;; now share ClojureScript's class, so the question can be put.
+  ;;
+  ;; Constructed rather than read, because `agree' takes a form and #js is a data
+  ;; reader: what the reader hands back IS one of these.
+  (is (true? (o/agree? [] (JSValue. {:a 1 "b" 2}))))
+  (is (true? (o/agree? [] (JSValue. [1 2]))))
+  ;; and the values are code in both, while the keys are not
+  (is (true? (o/agree? '[(def a nil)] (JSValue. {:a 'a}))))
+  (is (true? (o/agree? '[(def a nil)] (JSValue. ['a (list 'if 'a 1 2)])))))
+
 (h/deftest-when h/cljs-analyzer? test-mixed
   (agree '[(def o nil) (def x 1)]
     '(if (.-x o) (.y o) (new js/Error "no"))
@@ -149,11 +165,10 @@
   ;; analysed it, because building one calls into cljs.core. It is in test-quote
   ;; above now (doc/cljs-compiler.md §5.7).
   ;;
-  ;; #js is the one literal the oracle cannot ask about, and for a reason that is
-  ;; about the harness rather than about either analyzer: the marker the reader
-  ;; wraps it in is clojure.cljs.reader/JSValue, a class cljs.analyzer has never
-  ;; heard of, so it sees an unknown record and answers :const. The node shapes
-  ;; are pinned against its source in analyzer-test instead.
+  ;; There used to be a second one recorded here too, and it also closed: #js
+  ;; could not be asked about while the marker was a record of this compiler's
+  ;; own. It is ClojureScript's own class now, and test-a-js-literal above asks
+  ;; (doc/cljs-compiler.md 5.68).
 
   ;; letfn* self-reference. cljs.analyzer binds a name to its OUTER meaning
   ;;    while analysing that name's own init, so a self-call resolves to a var and

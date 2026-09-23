@@ -47,7 +47,10 @@
             ;; back for #js [1 2] is a marker type someone has to interpret, and
             ;; the reader's own docstring says that someone is not the reader
             [clojure.cljs.reader :as reader])
-  (:import [clojure.cljs.reader JSValue]
+  ;; ClojureScript'S JSValue, which is the one our reader constructs: the type is
+  ;; shared with every macro that has to recognise a #js literal in a body it is
+  ;; rewriting (clojure.cljs.reader/read-js, doc/cljs-compiler.md 5.68)
+  (:import [cljs.tagged_literals JSValue]
            [clojure.lang Namespace Var]))
 
 (declare analyze warning wrap-meta)
@@ -3259,7 +3262,7 @@
   property names, spelled the host's way like every other property (§5.3), so
   #js {:a 1} and #js {\"a\" 1} are the same object. Only the values are code."
   [cenv env form]
-  (let [v (:val form)]
+  (let [v (.-val ^JSValue form)]
     (if (map? v)
       {:op :js-object :form form :env env
        :keys (vec (keys v))
@@ -3291,9 +3294,14 @@
                              " constant"))
       (const-node env form))
 
-    ;; BEFORE the map test, and it has to be: JSValue is a record, and a record
-    ;; is a map. #js {:a 1} analyzed as a Clojure map literal would build a
-    ;; PersistentArrayMap of one entry whose key was :val.
+    ;; BEFORE the map test, and it no longer HAS to be - kept because the reason
+    ;; it had to be is a trap worth not re-laying. JSValue was a defrecord here
+    ;; once, and a record is a map, so #js {:a 1} reaching the map test first was
+    ;; analyzed as a Clojure map literal of one entry whose key was :val.
+    ;; ClojureScript's own JSValue is a deftype and is not a map, which is also
+    ;; why upstream can afford to test it last (analyzer.cljc, -item-to-ssa in
+    ;; core.async) - and why this compiler now shares the type rather than
+    ;; declaring a second one (doc/cljs-compiler.md 5.68).
     (instance? JSValue form) (analyze-js-value cenv env form)
 
     (vector? form) (analyze-vector cenv env form)

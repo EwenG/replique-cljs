@@ -33,13 +33,24 @@
  ;; without it clojure.cljs.browser will not load and a browser REPL is missing.
  ;; Maven also copies the .clj sources in there, which is why the order matters:
  ;; the live ones shadow the copies rather than the other way round.
- ;; src/compat LAST, and it is not the compiler. It holds ONE namespace named the
- ;; way ClojureScript names it - cljs.analyzer.api - because a macro namespace of
- ;; somebody else's requires it BY THAT NAME off the classpath, and this compiler
- ;; renamed it to clojure.cljs.analyzer-api. Without the file such a library does
- ;; not half-work, it does not load: `Could not locate cljs/analyzer/api.cljc on
- ;; classpath', which says nothing about a fork. hx's useSmartEffect is the one
- ;; that turns up.
+ ;; src/compat LAST, and it is not the compiler. It holds TWO namespaces named the
+ ;; way ClojureScript names them, for two different reasons.
+ ;;
+ ;; cljs.analyzer.api, because a macro namespace of somebody else's requires it BY
+ ;; THAT NAME off the classpath, and this compiler renamed it to
+ ;; clojure.cljs.analyzer-api. Without the file such a library does not half-work,
+ ;; it does not load: `Could not locate cljs/analyzer/api.cljc on classpath', which
+ ;; says nothing about a fork. hx's useSmartEffect is the one that turns up.
+ ;;
+ ;; cljs.tagged-literals, because what somebody else's macro wants from it is a
+ ;; CLASS - cljs.tagged_literals.JSValue, the marker #js reads to, which
+ ;; core.async's ioc_macros.clj imports and asks instance? about while it rewrites
+ ;; a (go ...) body. That one is ClojureScript's own file, vendored verbatim and
+ ;; forwarding nothing, and it is HERE rather than in src/clj for a reason of the
+ ;; same shape as the one below and not the same reason: a copy in src/clj loads
+ ;; from source into a DynamicClassLoader while the jar's AOT cljs.analyzer
+ ;; resolves that name to the class in the jar, which is two classes with one name
+ ;; in one jvm. See doc/cljs-compiler.md 5.68.
  ;;
  ;; THE DOCUMENTED DOOR AND ONLY IT, which is a fact about shape rather than a
  ;; preference: cljs.analyzer.api declares no dynamic var - it reads its own

@@ -85,6 +85,10 @@
    ;; through it for the same reason and had to change nothing.
    "cljs/reader.cljs"  #{}
    "cljs/instant.clj"  #{}
+   ;; cljs/tagged_literals.cljc is vendored too and is NOT in this map, because
+   ;; it is not on this classpath: it lives in src/compat, where a second copy of
+   ;; its JSValue cannot exist beside the jar's (doc/cljs-compiler.md 5.68).
+   ;; clojure.cljs.compat-test byte-compares it from disk instead.
 
    ;; --- cljs.spec.alpha and its two companions (M6) ---------------------------
    ;;
@@ -157,6 +161,17 @@
             gone   (into (sorted-set) (remove ours) theirs)]
         (is (= declared gone)
             (str path ": the adaptation and the declaration disagree"))))))
+
+(h/deftest-when cljs-jar? test-the-ones-declared-verbatim-are-byte-for-byte
+  ;; THE SET DIFFERENCE ABOVE ONLY SEES LINES THAT WENT. An entry declared #{} is
+  ;; a claim that the file is untouched, and adding a line to it - a comment, a
+  ;; def, a whole function - satisfies that test without being true. Byte equality
+  ;; is the assertion those entries were always making, so it is the one they get,
+  ;; and the list stays derived from the map rather than written twice.
+  (doseq [[path declared] declared-adaptations
+          :when (empty? declared)]
+    (testing path
+      (is (= (jar-copy path) (slurp (io/resource path)))))))
 
 (h/deftest-when cljs-jar? test-clojure-string-and-set-are-vendored-unmodified
   ;; cljs.test's runtime requires clojure.string, and half of ClojureScript's test

@@ -32,22 +32,43 @@
   env/*current-ns* as it processes each (ns ...) form."}
   clojure.cljs.reader
   (:require [cljs.instant]
+            ;; for JSValue alone, and requiring it is what makes the class LOAD:
+            ;; an :import does not load a namespace, and somebody else's macro
+            ;; imports this class without requiring anything that would
+            [cljs.tagged-literals]
             [clojure.cljs.env :as env]
             [clojure.cljs.macroexpand :as mx]
             [clojure.java.io :as io])
-  (:import [clojure.lang Compiler LispReader LispReader$Resolver
+  (:import [cljs.tagged_literals JSValue]
+           [clojure.lang Compiler LispReader LispReader$Resolver
             LineNumberingPushbackReader Namespace NamespaceWorld Symbol Var]
            [java.io Reader StringReader]))
 
 ;; --- #js ------------------------------------------------------------------
 
-(defrecord JSValue [val])
-
 (defn read-js
   "Data reader for #js. Wraps the form rather than building anything: what
-  #js [1 2] and #js {:a 1} become is the emitter's decision, not the reader's."
+  #js [1 2] and #js {:a 1} become is the emitter's decision, not the reader's.
+
+  THE MARKER IS ClojureScript'S OWN CLASS, and not a second one of ours, because
+  the question it answers is asked by code this project did not write. A macro
+  that rewrites the body it was handed has to recognise a #js literal on the way
+  past: core.async's ioc_macros.clj imports cljs.tagged_literals.JSValue and asks
+  `instance?' about every form it lifts into a state machine. A private marker
+  answers that question NO - and answers it SILENTLY, because upstream's dispatch
+  tests map? before it tests the class and a defrecord is a map, so #js {:a 1}
+  inside a (go ...) came out as (hash-map :val {:a 1}): a ClojureScript map where
+  a JavaScript object was written, compiled clean. ClojureScript's own
+  cljs/tagged_literals.cljc is vendored verbatim for this, in src/compat rather
+  than beside the compiler - two copies of a deftype in one jvm are two classes
+  with one name, which is this same bug read backwards. See
+  doc/cljs-compiler.md 5.68.
+
+  The TABLE below is still ours. Upstream's read-js also refuses an object literal
+  whose keys are not strings or unqualified keywords, and taking that on would be
+  a behaviour change nobody asked for - what was wanted is the type."
   [form]
-  (->JSValue form))
+  (JSValue. form))
 
 ;; --- resolution -----------------------------------------------------------
 

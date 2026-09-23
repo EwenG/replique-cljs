@@ -25,7 +25,8 @@
             [clojure.cljs.reader :as reader]
             [clojure.cljs.test-harness :as h]
             [clojure.test :refer [are deftest is testing use-fixtures]])
-  (:import [clojure.lang Namespace NamespaceWorld Var]))
+  (:import [cljs.tagged_literals JSValue]
+           [clojure.lang Namespace NamespaceWorld Var]))
 
 (use-fixtures :each h/cursor)
 
@@ -1771,15 +1772,16 @@
                                                  {:clojure.cljs.analyzer/no-resolve true}))))))))
 
 (deftest test-a-js-value-keeps-its-keys-unanalysed
-  ;; The one literal the AST oracle cannot ask about: #js arrives wrapped in
-  ;; clojure.cljs.reader/JSValue, a class cljs.analyzer has never heard of, so it
-  ;; sees an unknown record and answers :const. The shapes below are copied from
-  ;; cljs.analyzer/analyze-js-value, and this is where they are pinned.
-  (let [array (h/analyze (clojure.cljs.reader/->JSValue [1 2]))]
+  ;; The shapes below are copied from cljs.analyzer/analyze-js-value, and this is
+  ;; where they are pinned. The oracle used to be unable to ask about #js at all,
+  ;; because the marker was a record of this compiler's own that cljs.analyzer had
+  ;; never heard of and answered :const for; the marker is ClojureScript's own type
+  ;; now, so oracle-test asks it directly (doc/cljs-compiler.md 5.68).
+  (let [array (h/analyze (JSValue. [1 2]))]
     (is (= :js-array (:op array)))
     (is (= [:items] (:children array)))
     (is (= [:const :const] (mapv :op (:items array)))))
-  (let [object (h/analyze (clojure.cljs.reader/->JSValue {:a 1 :b 2}))]
+  (let [object (h/analyze (JSValue. {:a 1 :b 2}))]
     (is (= :js-object (:op object)))
     ;; only the values are code: a key is a JavaScript property name, so it is
     ;; carried across as it was written and never analysed

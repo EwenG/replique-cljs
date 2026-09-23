@@ -48,6 +48,8 @@
 
 (def ^:private compat-file (io/file compat-root "cljs" "analyzer" "api.clj"))
 
+(def ^:private marker-file (io/file compat-root "cljs" "tagged_literals.cljc"))
+
 (defn- forms
   "Every top level form of SRC, read but not evaluated. Reader conditionals are
   taken the way this jvm would take them, so that a .cljc reads as its :clj half.
@@ -182,6 +184,82 @@
                    pom)
           (str "the copy must run at prepare-package: earlier than that is before"
                " `test' and would put it on the test classpath")))))
+
+;;; The second file: a type rather than a forward
+
+(deftest test-the-js-marker-is-here-and-is-verbatim
+  ;; cljs/tagged_literals.cljc, and it is nothing like api.clj: it forwards
+  ;; nothing, it is ClojureScript's own file byte for byte, and what a consumer
+  ;; needs from it is a CLASS. #js is a data reader, so a macro that rewrites a
+  ;; body it was handed has to recognise the marker the reader wrapped a literal
+  ;; in - core.async's ioc_macros.clj opens
+  ;; (:import [cljs.tagged_literals JSValue]) and asks instance? about every form
+  ;; it lifts into a state machine (doc/cljs-compiler.md 5.68).
+  (is (.isFile marker-file) "cljs.tagged-literals is missing from src/compat")
+  (when h/cljs-analyzer?
+    (let [theirs (io/resource "cljs/tagged_literals.cljc")]
+      ;; read off the classpath, which here can only be the jar - that is the
+      ;; property the next test is about
+      (is (str/includes? (str theirs) ".jar!"))
+      (is (= (slurp theirs) (slurp marker-file))
+          "vendored verbatim, and the whole of what makes sharing the class safe"))))
+
+(h/deftest-when h/cljs-analyzer? test-the-js-marker-is-not-beside-the-compiler
+  ;; The same invariant as api.clj's and for a DIFFERENT reason, which is worth
+  ;; writing down because the first reason does not apply: nothing here shadows a
+  ;; name the oracle reads. .cljc against .cljc, and our copy is byte-identical
+  ;; anyway.
+  ;;
+  ;; What a copy in src/clj costs is a second CLASS. RT.load prefers the newer
+  ;; source, so ours loads from src/clj and `deftype' defines
+  ;; cljs.tagged_literals.JSValue into a DynamicClassLoader - while the jar's
+  ;; AOT-compiled cljs.analyzer resolves that same name, through its own defining
+  ;; loader, to the class in the jar. Two classes, one name, instance? false
+  ;; between them. Measured: with the file in src/clj the oracle answered :const
+  ;; for every #js literal, which is exactly the failure this whole section is
+  ;; about, one JVM over.
+  (is (nil? (some (fn [^java.net.URL u] (when-not (= "jar" (.getProtocol u)) u))
+                  (enumeration-seq
+                   (.getResources (.getContextClassLoader (Thread/currentThread))
+                                  "cljs/tagged_literals.cljc"))))
+      "src/compat must not be on the test classpath - and src/clj must not hold a copy")
+  (testing "so there is exactly one of the class in this jvm"
+    (is (= (Class/forName "cljs.tagged_literals.JSValue")
+           (class (@(requiring-resolve 'clojure.cljs.reader/read-js) {:a 1})))
+        "the reader constructs what an importer resolves")))
+
+(deftest test-a-consumer-gets-the-class-with-no-clojurescript-jar
+  ;; WHERE THE :require IN clojure.cljs.reader IS LOAD-BEARING, and the only place
+  ;; it can be seen from. An :import does not load a namespace, and this suite's
+  ;; classpath carries the ClojureScript jar, whose AOT
+  ;; cljs/tagged_literals/JSValue.class answers Class/forName whether or not
+  ;; anybody required cljs.tagged-literals. A project using this compiler has no
+  ;; such jar - replacing it is how the fork gets used at all - so there the class
+  ;; exists only once the namespace has loaded, and clojure.cljs.reader requiring
+  ;; it is what loads it. Drop that require and the very import core.async needs
+  ;; is a ClassNotFoundException again, for everyone except us.
+  ;;
+  ;; Another process, because a classpath cannot be taken away from a running one,
+  ;; and this is the one a consumer has: the jar out, src/compat in.
+  (let [java (str (io/file (System/getProperty "java.home") "bin" "java"))
+        cp   (->> (str/split (System/getProperty "java.class.path")
+                             (re-pattern (java.util.regex.Pattern/quote File/pathSeparator)))
+                  (remove #(re-find #"clojurescript-[^/]*\.jar$" %))
+                  (cons (.getPath compat-root))
+                  (str/join File/pathSeparator))
+        {:keys [out err exit]}
+        (sh/sh java "-classpath" cp "clojure.main" "-e"
+               (str "(require 'clojure.cljs.reader 'clojure.java.io)"
+                    "(println :jar (some? (clojure.java.io/resource \"cljs/analyzer.cljc\")))"
+                    "(println :class (.getName (Class/forName \"cljs.tagged_literals.JSValue\")))"
+                    "(println :same (= (Class/forName \"cljs.tagged_literals.JSValue\")"
+                    "                  (class (clojure.cljs.reader/read-js {:a 1}))))"))]
+    (is (zero? exit) (str out err))
+    (is (str/includes? out ":jar false")
+        (str "the ClojureScript jar was supposed to be off this classpath: " out))
+    (is (str/includes? out ":class cljs.tagged_literals.JSValue") (str out err))
+    (is (str/includes? out ":same true")
+        (str "and it is the class the reader constructs: " out))))
 
 ;;; What would rot without being noticed
 
