@@ -594,6 +594,14 @@
   that threw `>! used not in (go ...) block` at run time, which is the worst
   failure this compiler can have (doc/cljs-compiler.md §8, M5).
 
+  :line AND :column ARE A FOURTH SUCH KEY AND ARE NOT HERE, deliberately:
+  clojure.cljs.analyzer/analyze-seq merges them into the env it hands to
+  macroexpand-1, as ClojureScript's analyze-seq does, because a position belongs to
+  the form being analysed and a FRESH env has none - so a macro reads them off
+  `&env` and nothing reads them off this. Standing alone, this env describes a
+  namespace rather than a form and has no position to give
+  (doc/cljs-compiler.md §5.66).
+
   They are also what upstream's `excluded?` and `used?` ask for FIRST, before the
   compiler-state atom they fall back to - which is what keeps that atom a constant
   rather than a second copy of our symbol table. See

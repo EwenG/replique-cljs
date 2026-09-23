@@ -1018,6 +1018,29 @@
                     cenv (env/analysis-env cenv)
                     '(upstream-expansion-of (spec-checked "nope"))))))))
 
+(def ^:private called-at
+  "Where `record-position` was expanded, in order. An atom because the question is
+  about &env rather than about an expansion, and a macro that answers it by side
+  effect is the shortest way to read &env from outside the compiler."
+  (atom []))
+
+(defmacro record-position
+  "A macro that writes down where it was called, as one keying an i18n string or a
+  log line by source location does. Expands to nil, which is a constant the
+  analyzer accepts anywhere."
+  []
+  (swap! called-at conj [(:line &env) (:column &env)])
+  nil)
+
+(defmacro position-of-a-form-nobody-read
+  "Expands to a `record-position' call BUILT rather than read, so it carries no
+  metadata of its own and the position it reports can only have come from the env
+  it was handed. (list 'record-position) rather than a syntax-quote for the same
+  reason parse-deftype gives: a built form has no reader metadata, and here that
+  is the property under test rather than an accident."
+  []
+  (list 'record-position))
+
 (deftest test-the-analysis-env-carries-what-a-macro-reads
   ;; 5.55. Three keys that used to be part of `ClojureScript's shape, minus what
   ;; does not exist yet` and now exist, because somebody else's macro reads them.
@@ -1038,6 +1061,42 @@
       (is (= #{} (set (filter string? (vals (:requires ns-map))))))
       (is (= #{'time} (:excludes ns-map)))
       (is (= 'clojure.cljs.analyzer-test (get (:use-macros ns-map) 'twice))))))
+
+(deftest test-a-macro-is-told-where-it-was-called
+  ;; 5.66. :line and :column in &env, which ClojureScript's analyze-seq assocs on
+  ;; the way into macroexpand-1 and ours did not. A macro that records a source
+  ;; position - an i18n extractor keying a translation by file and line is the
+  ;; case that asked for it - reads (:line &env) there, and got nil.
+  ;;
+  ;; Three positions, because the interesting part is not the easy one:
+  ;;
+  ;;   line 3, a call the reader read, at the top level - (meta &form) would have
+  ;;           answered this one too;
+  ;;   line 5, the same call nested inside a `defn`, which is a MACRO: the body
+  ;;           forms pass through its expansion unrebuilt, so the position is
+  ;;           still the inner form's own and not the defn's;
+  ;;   line 6, a call built by another macro, which has no metadata at all - so
+  ;;           the only answer available is the enclosing form's line, inherited
+  ;;           through the env analyze-seq passes onward. THIS IS THE ONE
+  ;;           (meta &form) CANNOT ANSWER, and why the fallback is not cosmetic.
+  (reset! called-at [])
+  (let [cenv (h/core-env 'app.pos)
+        src (str "(ns app.pos\n"                                              ;; 1
+                 "  (:require-macros [clojure.cljs.analyzer-test\n"           ;; 2
+                 "                    :refer [record-position\n"              ;; 3
+                 "                            position-of-a-form-nobody-read]]))\n")
+        body (str "(record-position)\n"                                       ;; 3
+                  "(defn f []\n"                                              ;; 4
+                  "  (record-position))\n"                                    ;; 5
+                  "(position-of-a-form-nobody-read)\n")]                      ;; 6
+    (doseq [form (reader/read-forms cenv src)]
+      (h/analyze cenv form))
+    (reset! called-at [])
+    ;; read apart from the ns form so the line numbers in the comments above are
+    ;; the ones this string actually has
+    (doseq [form (reader/read-forms cenv (str "\n\n" body))]
+      (h/analyze cenv form))
+    (is (= [[3 1] [5 3] [6 1]] @called-at))))
 
 (h/deftest-when h/cljs-analyzer? test-a-macro-may-call-upstreams-analyzer
   ;; The whole of what core.async's `go` needed. With cljs.env/*compiler* unbound

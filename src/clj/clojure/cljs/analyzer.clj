@@ -3145,7 +3145,37 @@
                                        env/*current-ns* (removed-note sym))))))))))
 
 (defn- analyze-seq [cenv env form]
-  (let [form' (mx/macroexpand-1 cenv env form)]
+  ;; WHERE :line AND :column ENTER &env, and the only place they could: this is
+  ;; the sole call site of macroexpand-1 in the analyzer, so it is the sole moment
+  ;; at which an &env is handed to somebody else's code.
+  ;;
+  ;; A macro reads (:line &env) because it wants to record WHERE IT WAS CALLED -
+  ;; an i18n extractor keying a translation by file and line is the case that
+  ;; asked for this, and cljs.analyzer's analyze-seq (analyzer.cljc:4352) puts the
+  ;; two keys there for it. (meta &form) answers the same question and is already
+  ;; there, but only for a call the READER read: a macro call built by another
+  ;; macro's expansion carries no metadata at all, for the reason parse-deftype
+  ;; gives above - syntax-quote does not copy &form's. Hence the inheritance, and
+  ;; it is what &form alone cannot do.
+  ;;
+  ;; THE INHERITED POSITION TRAVELS UNDER A NAMESPACED KEY AND NOT AS :line, which
+  ;; is the whole difference between this and upstream's version. Upstream assocs
+  ;; :line and :column onto the env it threads onward, so every node it builds ends
+  ;; up carrying a position and its source maps are made of them. Here positions on
+  ;; nodes belong to clojure.cljs.source-info, which walks the finished tree with
+  ;; the same rule - own position, else the nearest enclosing one - and its own
+  ;; docstring says why analysis does not do it: `threading them through every
+  ;; analyze call' is a larger change than that pass, not a free side effect of
+  ;; this one. Two sources of truth for a node's line is the failure to avoid, and
+  ;; ::position is invisible to source-info's position-keys and to the emitter's
+  ;; node-pos, so there is only ever one.
+  ;;
+  ;; :line and :column MOVE AS A GROUP, and a form has a position at all only if it
+  ;; has a :line - source-info/own-position reads reader metadata the same way.
+  (let [m   (meta form)
+        pos (if (:line m) (select-keys m [:line :column]) (::position env))
+        env (cond-> env pos (assoc ::position pos))
+        form' (mx/macroexpand-1 cenv (merge env pos) form)]
     (if-not (identical? form form')
       (analyze cenv env form')
       (let [op (first form)]
