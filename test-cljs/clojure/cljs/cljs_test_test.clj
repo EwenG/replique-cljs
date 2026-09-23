@@ -275,6 +275,71 @@
       (testing "get-options is empty and cljs.test defaults around it"
         (is (= {} (api/get-options)))))))
 
+;; --- and the one sci asks ----------------------------------------------------
+
+(deftest test-ns-publics-is-the-interns-a-sandbox-may-copy
+  ;; cljs.analyzer.api's eighth name, and not one cljs.test asks for.
+  ;; sci.core/copy-ns lifts a namespace into a sandbox wholesale, and the branch of
+  ;; that macro which runs inside the ClojureScript compiler reads its list through
+  ;; this name. nosco-gamma is the caller that found it missing:
+  ;; (sci/copy-ns cljs.math (sci/create-ns 'clojure.math)), so that sandboxed
+  ;; surface code can call clojure.math/round without reaching js/Math.
+  (let [cenv (h/core-env 'app.pub)]
+    (h/js cenv "(def a 1) (def ^:private hidden 2) (defn- f [] 3) (defn g [] 4)")
+    (binding [env/*cenv* cenv]
+      (is (= #{'a 'hidden 'f 'g} (set (keys (api/ns-interns 'app.pub))))
+          "ns-interns is everything the namespace holds")
+      (is (= #{'a 'g} (set (keys (api/ns-publics 'app.pub))))
+          "and ns-publics is what another namespace may name")
+      ;; BOTH SPELLINGS OF PRIVATE, because they are two macros and only one of
+      ;; them is the one anybody writes by hand
+      (is (nil? (get (api/ns-publics 'app.pub) 'hidden)) "^:private on a def")
+      (is (nil? (get (api/ns-publics 'app.pub) 'f)) "defn-")
+      ;; the var maps are the SAME maps ns-interns gives, which is what copy-ns
+      ;; needs: it reads :arglists and :doc off them to rebuild the var in the
+      ;; sandbox
+      (is (= (select-keys (api/ns-interns 'app.pub) '[a g])
+             (api/ns-publics 'app.pub)))
+      ;; a namespace that is not there is empty rather than an error, as
+      ;; ClojureScript's is - it merges two absent maps and gets one
+      (is (= {} (api/ns-publics 'no.such.ns))))))
+
+(deftest test-a-var-map-carries-its-metadata-twice
+  ;; ClojureScript's parse-def merges sym-meta into the var map AND puts it under
+  ;; :meta beside it (analyzer.cljc:2050). Both spellings therefore have readers,
+  ;; and the second one is not decoration: sci.core/copy-ns walks the publics with
+  ;;
+  ;;     (if-let [m (:meta var)] (assoc ns-map ...) ns-map)
+  ;;
+  ;; so a var map with no :meta is DROPPED rather than mis-copied. Without this key
+  ;; (sci/copy-ns cljs.math ...) compiled to (-copy-ns {} the-ns) - an empty
+  ;; sandbox namespace, no warning, no error, and forty-five functions missing at
+  ;; run time. The flat keys alone pass every other test in this file.
+  (let [cenv (h/core-env 'app.twice)]
+    (h/js cenv "(defn ^{:doc \"d\" :arglists '([x])} f [x] x)")
+    (binding [env/*cenv* cenv]
+      (let [v (get (api/ns-publics 'app.twice) 'f)]
+        (is (some? (:meta v)) "the key copy-ns looks for")
+        (is (= "d" (:doc v) (:doc (:meta v))) "and it holds the same metadata")
+        (is (= (:line v) (:line (:meta v))))
+        ;; THE NESTED COPY IS READABLE, because copy-ns quotes it into emitted
+        ;; code. (meta v) holds a clojure.lang.Namespace under :ns - a real Var
+        ;; always does, and upstream's :meta is a symbol's metadata and never
+        ;; did - so it is spelled as a symbol here, as the flat map spells it
+        (is (symbol? (:ns (:meta v))) "not a clojure.lang.Namespace")
+        (is (= (:ns v) (:ns (:meta v))))
+        (is (= (:meta v) (read-string (pr-str (:meta v))))
+            "quotable, which is what copy-ns does with it"))))
+  (testing ":test is in the flat map and not in the nested one"
+    ;; cljs.test reads the flat one; the nested one is quoted into emitted code,
+    ;; and a function value is not a constant anything can emit
+    (let [cenv (h/core-env 'app.tested)]
+      (h/js cenv "(def ^{:test (fn [] 1)} a 1)")
+      (binding [env/*cenv* cenv]
+        (let [v (get (api/ns-interns 'app.tested) 'a)]
+          (is (some? (:test v)))
+          (is (nil? (:test (:meta v)))))))))
+
 (deftest test-the-namespace-a-macro-sees-is-the-one-being-compiled
   ;; ana/*cljs-ns*, which cljs.test's run-tests reads as a VALUE to default to the
   ;; current namespace. Bound per top-level form, because an ns form moves the

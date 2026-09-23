@@ -242,8 +242,9 @@
                      "                            (map r) (filter some?) (map :name) vec))))))")
         {:keys [out err exit]} (sh/sh java "-classpath" cp "clojure.main" "-e" program)]
     (is (zero? exit) (str out err))
-    (is (str/includes? out "(all-ns current-file find-ns get-options ns-interns ns-resolve resolve)")
-        (str "the seven of cljs.analyzer.api and no more: " out))
+    (is (str/includes? out (str "(all-ns current-file find-ns get-options ns-interns"
+                                " ns-publics ns-resolve resolve)"))
+        (str "the eight of cljs.analyzer.api and no more: " out))
     (is (str/includes? out ":repl-file nil")
         (str "current-file is nil outside a file, where ClojureScript says"
              " NO_SOURCE_PATH: " out))

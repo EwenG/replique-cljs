@@ -31,11 +31,31 @@
   instead, which is a change of one symbol at the call site and the thing
   ClojureScript's own documentation has always said to do.
 
-  SEVEN OF THE THIRTY-ONE, which is what clojure.cljs.analyzer-api carries: the
-  six cljs/test.cljc asks for and current-file. A library reaching for an eighth
-  gets `Unable to resolve symbol' naming the one it wanted, at the line that
-  wanted it, which is the report to have - the alternative is a stub answering
+  EIGHT OF THE THIRTY-ONE, which is what clojure.cljs.analyzer-api carries: the
+  six cljs/test.cljc asks for, current-file, and ns-publics. A library reaching for
+  a ninth gets `Unable to resolve symbol' naming the one it wanted, at the line
+  that wanted it, which is the report to have - the alternative is a stub answering
   plausibly for a pass this compiler does not run.
+
+  UNLESS IT RESOLVES THE NAME ITSELF, and that caveat is worth stating because the
+  library that made this namespace eight is the one it applies to. sci.impl.cljs
+  does not write cljs.analyzer.api/ns-publics anywhere; it writes
+
+      (def cljs-ns-publics (resolve 'cljs.analyzer.api/ns-publics))
+
+  at load time, which answers nil for a name that is not here and interns a var
+  holding it. Nothing has gone wrong yet. What goes wrong is a call, much later and
+  somewhere else - sci.core/copy-ns, which is the macro a user wrote - and it is a
+  NullPointerException naming neither the missing function nor the namespace it
+  was wanted from:
+
+      Cannot invoke \"clojure.lang.IFn.invoke(Object)\" because the return value
+      of \"clojure.lang.Var.getRawRoot()\" is null
+
+  So the report this namespace is designed to give - the name, at the line that
+  wanted it - is the report for code that names a var and not for code that looks
+  one up. There is nothing to do about that from here, and knowing it is what turns
+  a null pointer into a missing function.
 
   ClojureScript's versions take an optional compiler-state first argument. Ours do
   not, for the reason clojure.cljs.env's docstring gives - the state is
@@ -44,7 +64,7 @@
 
   See doc/cljs-compiler.md 5.66."}
   cljs.analyzer.api
-  (:refer-clojure :exclude [all-ns find-ns ns-interns ns-resolve resolve])
+  (:refer-clojure :exclude [all-ns find-ns ns-interns ns-publics ns-resolve resolve])
   (:require [clojure.cljs.analyzer-api :as api]))
 
 (defn resolve
@@ -97,3 +117,11 @@
   "The vars interned in `ns', as a map of name to var map."
   [ns]
   (api/ns-interns ns))
+
+(defn ns-publics
+  "The vars of `ns' that another namespace may name, as a map of name to var map.
+
+  The defs and not the macros - see clojure.cljs.analyzer-api/ns-publics for why
+  that is not the same list ClojureScript's returns."
+  [ns]
+  (api/ns-publics ns))
