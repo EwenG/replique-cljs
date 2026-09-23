@@ -408,6 +408,42 @@
 
 ;; --- end to end -------------------------------------------------------------
 
+(h/deftest-when h/node? test-the-two-implementations-of-munge-agree
+  ;; runtime.js states code-map a second time, because a var looked up by a name
+  ;; that is a STRING at run time - lazy loading, where the module holding it has
+  ;; not been fetched yet - has nothing to ask the JVM. Two statements of one rule
+  ;; drift unless something runs them against each other, as output_test does for
+  ;; urlFor, and a wrong answer here is a property that does not exist rather than
+  ;; an error anything reports.
+  ;;
+  ;; THE SAME ALPHABET test-munge-is-injective uses, and for the same reason: the
+  ;; characters that make munging hard are the escape, the separator, a mapped
+  ;; character and a plain one. A handful of hand-picked names would agree by
+  ;; accident over any map that got the common case right.
+  (let [alphabet [\a \_ \- \> \$ \:]
+        names    (loop [ns (map str alphabet), all []]
+                   (if (> (count (first ns)) 3)
+                     all
+                     (recur (for [n ns, c alphabet] (str n c)) (into all ns))))
+        js       (str "console.log(JSON.stringify(["
+                      (str/join ", " (map #(str "\"" % "\"") names))
+                      "].map((n) => $CLJS.munge(n))));")]
+    (is (< 250 (count names)) "the alphabet should generate a real spread")
+    (is (= (mapv names/munge names) (read-string (h/run-js js))))))
+
+(h/deftest-when h/node? test-every-character-code-map-maps-agrees
+  ;; the alphabet above is four characters wide and code-map is twenty-six, so
+  ;; this is the other half: every entry, once, including the ones no ordinary
+  ;; name contains. A transcription that dropped or misspelled one would pass the
+  ;; test above and lose a var here.
+  (let [chars (sort (keys names/code-map))
+        names (map #(str "a" % "b") chars)
+        js    (str "console.log(JSON.stringify(["
+                   (str/join ", " (map #(str "\"" (str/escape % {\\ "\\\\" \" "\\\""}) "\"") names))
+                   "].map((n) => $CLJS.munge(n))));")]
+    (is (= 26 (count chars)) (pr-str chars))
+    (is (= (mapv names/munge names) (read-string (h/run-js js))))))
+
 (h/deftest-when h/node? test-two-vars-that-used-to-share-one-property
   ;; foo-bar and foo_bar are two vars. Under cljs.compiler's lossy map they were
   ;; one JavaScript property, and the second def silently clobbered the first.

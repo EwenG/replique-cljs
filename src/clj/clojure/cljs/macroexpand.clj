@@ -160,7 +160,18 @@
 ;; module-for-ns! throws exactly what it threw before, and the refusal sits where
 ;; the knowledge actually runs out rather than one step past it.
 ;;
-;; See doc/cljs-compiler.md 5.58.
+;; AND WHO STILL ASKS, which is worth saying now that the answer has changed for
+;; the caller this was written for. shadow.lazy's own macro cannot load under this
+;; compiler at all - it requires cljs.compiler as well as cljs.analyzer - so a
+;; project running here supplies its own, and a lazy loader written against THIS
+;; runtime has no modules to ask about: every namespace is already its own ES
+;; module and $CLJS.require fetches one by name (5.67). So this answers a question
+;; that a macro of shadow's would ask and the one macro anybody replaced it with
+;; does not. It stays because it is the right answer for any OTHER macro reading
+;; that key, and because being wrong about which macros exist is exactly the kind
+;; of guess the section above declines to make.
+;;
+;; See doc/cljs-compiler.md 5.58 and 5.67.
 
 (def ^:dynamic *shadow-cljs-edn*
   "shadow-cljs's configuration file.

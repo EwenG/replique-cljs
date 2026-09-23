@@ -81,6 +81,47 @@ globalThis.cljs = { core: ns("cljs.core") };
 $CLJS.ns = ns;
 $CLJS.truth_ = truth_;
 
+// --- names ------------------------------------------------------------------
+//
+// clojure.cljs.names/code-map, STATED A SECOND TIME, for urlFor's reason one
+// section down: a name computed HERE has nothing to ask the JVM. names_test holds
+// the two to each other over the same alphabet that proves munge injective, which
+// is the only thing keeping them from drifting apart.
+//
+// WHAT NEEDS IT is a var looked up by a name that is a string at run time rather
+// than a symbol at compile time - lazy loading, where the thing to fetch is named
+// by `"the.ns/the-var"` and the module holding it is not loaded yet, so there was
+// no compile-time reference to munge. `$CLJS.ns(ns)[munge(v)]` is then the whole
+// of the lookup, because a var IS a property of its namespace object (def-name in
+// clojure.cljs.emitter, doc/cljs-repl.md §3.1).
+//
+// NOT cljs.core/munge, which is the same idea and a DIFFERENT map: it delimits
+// its codes with _ and appends $ to JavaScript reserved words, where ours delimits
+// with $ and reserves nothing. nosco-gamma's file->wb-promise is file_$GT$wb_promise
+// here and file__GT_wb_promise there - a property that does not exist. The two are
+// not interchangeable and the name they disagree about is an ordinary one.
+const CODE_MAP = {
+  // the three that make it injective: - is the common case, and the other two
+  // escape the characters the output would otherwise be ambiguous about
+  "-": "_", "_": "$US$", "$": "$DL$",
+  ":": "$COLON$", "+": "$PLUS$", ">": "$GT$", "<": "$LT$", "=": "$EQ$",
+  "~": "$TILDE$", "!": "$BANG$", "@": "$CIRCA$", "#": "$SHARP$",
+  "'": "$SINGLEQUOTE$", '"': "$DOUBLEQUOTE$", "%": "$PERCENT$", "^": "$CARET$",
+  "&": "$AMPERSAND$", "*": "$STAR$", "|": "$BAR$", "{": "$LBRACE$",
+  "}": "$RBRACE$", "[": "$LBRACK$", "]": "$RBRACK$", "/": "$SLASH$",
+  "\\": "$BSLASH$", "?": "$QMARK$",
+};
+
+// A plain object is safe to index with an unknown character because every key on
+// Object.prototype is more than one character long, and a key here never is.
+export function munge(name) {
+  let out = "";
+  for (const c of name) out += CODE_MAP[c] ?? c;
+  return out;
+}
+
+$CLJS.munge = munge;
+
 // --- the protocol calling convention ----------------------------------------
 //
 // doc/cljs-compiler.md §5.4. An implementation lives on the object, under a
