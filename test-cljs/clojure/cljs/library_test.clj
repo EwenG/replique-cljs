@@ -15,7 +15,7 @@
   requires clojure.walk, so a project using hx compiled nothing at all, and what it
   was told was `Could not locate clojure/walk.cljs'.
 
-  THIRTEEN FILES, ALL VERBATIM, and verbatim is why this file is short. Not one of
+  FIFTEEN FILES, ALL VERBATIM, and verbatim is why this file is short. Not one of
   them needed a line changed - unlike cljs/core.cljc (183 declared adaptations) and
   unlike cljs/test.cljs (four) - so what there is to check is byte equality and
   that the thing runs. The reason they cost nothing is the same reason the goog
@@ -32,6 +32,46 @@
   goog.string and clojure.string, and its :clj branch is ClojureScript's compiler,
   which nothing here reads.
 
+  THE FOURTEENTH AND FIFTEENTH ARRIVED LATER, and the list below used to carry the
+  reason they never would. cljs/core/specs/alpha.cljc was NOT VENDORED because its
+  macro half requires clojure.spec.alpha, which is a JVM artifact rather than a
+  ClojureScript file - `a second dependency for a namespace no program requires to
+  run'. That reason was right that nothing asked and wrong about the cost.
+
+  Nothing asked until better-cond, which opens
+
+      (ns better-cond.core
+        (:require [clojure.core.specs.alpha]
+                  [clojure.spec.alpha :as spec]))
+
+  with the first of those OUTSIDE any reader conditional, so the ClojureScript
+  analyzer has to resolve it before the file compiles a line - and a program with
+  better-cond anywhere under it stops there. The keywords better-cond then writes
+  (:clojure.core.specs.alpha/local-name, among others) are lazy references inside
+  an s/or that nothing conforms at run time; the namespace has to EXIST, not to
+  hold anything. phrase looks like a second caller and is not one: its :cljs branch
+  omits the require and replaces every one of those keys with any? and
+  simple-symbol?.
+
+  And the cost is not a dependency. org.clojure/spec.alpha is declared by the
+  CLOJURE THIS COMPILER RUNS ON - replique-clj/clojure names it exactly as
+  org.clojure/clojure does, which is why clojure.spec.alpha is already on this
+  suite's classpath - so the two files add no coordinate to anybody's deps.edn.
+
+  WHAT THE MACRO HALF DOES HERE IS NOTHING, and vendoring it anyway is the point.
+  Its twelve s/fdef forms - core/let, core/defn, core/ns-special-form and the rest
+  - exist to be read by do-macroexpand-check, and this compiler sets
+  :spec-skip-macros true and never reads them (clojure.cljs.macroexpand, a decision
+  rather than a default). So a stub would have served: (ns cljs.core.specs.alpha)
+  and nothing else compiles better-cond just as well, and the emitted module is the
+  same 314 bytes either way, because the .cljs half defines no var in either case.
+  It would also be the first ADAPTED file in this list, a divergence to re-justify
+  the day :spec-skip-macros changes, in exchange for not loading a file that costs
+  a require of clojure.spec.alpha on the JVM. 5.65's rule decides it and decides it
+  the same way it decided the other thirteen: the chain terminates cheaply, so ship
+  what everyone else has. test-the-macro-half-is-what-registers-the-specs is where
+  that stops being a preference and becomes something a test can lose.
+
   NOT VENDORED, AND EACH FOR ITS OWN REASON:
 
       cljs/nodejs.cljs   It IS (def require (js* \"require\")) and this compiler
@@ -44,11 +84,6 @@
                          browser-REPL transport, which this fork replaced.
       cljs/loader.cljs   The :modules loader. There are no modules here.
       cljs/js.cljs       The self-hosted compiler.
-      cljs/core/specs/alpha.cljc  Specs for the shapes of core MACRO forms. Its
-                         macro half requires clojure.spec.alpha, which is a JVM
-                         artifact (org.clojure/spec.alpha) nothing else here wants
-                         - a second dependency for a namespace no program requires
-                         to run.
 
   See doc/cljs-compiler.md 5.65."}
   clojure.cljs.library-test
@@ -83,7 +118,13 @@
 
   Kept as paths rather than namespaces because that is what the claim is about: a
   path is what gets diffed and what the classpath answers for. clojure/edn.cljs
-  names cljs.reader, which was already vendored and until now could not load."
+  names cljs.reader, which was already vendored and until now could not load.
+
+  THE LAST TWO ARE NOT THIS MILESTONE'S. cljs/core/specs/alpha.cljc and .cljs came
+  later, when better-cond asked for a name this file had written down as one it
+  would not carry. They are in the same list because they make the same claim -
+  verbatim, and the copy that loads is ours - and a second list would only be a
+  place for one of them to be forgotten."
   ["clojure/walk.cljs"
    "clojure/data.cljs"
    "clojure/zip.cljs"
@@ -96,7 +137,9 @@
    "cljs/pprint.cljc"
    "cljs/stacktrace.cljc"
    "cljs/spec/alpha.cljs"
-   "cljs/spec/gen/alpha.cljs"])
+   "cljs/spec/gen/alpha.cljs"
+   "cljs/core/specs/alpha.cljc"
+   "cljs/core/specs/alpha.cljs"])
 
 (h/deftest-when cljs-jar? test-the-library-is-vendored-unmodified
   ;; The property that makes "vendored" an honest word, and the one that decays
@@ -114,6 +157,11 @@
   ;; that put the jar first would compile a program against ClojureScript's
   ;; cljs.core rather than ours, and the diff test above would still pass because
   ;; it reaches for the jar by name.
+  ;;
+  ;; WHAT ANSWERS HERE IS target/classes, not src/clj: Maven's test classpath is the
+  ;; build output, and the resources copy is additive - it never removes what is no
+  ;; longer in src/clj. So a defeat that deletes one of these files leaves a stale
+  ;; copy behind and reads as INERT. Delete both, or mvn clean first.
   (doseq [path vendored]
     (testing path
       (is (not= "jar" (.getProtocol (io/resource path)))))))
@@ -218,6 +266,59 @@
   (let [out (runs "(ns demo.core (:require [cljs.spec.test.alpha :as st]))
                    (js/console.log (pr-str (st/summarize-results [])))")]
     (is (str/includes? out "{:total 0}"))))
+
+;; --- the specs of core macro forms ------------------------------------------
+
+(h/deftest-when h/node? test-a-namespace-may-require-the-specs-of-core-macro-forms
+  ;; SPELLED THE CLOJURE WAY, because that is the spelling that broke. better-cond
+  ;; writes (:require [clojure.core.specs.alpha]) and there is no
+  ;; clojure/core/specs/alpha.cljs anywhere - upstream ships the cljs.* name only -
+  ;; so what carries it is the alias rule the two tests above ride on
+  ;; (analyzer/aliased-clj-ns): a clojure.* name with no file of its own means the
+  ;; cljs.* one. The error before this pair was vendored named both halves of that
+  ;; rule and neither of the reasons:
+  ;;
+  ;;     Could not locate clojure/core/specs/alpha.cljs or cljs/core/specs/alpha.cljs
+  ;;
+  ;; THERE IS NOTHING TO CALL, and that is not a gap in the test. The .cljs half is
+  ;; an ns form and a :require-macros and no var at all; every spec it is named for
+  ;; is registered on the JVM by the .cljc, for a macroexpansion check this
+  ;; compiler skips. So what a program can observe is that the name resolves, the
+  ;; module is emitted and node loads it, and this asserts exactly that much.
+  (let [out (runs "(ns demo.core
+                     (:require [clojure.core.specs.alpha]))
+                   (js/console.log \"the specs namespace loaded\")")]
+    (is (str/includes? out "the specs namespace loaded"))))
+
+(deftest test-the-macro-half-is-what-registers-the-specs
+  ;; THE TEST A STUB LOSES. (ns cljs.core.specs.alpha) on its own compiles
+  ;; better-cond and emits the same 314 bytes, so the test above cannot tell the
+  ;; two apart. This one can: the :require-macros in the vendored .cljs is what
+  ;; loads the .cljc on the JVM, and the .cljc is 7,469 bytes of s/def whose whole
+  ;; visible effect is these keys being in clojure.spec's registry.
+  ;;
+  ;; requiring-resolve rather than a require in the ns form: clojure.spec.alpha
+  ;; arrives here transitively, as a dependency of the Clojure this compiler runs
+  ;; on, and nothing else in this compiler names it. Reaching for it by name in one
+  ;; place says that, where an ns form would say it is ours.
+  ;;
+  ;; THE REGISTRY IS PROCESS-WIDE, so what this pins is that a compile CAN load the
+  ;; macro half - not that this particular compile was the one that did. The defeat
+  ;; that matters is the same either way: stub the .cljs and nothing loads it at all.
+  (let [source   (h/write-sources! {'demo.core "(ns demo.core
+                                                  (:require [cljs.core.specs.alpha]))"})
+        target   (h/temp-dir)
+        get-spec (requiring-resolve 'clojure.spec.alpha/get-spec)]
+    (try
+      (driver/compile-namespace! (env/compile-env {:ns 'cljs.user}) 'demo.core
+                                 {:out-dir target :source-paths [source]})
+      (is (some? (get-spec :cljs.core.specs.alpha/binding-form))
+          "the destructuring spec - what better-cond's own ::binding-form is an s/or over")
+      (is (some? (get-spec :cljs.core.specs.alpha/defn-args))
+          "the defn spec")
+      (is (some? (get-spec :cljs.core.specs.alpha/ns-form))
+          "the ns spec, which is the one do-macroexpand-check would reach for first")
+      (finally (h/delete-tree! source) (h/delete-tree! target)))))
 
 ;; --- fetching what it compiled to --------------------------------------------
 
