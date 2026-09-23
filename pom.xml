@@ -29,6 +29,16 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
+
+    <!-- Empty by default, so `mvn -o test' runs everything. Set it to run part of
+         the suite during an edit: mvn -o test -Dtest.ns=clojure.cljs.compat-test
+         (comma-separated for several). DECLARED HERE AND NOT ONLY ON THE COMMAND
+         LINE, because -Dtest.ns=${test.ns} in the test execution below is expanded
+         by Maven and not by the shell: an undeclared property does not expand to
+         the empty string, it stays the literal ${test.ns} and reaches the forked
+         JVM as one. src/script/run_cljs_test.clj says why a partial run is a
+         middle-of-edit thing and never the last word. -->
+    <test.ns></test.ns>
   </properties>
 
   <dependencies>
@@ -186,6 +196,44 @@
         <version>3.4.1</version>
       </plugin>
 
+      <!-- src/compat into the jar, AND NOT ONE PHASE EARLIER. It holds cljs.analyzer.api
+           under ClojureScript's own name, for macro namespaces of somebody else's that
+           require it by that name (see deps.edn and doc/cljs-compiler.md 5.66). A
+           consumer needs it on the classpath; THIS BUILD MUST NOT HAVE IT, because the
+           suite carries ClojureScript 1.12.145 as an AST oracle and a .clj shadows the
+           jar's .cljc - analyzer-test's (requiring-resolve 'cljs.analyzer.api/resolve)
+           would quietly get ours and compare this compiler with itself.
+
+           So it cannot be a <resource> above: those are copied at process-resources,
+           which is before test, and into target/classes, which is ON the test classpath.
+           prepare-package runs after test and before jar, which is the one window where
+           the file can be added without any test run seeing it. The cost is that
+           target/classes differs between `mvn test' and `mvn package'; the benefit is
+           that the difference is exactly the file that must not be there during a test.
+           clojure.cljs.compat-test asserts the absence, so a mistake here is loud. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>compat-into-jar</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>copy-resources</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>src/compat</directory>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-source-plugin</artifactId>
@@ -256,6 +304,7 @@
                      reach a .class file. Its copy of the Clojure sources still loses to
                      src/clj, which is the order the paragraph above depends on. -->
                 <argument>${project.basedir}/src/clj${path.separator}${project.basedir}/test-cljs${path.separator}${project.build.outputDirectory}${path.separator}${cljs-test.deps.classpath}</argument>
+                <argument>-Dtest.ns=${test.ns}</argument>
                 <argument>clojure.main</argument>
                 <argument>${project.basedir}/src/script/run_cljs_test.clj</argument>
               </arguments>

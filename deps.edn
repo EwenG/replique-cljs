@@ -33,4 +33,35 @@
  ;; without it clojure.cljs.browser will not load and a browser REPL is missing.
  ;; Maven also copies the .clj sources in there, which is why the order matters:
  ;; the live ones shadow the copies rather than the other way round.
- :paths ["src/clj" "target/classes"]}
+ ;; src/compat LAST, and it is not the compiler. It holds ONE namespace named the
+ ;; way ClojureScript names it - cljs.analyzer.api - because a macro namespace of
+ ;; somebody else's requires it BY THAT NAME off the classpath, and this compiler
+ ;; renamed it to clojure.cljs.analyzer-api. Without the file such a library does
+ ;; not half-work, it does not load: `Could not locate cljs/analyzer/api.cljc on
+ ;; classpath', which says nothing about a fork. hx's useSmartEffect is the one
+ ;; that turns up.
+ ;;
+ ;; THE DOCUMENTED DOOR AND ONLY IT, which is a fact about shape rather than a
+ ;; preference: cljs.analyzer.api declares no dynamic var - it reads its own
+ ;; through current-file, current-ns and current-state - so all of it forwards,
+ ;; while cljs.analyzer is mostly dynamic vars, and a var cannot be forwarded
+ ;; at all (Namespace.findInternedVar refuses a var whose ns is not this one).
+ ;; Code
+ ;; reaching through the internal name is asked to come through this one instead.
+ ;;
+ ;; A SOURCE ROOT OF ITS OWN BECAUSE IT MUST NOT BE ON OUR OWN TEST CLASSPATH,
+ ;; and that is not tidiness - it is the whole reason the directory exists. The
+ ;; tests carry ClojureScript 1.12.145 as an AST oracle
+ ;; (clojure.cljs.test-harness/cljs-analyzer?), and the oracle IS cljs.analyzer:
+ ;; clojure.cljs.oracle resolves cljs.analyzer/analyze, /empty-env, /*cljs-ns*,
+ ;; /*analyze-deps*, /*load-macros*, and clojure.cljs.analyzer-test reaches for
+ ;; cljs.analyzer/macroexpand-1 and cljs.analyzer.api/resolve. A .clj shadows a
+ ;; jar's .cljc (RT.load tries .clj first), so putting this in src/clj turns that
+ ;; last one into the oracle comparing this compiler with itself - a test suite
+ ;; that passes and checks nothing. The file is not called analyzer.clj any more,
+ ;; which makes the trap smaller and not gone: api.clj alone still does it.
+ ;;
+ ;; Nothing shadows for a CONSUMER, because a project using this compiler has no
+ ;; ClojureScript on its classpath to shadow: its cljs/core.cljs would be a second
+ ;; one beside ours, so it has to be excluded whether or not these files exist.
+ :paths ["src/clj" "target/classes" "src/compat"]}

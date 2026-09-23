@@ -1,10 +1,16 @@
-(ns ^{:doc "cljs.analyzer.api, the six functions cljs/test.cljc asks for.
+(ns ^{:doc "cljs.analyzer.api, as much of it as anything here asks for.
 
   ClojureScript keeps two front doors onto its symbol table: cljs.analyzer, which
   is internal, and cljs.analyzer.api, which is the documented one. cljs/test.cljc
   goes through the second, and uses six of it - resolve, get-options, all-ns,
-  find-ns, ns-resolve and ns-interns - so this is the whole of what a vendored
-  cljs.test needs that clojure.cljs.analyzer does not already give it.
+  find-ns, ns-resolve and ns-interns - so those six are the whole of what a
+  vendored cljs.test needs that clojure.cljs.analyzer does not already give it.
+
+  `current-file' is the seventh, and it is here for somebody else: src/compat
+  publishes this namespace under ClojureScript's own name, and a macro namespace
+  asking where it is being expanded comes through that door. It could not have
+  come through the other one - a dynamic var cannot be forwarded, and a function
+  that READS one can (see src/compat/cljs/analyzer/api.clj).
 
   A NAMESPACE OF ITS OWN because four of the six are clojure.core names. Putting
   them beside resolve-var would shadow resolve, find-ns, ns-resolve and ns-interns
@@ -19,6 +25,18 @@
   (:require [clojure.cljs.analyzer :as ana]
             [clojure.cljs.env :as env])
   (:import [clojure.lang Namespace Var]))
+
+(defn current-file
+  "The file being analysed, as a var's :file records it, or nil outside a file.
+
+  clojure.cljs.analyzer/*source-file*, and A PATH UNDER A SOURCE DIRECTORY -
+  my_lib/core.cljs - rather than one on this machine, which is that var's own
+  rule and the one an editor can resolve. ClojureScript's answer here is
+  whatever its driver was handed, which is an absolute path, so a caller that
+  prints it will see a shorter string than it used to. NIL AT A REPL, where
+  ClojureScript says \"NO_SOURCE_PATH\"."
+  []
+  ana/*source-file*)
 
 (defn get-options
   "The compiler options in force. ClojureScript's build options map; ours is empty,
