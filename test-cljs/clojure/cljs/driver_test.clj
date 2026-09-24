@@ -126,9 +126,12 @@
       (finally (delete-tree! src) (delete-tree! out)))))
 
 (h/deftest-when h/node? test-a-second-compile-writes-nothing
-  ;; not incremental - every namespace is re-analysed, because a CompileEnv lives
-  ;; only as long as the JVM - but an unchanged module keeps its mtime, which is
-  ;; what editors and watchers care about
+  ;; A FRESH ENVIRONMENT EVERY TIME, which is what makes this a test of the WRITE
+  ;; rather than of the skip: an environment that had already compiled these would
+  ;; compile none of them again (test-what-is-already-compiled-is-not-compiled-
+  ;; again), and then nothing being rewritten would say nothing at all. Here every
+  ;; namespace really is re-analysed and re-emitted, and the module still keeps its
+  ;; mtime - which is what editors and watchers care about.
   (let [src (write-sources! (temp-dir) program)
         out (temp-dir)]
     (try
@@ -158,6 +161,102 @@
         (is (= 3 (count (:written (compile)))))
         (is (= "60\n9" (node (io/file out "ns/app/core.js")))))
       (finally (delete-tree! src) (delete-tree! out)))))
+
+;; --- what is already compiled ------------------------------------------------
+;;
+;; The environment is what the driver asks about a dependency, and it lives as long
+;; as the JVM. These four say what that means at each end: nothing is done twice,
+;; a file named is still always compiled, the two flags are how a caller says
+;; otherwise, and the output directory is asked as well as the environment.
+
+(deftest test-what-is-already-compiled-is-not-compiled-again
+  (let [src  (write-sources! (temp-dir) program)
+        out  (temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})
+        opts {:out-dir out :source-paths [src]}]
+    (try
+      (is (= '[cljs.core deep.util my-lib.core app.core]
+             (:compiled (driver/compile-namespace! cenv 'app.core opts))))
+      ;; THE SECOND ASK IS THE WHOLE POINT. All four are in the environment, with
+      ;; their vars, their requires and their aliases, so there is no question left
+      ;; for a compile to answer - and a REPL asks this on every form that mentions
+      ;; a namespace, which is why doing nothing has to be free rather than fast.
+      (let [again (driver/compile-namespace! cenv 'app.core opts)]
+        (is (= [] (:compiled again)))
+        (is (= [] (:written again)))
+        ;; and no bodies, which is what plain require ships nothing of: it ships a
+        ;; question to the runtime instead (repl/require-script)
+        (is (= [] (:scripts again))))
+      ;; A NAMESPACE THE ENVIRONMENT HAS NOT GOT still compiles, and only it: the
+      ;; skip is per namespace and not a switch that turns the driver off.
+      (spit (io/file src "app/extra.cljs")
+            "(ns app.extra (:require [my-lib.core :as lib]))\n(def n (fn* ([] (lib/helper 1))))\n")
+      (is (= '[app.extra] (:compiled (driver/compile-namespace! cenv 'app.extra opts))))
+      (finally (delete-tree! src) (delete-tree! out)))))
+
+(h/deftest-when h/node? test-load-file-compiles-the-file-and-nothing-under-it
+  ;; what a REPL user types, and the reason any of this was noticed: loading one
+  ;; source of a program with three hundred namespaces in it used to recompile all
+  ;; three hundred, because the run began by forgetting what the environment knew.
+  (let [src  (write-sources! (temp-dir) program)
+        out  (temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})
+        opts {:out-dir out :source-paths [src]}]
+    (try
+      (driver/compile-namespace! cenv 'app.core opts)
+      (spit (io/file src "app/core.cljs")
+            (str "(ns app.core (:require [my-lib.core :as lib :refer [helper]]))\n"
+                 "(js* \"console.log(~{})\" (helper 5))\n"))
+      (let [r (driver/compile-file! cenv (str (io/file src "app/core.cljs")) opts)]
+        ;; THE FILE, AND NOT ITS GRAPH. No flag said so: load-file goes straight to
+        ;; compile-one! because you named this file, while its requires are
+        ;; ordinary requires and the environment has them.
+        (is (= '[app.core] (:compiled r)))
+        ;; and the edit took, which is the half that would make a skip here a bug
+        (is (= "10" (node (io/file out "ns/app/core.js")))))
+      (finally (delete-tree! src) (delete-tree! out)))))
+
+(deftest test-reload-names-one-namespace-and-reload-all-names-the-graph
+  (let [src  (write-sources! (temp-dir) program)
+        out  (temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})
+        base {:out-dir out :source-paths [src]}
+        compile #(driver/compile-namespace! cenv 'app.core (merge base %))]
+    (try
+      (is (= '[cljs.core deep.util my-lib.core app.core] (:compiled (compile {}))))
+      ;; :reload is the namespace the caller NAMED and nothing under it, which is
+      ;; what the flag means in Clojure and what it has to mean here for
+      ;; (require 'app.core :reload) to ship app.core's body and no other
+      (is (= '[app.core] (:compiled (compile {:reload true}))))
+      ;; :reload-all is the graph, and it is the only way to pick up a dependency
+      ;; edited outside this process
+      (is (= '[cljs.core deep.util my-lib.core app.core]
+             (:compiled (compile {:reload-all true}))))
+      (finally (delete-tree! src) (delete-tree! out)))))
+
+(deftest test-the-output-directory-is-asked-as-well-as-the-environment
+  ;; TWO HALVES ON TWO CLOCKS. The environment holds the analysis and lives as long
+  ;; as the JVM; the directory holds the module the runtime imports and is made
+  ;; fresh every time a runtime starts. A skip that asked only the first would
+  ;; answer a new directory with an empty one.
+  (let [src  (write-sources! (temp-dir) program)
+        out  (temp-dir)
+        out2 (temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})]
+    (try
+      (driver/compile-namespace! cenv 'app.core {:out-dir out :source-paths [src]})
+      ;; one module deleted, and it is compiled again - the environment still holds
+      ;; it and the directory no longer does
+      (is (.delete (io/file out "ns/app/core.js")))
+      (is (= '[app.core]
+             (:compiled (driver/compile-namespace! cenv 'app.core
+                                                   {:out-dir out :source-paths [src]}))))
+      ;; and a directory that has none of it: everything again, into the new one
+      (is (= '[cljs.core deep.util my-lib.core app.core]
+             (:compiled (driver/compile-namespace! cenv 'app.core
+                                                   {:out-dir out2 :source-paths [src]}))))
+      (is (.isFile (io/file out2 "ns/app/core.js")))
+      (finally (delete-tree! src) (delete-tree! out) (delete-tree! out2)))))
 
 (h/deftest-when h/node? test-a-clojure-name-with-no-file-of-its-own-means-the-cljs-one
   ;; doc/cljs-compiler.md §5.20. Three of ClojureScript's own test namespaces open
@@ -317,12 +416,19 @@
   ;; the environment outlives the file, so an ns form has to replace what the last
   ;; one left rather than add to it - see env/clear-ns-declaration!. Recompiling in
   ;; a FRESH environment would hide this, which is why this one is reused
+  ;;
+  ;; :reload IS WHAT MAKES THE SECOND COMPILE HAPPEN, and it has to be said here
+  ;; for the same reason a user has to say it: the environment already holds
+  ;; app.core, so the plain form of this call now compiles nothing and the edit
+  ;; would never be read. That is the trade `ensure!' documents - an environment is
+  ;; asked, not a disk - and saying the flag is how a caller opts out of it.
   (let [src  (write-sources! (temp-dir) program)
         out  (temp-dir)
         cenv (env/compile-env {:ns 'cljs.user})]
     (try
       (let [compile #(driver/compile-namespace! cenv 'app.core
-                                                {:out-dir out :source-paths [src]})
+                                                {:out-dir out :source-paths [src]
+                                                 :reload true})
             text    #(slurp (io/file out "ns/app/core.js"))]
         (compile)
         (is (str/includes? (text) "import \"../my-lib/core.js\""))

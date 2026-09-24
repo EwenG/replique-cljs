@@ -462,6 +462,41 @@
   (alter-meta! (cljs-ns cenv ns-sym) assoc ::declared true)
   ns-sym)
 
+(defn compiled?
+  "Has the driver compiled `ns-sym` from a source file into this environment?
+
+  A STRONGER FACT THAN `declared?' AND A DIFFERENT ONE. Anything that analyses an
+  ns form declares a namespace - an (ns ...) or an (in-ns ...) typed at a REPL
+  declares one that has no file anywhere - while this is set by
+  clojure.cljs.driver at the END of compiling a file, and it means the whole of
+  that file was read, analysed into this environment, and emitted.
+
+  WHAT IT IS FOR is the only question a driver has about a DEPENDENCY. A compile
+  environment lives as long as the JVM, so a namespace compiled into it an hour
+  ago is still in it, with its vars, its requires and its aliases; re-reading its
+  file would spend the analysis again to reach the answer already held.
+  ClojureScript asks the same question of the same environment and stops for the
+  same reason - cljs.analyzer/analyze-file does nothing at all when the namespace
+  it was handed already has :defs - and Clojure's own `require' consults
+  *loaded-libs* before it loads anything.
+
+  IT SAYS NOTHING ABOUT AN OUTPUT DIRECTORY, and the difference is not academic: a
+  compile environment outlives one, because the same session compiles into a fresh
+  directory every time a runtime is started. A caller who needs the MODULE has to
+  ask the directory as well, and the driver does.
+
+  Nothing clears it. `clear-ns-declaration!' unmakes what an ns form established
+  because a re-analysed ns form REPLACES it; this records that a compilation
+  happened, which no later compilation makes untrue."
+  [^CompileEnv cenv ns-sym]
+  (boolean (some-> (find-cljs-ns cenv ns-sym) meta ::compiled)))
+
+(defn compiled!
+  "Record that `ns-sym` has been compiled from its source into this environment."
+  [^CompileEnv cenv ns-sym]
+  (alter-meta! (cljs-ns cenv ns-sym) assoc ::compiled true)
+  ns-sym)
+
 (defn clear-ns-declaration!
   "Everything a previous ns form for `ns-sym` established, removed: its requires,
   its aliases, its refers, its excludes, and the same on the macro side.

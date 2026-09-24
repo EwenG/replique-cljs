@@ -483,7 +483,13 @@
 
 (defn- ordered-scripts
   "The [ns script] pairs of every namespace compiled for `targets`, in dependency
-  order, each appearing once."
+  order, each appearing once.
+
+  ONLY WHAT WAS COMPILED IS IN HERE, which is what the flags in `opts' decide.
+  Plain require compiles what the environment is missing, so a target it already
+  holds contributes nothing - and nothing is what plain require ships anyway, a
+  question to the runtime rather than a body. :reload and :reload-all are the two
+  that need bodies, and they are the two that force a compile to produce them."
   [cenv opts targets]
   (first (reduce (fn [[acc seen] [nsym script]]
                    (if (seen nsym)
@@ -505,14 +511,25 @@
   What is shipped is what the flags choose. Plain require ships a question - the
   runtime fetches from disk what it does not have. :reload ships the named
   namespaces' bodies, which re-runs them whatever the runtime already holds.
-  :reload-all ships every body in the graph, in dependency order."
+  :reload-all ships every body in the graph, in dependency order.
+
+  THE SAME TWO FLAGS REACH THE COMPILER, and they have to, because a body cannot
+  be shipped without being compiled. The driver compiles nothing it already holds
+  (driver/ensure!), so on a plain require the first step is usually no work at
+  all; :reload asks for the named namespaces again and :reload-all for everything
+  under them, which is also the only way to pick up a file edited outside this
+  process."
   [cenv runtime opts args]
   (need-out-dir! opts "require")
   (let [args    (map unquoted args)
         flags   (set (filter keyword? args))
         specs   (vec (remove keyword? args))
         written (ana/ns-form-deps (list* 'ns 'repl [(cons :require specs)]))
-        scripts (ordered-scripts cenv opts written)
+        scripts (ordered-scripts cenv
+                                 (assoc opts
+                                        :reload     (contains? flags :reload)
+                                        :reload-all (contains? flags :reload-all))
+                                 written)
         ;; WHAT EACH NAME TURNED OUT TO NAME. (require 'clojure.math) compiles
         ;; cljs/math.cljs, because a clojure.* name with no file of its own means
         ;; the cljs.* one (ana/aliased-clj-ns) - and what was written to disk is

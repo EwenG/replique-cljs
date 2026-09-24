@@ -41,14 +41,24 @@
   Clojure code - so a .clj macro file beside a .cljs source has to be on the
   classpath rather than merely on the source path.
 
-  NOT INCREMENTAL, and the reason is worth stating rather than fixing here: a
-  CompileEnv lives only as long as the JVM, so every namespace in the graph has to
-  be analysed on every run whatever its file's mtime says. Skipping the write would
-  save an emit and a spit and nothing else. What it would save is a needless mtime
-  change, so the write is skipped when the text is identical - enough to leave
-  editors and watchers alone. Real incremental compilation is the analysis
-  subsystem's stale-files, which persists a model across restarts; wiring to it is
-  its own piece of work.
+  WHAT THIS ENVIRONMENT HOLDS IS NOT COMPILED AGAIN. A CompileEnv lives as long as
+  the JVM, and a namespace compiled into it is in it with its vars, its requires
+  and its aliases - so `ensure!' asks the environment about a dependency rather
+  than the disk, and a REPL that compiled a program at startup can load one of its
+  files without walking the rest. ClojureScript stops in the same place
+  (cljs.analyzer/analyze-file does nothing for a namespace that already has :defs)
+  and Clojure's require stops earlier still, at *loaded-libs*. :reload and
+  :reload-all are how a caller says otherwise, and they mean here what they mean
+  there; see §5.69.
+
+  NOT INCREMENTAL ACROSS JVMS, and that reason is worth stating rather than fixing
+  here: nothing is persisted beside the modules, so a run that starts cold
+  analyses every namespace in the graph whatever its file's mtime says. Skipping
+  the write would save an emit and a spit and nothing else. What it would save is a
+  needless mtime change, so the write is skipped when the text is identical -
+  enough to leave editors and watchers alone. Real incremental compilation is the
+  analysis subsystem's stale-files, which persists a model across restarts; wiring
+  to it is its own piece of work.
 
   That skip rests on emission being deterministic, and it is with ONE exception,
   worth knowing before it is discovered: a macro that calls gensym mints a new name
@@ -116,8 +126,10 @@
 
   It also happens to reach a library inside a jar, which default-source-paths
   deliberately skips. That skip stands: a jar entry has no mtime worth consulting,
-  and this compiler is not incremental anyway, so what it costs is nothing and what
-  it buys is that a jarred dependency compiles rather than being unfindable.
+  and no mtime is consulted here anyway - what `ensure!' asks about a dependency is
+  whether this environment already holds it - so what the fallback costs is nothing
+  and what it buys is that a jarred dependency compiles rather than being
+  unfindable.
 
   Everything downstream takes a reader over it, so the two kinds are interchangeable
   - only compile-file!, which is handed a path by a user, needs a real file."
@@ -386,7 +398,12 @@
         state   (reduce #(ensure! cenv opts %1 %2)
                         (update state :visiting conj ns-sym)
                         deps)
-        {:keys [written mapped script]} (compile-source! cenv opts src ns-sym)]
+        {:keys [written mapped script]} (compile-source! cenv opts src ns-sym)
+        ;; RECORDED AFTER IT WORKED, which is the whole of what `ensure!' asks
+        ;; about a dependency next time. A file that threw half way through
+        ;; leaves the namespace partly analysed and NOT marked, so the next run
+        ;; compiles it again rather than trusting a half-built answer.
+        _ (env/compiled! cenv ns-sym)]
     (-> state
         (update :visiting pop)
         (update :done conj ns-sym)
@@ -395,12 +412,60 @@
         (cond-> written (update :written conj written)
                 mapped  (update :written conj mapped)))))
 
+(defn- forced?
+  "Whether this run recompiles `ns-sym` whatever the environment already holds.
+
+  :all is :reload-all - the graph, which is what makes that flag mean more than
+  :reload does. A set is the namespaces a caller NAMED, and naming is the whole
+  distinction: (require 'foo :reload) asks for foo again and says nothing about
+  what foo requires."
+  [state ns-sym]
+  (let [f (:force state)]
+    (or (= :all f) (contains? f ns-sym))))
+
+(defn- held?
+  "Whether `ns-sym` is already compiled - into this environment AND into this
+  output directory.
+
+  BOTH HALVES, because they go stale on different clocks. The environment holds
+  the analysis and lives as long as the JVM (env/compiled?); the directory holds
+  the module and is made fresh every time a runtime starts, so the same
+  environment can be asked about a directory that has none of what it knows. A
+  module somebody deleted is compiled again for the same reason - what the
+  runtime imports is the file.
+
+  THE ENVIRONMENT IS ASKED FIRST and not only for speed: `ns-sym' here may be a
+  JavaScript module required by its bare name, which is not a namespace and has
+  no output path, and output/ns->path would refuse to spell one."
+  [cenv opts ns-sym]
+  (and (env/compiled? cenv ns-sym)
+       (.isFile (io/file (:out-dir opts) (output/ns->path ns-sym)))))
+
 (defn- ensure!
-  "Compile `ns-sym` if it has not been compiled in this run, its dependencies
-  first. `state` carries what is done, what is being visited, and what was written."
+  "Compile `ns-sym` if it is not already compiled, its dependencies first. `state`
+  carries what is done, what is being visited, what was written, and what is
+  forced.
+
+  ALREADY COMPILED IS THE COMMON CASE AT A REPL, and skipping it is the difference
+  between loading one file and recompiling everything that file can reach. The
+  environment outlives the form you typed: a REPL that compiled a program at
+  startup holds every namespace in it, so a (load-file ...) of one source has
+  nothing to do but that source. ClojureScript stops in the same place
+  (cljs.analyzer/analyze-file, which does nothing when the namespace already has
+  :defs) and Clojure's `require' stops earlier still, at *loaded-libs*.
+
+  WHAT IT COSTS IS THE EDITED DEPENDENCY, and it is the cost every ClojureScript
+  REPL has: a file changed on disk since it was compiled is not noticed by a load
+  of something that requires it, because nothing here watches the disk and an
+  mtime is not the question being asked - `held?' is about this JVM, not about
+  this minute. :reload and :reload-all are how a caller says otherwise, and they
+  are why `forced?' exists."
   [cenv opts state ns-sym]
   (cond
     (contains? (:done state) ns-sym) state
+
+    (and (not (forced? state ns-sym)) (held? cenv opts ns-sym))
+    (update state :done conj ns-sym)
 
     ;; a cycle. Depth first with no cycle check would recur until the stack ran
     ;; out, and the message for that names nothing at all
@@ -472,8 +537,26 @@
                                 {:ns ns-sym
                                  :source-paths (mapv str (:source-paths opts))}))))))))))
 
-(def ^:private empty-state
-  {:done #{} :visiting [] :compiled [] :written [] :scripts []})
+(defn- empty-state
+  "Nothing done, nothing visited, nothing written - and FORCE, the namespaces this
+  run compiles whether or not they are already compiled. Either a set of them, or
+  :all."
+  [force]
+  {:done #{} :visiting [] :compiled [] :written [] :scripts [] :force force})
+
+(defn- forced-by
+  "What `opts' asks to be recompiled, in the shape `forced?' reads.
+
+  THE TWO FLAGS A REPL ALREADY HAS, spelled the way `require' spells them: nil is
+  plain require, which compiles what is missing and no more; a set is :reload,
+  which is the namespaces the caller named; :all is :reload-all, which is the
+  graph under them. The names are not the driver's invention - they are Clojure's,
+  they mean here what they mean there, and a third vocabulary for one idea would
+  be one more thing to know."
+  [opts ns-syms]
+  (cond
+    (:reload-all opts) :all
+    (:reload opts)     (set ns-syms)))
 
 (defn- data-reader-nss
   "The ClojureScript namespaces every data_readers.cljc on the classpath names, as
@@ -506,9 +589,13 @@
         (map #(:sym (meta %)) (vals (reader/user-data-readers)))))
 
 (defn- seed-state
-  "empty-state, with every data-reader namespace already compiled into it."
-  [cenv opts]
-  (reduce #(ensure! cenv opts %1 %2) empty-state (data-reader-nss opts)))
+  "empty-state, with every data-reader namespace already compiled into it.
+
+  Compiled ONCE, like everything else: the second run through here finds them in
+  the environment and does nothing, which is what `ensure!' is for. They are never
+  forced - :reload names what the caller named, and nobody names these."
+  [cenv opts force]
+  (reduce #(ensure! cenv opts %1 %2) (empty-state force) (data-reader-nss opts)))
 
 (defn- run!*
   "Every entry point goes through here: normalise the options, make sure the output
@@ -592,6 +679,14 @@
     :static-dispatch  compile a call to a var of known shape as a call to the arity
                       that answers it. Faster, and it does not survive a
                       redefinition that drops that arity - see run!*. Default off.
+    :reload           compile `ns-sym' again even if this environment already
+                      holds it - and only it
+    :reload-all       the same for everything under it
+
+  WHAT IS ALREADY COMPILED IS NOT COMPILED AGAIN, which is what the two flags are
+  there to override and what makes this cheap to call. A dependency is looked up
+  in the environment, not on the disk; see `ensure!' for what that buys and what
+  it costs.
 
   Returns, for everything compiled and in the order it was compiled:
 
@@ -610,14 +705,22 @@
                   clojure.cljs.npm/ensure-js!, and nil when there was nothing to
                   do. Options for it live under :npm in `opts`"
   [cenv ns-sym opts]
-  (run!* cenv opts #(ensure! cenv % (seed-state cenv %) ns-sym)))
+  (let [force (forced-by opts [ns-sym])]
+    (run!* cenv opts #(ensure! cenv % (seed-state cenv % force) ns-sym))))
 
 (defn compile-file!
   "compile-namespace! for a file named rather than looked up - what load-file
   needs. The namespace comes from the file's own ns form, and its dependencies are
-  still resolved by name on the source path."
+  still resolved by name on the source path.
+
+  THE FILE IS ALWAYS COMPILED, and it is `compile-one!' rather than `ensure!' that
+  says so: the question `ensure!' asks - is this already held - is the wrong
+  question about a file somebody named. You asked for THIS file, which is what
+  distinguishes load-file from require and is why it needs no flag to mean it.
+  Its dependencies are ordinary dependencies and are compiled only if they are
+  missing."
   [cenv path opts]
   (let [^File src (io/file path)]
     (when-not (.isFile src)
       (throw (ex-info (str "No such file: " src) {:path (str src)})))
-    (run!* cenv opts #(compile-one! cenv % (seed-state cenv %) src nil))))
+    (run!* cenv opts #(compile-one! cenv % (seed-state cenv % nil) src nil))))
