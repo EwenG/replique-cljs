@@ -111,31 +111,58 @@ try {
 // reason.
 function entryPath(spec) { return join(entryDir, spec + ".js"); }
 
-// AN ES MODULE STANDS FOR ITS NAMESPACE OBJECT, which is what `import * as` binds
-// and what `:as` must therefore end up holding. Nothing is copied and nothing is
-// wrapped, so esbuild can still see which of its exports are used and drop the
-// rest.
-const ESM = (spec) =>
-  `import * as $module from ${JSON.stringify(spec)};\nexport { $module };\n`;
-
-// A CommonJS MODULE STANDS FOR `module.exports`, AND ONLY `require` YIELDS IT.
-// `import * as` and `import x from` both go through esbuild's interop, which wraps
-// the exports in a fresh namespace object and - when the package sets
-// `__esModule` - unwraps `.default` on the way. Either is the wrong object:
-// `module.exports` may BE the function the package is (`module.exports = debounce`),
-// and it carries properties no static view of the file can see. `require` returns
-// the object the package assigned, untouched.
+// `require` IS THE RESOLUTION AS WELL AS THE VALUE, and this is the entry every
+// specifier gets unless it cannot have one.
 //
-// This is the whole of what doc/cljs-npm.md §2.1 calls the CommonJS rule, and it
-// is shadow-cljs's semantics: an alias on a CommonJS package names its exports
-// object, so `$default` and `:default` read `.default` OFF it rather than being it.
+// THE VALUE. `module.exports` is what an alias must end up holding, and only
+// `require` yields it. `import * as` and `import x from` both go through esbuild's
+// interop, which wraps the exports in a fresh namespace object and - when the
+// package sets `__esModule` - unwraps `.default` on the way. Either is the wrong
+// object: `module.exports` may BE the function the package is
+// (`module.exports = debounce`), and it carries properties no static view of the
+// file can see. `require` returns the object the package assigned, untouched. For a
+// package that is really an ES module, `require` of it gives the namespace object,
+// which is what an ES module's `module.exports` would be - so the one call answers
+// both halves of §2.1's table without being told which it is looking at.
+//
+// THE RESOLUTION, which is the half that took a bug to find. A package shipping
+// BOTH builds - `exports: {import, require}`, or `module` beside `main` - has two
+// files saying the same thing, and which one a bundler loads is a CONDITION rather
+// than a fact about the package:
+//
+//     orderedmap    exports.require -> dist/index.cjs   module.exports = OrderedMap
+//                   exports.import  -> dist/index.js    export default OrderedMap
+//
+// Asked with `import * as`, esbuild takes the `import` condition and the alias
+// becomes {default: OrderedMap} - so `OrderedMap/from`, which is what the package
+// is FOR, reads a named export the ES build has not got. Asked with `require` it
+// takes the other one and the alias is OrderedMap, which is what shadow-cljs binds
+// and what the project's source was written against. Both toolchains ask the same
+// way for the same reason, and ClojureScript's own :bundle target emits a require()
+// call for its bundler to resolve.
+//
+// A package with no `exports` map is unaffected: `mainFields` decides, esbuild's
+// browser default is ["browser", "module", "main"], and that is shadow's order too -
+// date-fns/sub resolves to its ESM build under both, and `$default` reads the
+// `default` off the namespace `require` gives back.
 const CJS = (spec) =>
   `export const $module = require(${JSON.stringify(spec)});\n`;
 
-const form = new Map(specs.map((s) => [s, ESM]));
-// A specifier only `require` could resolve at all: it never goes back to ESM,
-// because ESM is what already failed for it.
-const forced = new Set();
+// THE FALLBACK, FOR A PACKAGE `require` CANNOT REACH. Two shapes cannot be
+// required: one whose `exports` map offers an `import` condition and no `require`
+// one, and one whose ES module has a top-level await - `require` of that is refused
+// because there is nothing synchronous to return. Both are ES modules by the only
+// route they have left, so `import * as` is what is left to ask with, and the
+// namespace object it binds is what §2.1's first row says `$module` is anyway.
+const ESM = (spec) =>
+  `import * as $module from ${JSON.stringify(spec)};\nexport { $module };\n`;
+
+const form = new Map(specs.map((s) => [s, CJS]));
+// What each specifier's resolved file turned out to BE, which is not the same
+// question as which entry shape reached it: `require` of an ES module is a legal
+// thing to do and what comes back is that module's namespace. Reported as `kinds`,
+// because it is what decides which object an alias binds - §2.1.
+const formats = new Map();
 let live = new Set(specs);
 const failed = [];
 
@@ -175,6 +202,25 @@ const options = (extra) => ({
   entryPoints: writeEntries(),
   outbase: entryDir,
   bundle: true, format: "esm", splitting: true, platform: "browser",
+  // NOT THE DEFAULT, THOUGH IT LOOKS LIKE IT. esbuild documents this list as the
+  // browser default, and it is - for an import statement. For a `require` call it
+  // puts `main' first instead, which is node's rule and the wrong one here: a
+  // package with no `exports' map and both fields, `module' beside `main', is
+  // resolved to its ES build by shadow-cljs and by an import statement, and to its
+  // CommonJS build by a bare require. Saying the list out loud makes the two agree.
+  //
+  // Measured, on a package with main: index.js and module: index.mjs -
+  //
+  //   require(), default mainFields    -> index.js
+  //   require(), this list             -> index.mjs
+  //   import * as                      -> index.mjs
+  //
+  // date-fns/sub is that package, and `$default' reading a `default' off the
+  // namespace depends on which of the two was loaded: the ES build exports one,
+  // and the CommonJS build ends `module.exports = exports.default' and has none.
+  // An `exports' map still wins over this, which is what leaves §2.2's other half
+  // alone - orderedmap keeps going through its `require' condition.
+  mainFields: ["browser", "module", "main"],
   // NOT optional: without it esbuild defaults NODE_ENV to "development" for the
   // browser platform and silently bundles React's development build - 83KB
   // against 14KB, and no error either way.
@@ -190,9 +236,10 @@ const options = (extra) => ({
 // `format` - so the answer comes from the resolver that is going to do the work,
 // under the same conditions, rather than from a heuristic about package.json.
 //
-// It is asked with EVERY entry in its ES shape, because that shape resolves both
-// kinds: esbuild will happily `import * as` a CommonJS file, it just gives the
-// wrong object. The probe wants the format, not the object.
+// It is asked with EVERY entry in the shape it will really be built in, which is
+// the only way the answer is about the right FILE: a dual package resolves to one
+// file under `require` and another under `import`, so a probe that asked the other
+// way would report the format of a file the build is not going to read.
 let probes = 0, meta = null;
 for (;;) {
   probes++;
@@ -205,32 +252,38 @@ for (;;) {
     for (const err of e.errors) {
       const spec = specOf(err.location && err.location.file);
       if (!spec) continue;
-      // A package whose "exports" map offers a `require` condition and no `import`
-      // one: unreachable as ESM, and CommonJS by the only route it has left.
-      if (form.get(spec) === ESM) { form.set(spec, CJS); forced.add(spec); progress++; }
+      // A package whose "exports" map offers an `import` condition and no `require`
+      // one: unreachable by require, and an ES module by the only route it has left.
+      if (form.get(spec) === CJS) { form.set(spec, ESM); progress++; }
       else { live.delete(spec); failed.push([spec, err.text.slice(0, 200)]); progress++; }
     }
     if (!progress) die("resolve", e.errors.map((x) => x.text).join("\n"));
   }
 }
 
-// The entry imports exactly one file - the package - so the first import it has is
-// the one whose format decides the shape.
+// The entry reaches exactly one file - the package - so the one import it has is the
+// one whose format is the package's. The KIND of that import is whichever shape the
+// entry has, which is why both are looked for; what is being read is the target.
+//
+// NOTHING IS DECIDED HERE ANY MORE. The shape is `require` unless require could not
+// reach the package at all, and that was settled by the loop above. This records
+// what was reached, for the report.
 for (const [input, o] of Object.entries(meta.inputs)) {
   const spec = specOf(input);
-  if (!spec || forced.has(spec)) continue;
-  const imported = (o.imports || []).find((i) => i.kind === "import-statement");
+  if (!spec) continue;
+  const imported = (o.imports || [])
+        .find((i) => i.kind === "import-statement" || i.kind === "require-call");
   const target = imported && meta.inputs[imported.path];
-  if (target && target.format === "cjs") form.set(spec, CJS);
+  if (target && target.format) formats.set(spec, target.format);
 }
 
 // --- the build -----------------------------------------------------------------
 
 // WHAT THE PROBE CANNOT ANSWER, THE BUILD COMPLAINS ABOUT. `require` of an ES
-// module is refused when that module has a top-level await, and the probe never
-// tried it, so the one specifier this can be wrong about is a CommonJS-shaped
-// answer the real build will not take. Put it back in its ES shape and build
-// again - the probe already proved that shape resolves.
+// module is refused when that module has a top-level await - there is nothing
+// synchronous to hand back - and the probe writes nothing, so it never got that
+// far. Put such a specifier in its ES shape and build again: that shape needs no
+// proving, being the one every ES module resolves under.
 let rounds = 0;
 for (;;) {
   rounds++;
@@ -238,8 +291,11 @@ for (;;) {
     const result = await esbuild.build(options({ outdir: join(outDir, "npm") }));
     const outs = Object.entries(result.metafile.outputs);
     const chunk = (p) => /chunk-[A-Z0-9]+\.js$/.test(p);
+    // WHAT THE PACKAGE IS, not which entry reached it. A dual package required
+    // through its `require` condition is a CommonJS file and says so; an ES module
+    // that `require` reached all the same is an ES module.
     const kinds = new Map([...live].sort()
-                          .map((s) => [s, kw(form.get(s) === CJS ? "cjs" : "esm")]));
+                          .map((s) => [s, kw(formats.get(s) === "cjs" ? "cjs" : "esm")]));
     rmSync(entryDir, { recursive: true, force: true });
     report({
       ok: true,
@@ -267,7 +323,7 @@ for (;;) {
     for (const err of e.errors) {
       const spec = specOf(err.location && err.location.file);
       if (!spec) continue;
-      if (form.get(spec) === CJS && !forced.has(spec)) { form.set(spec, ESM); progress++; }
+      if (form.get(spec) === CJS) { form.set(spec, ESM); progress++; }
       else { live.delete(spec); failed.push([spec, err.text.slice(0, 200)]); progress++; }
     }
     // NO PROGRESS IS THE END OF IT. Looping on an error the rule above cannot act

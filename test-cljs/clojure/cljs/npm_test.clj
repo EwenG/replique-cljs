@@ -913,6 +913,87 @@
         (is (= "[a]|d:b|n:c|n:d|1|2" (node entry))))
       (finally (h/delete-tree! proj) (h/delete-tree! out)))))
 
+(defn- package!
+  "Write a package of several files into PROJ, with `json' as its package.json
+  beyond the name and version.
+
+  `fake-project!' writes packages of ONE file named by `main', which is every other
+  package in this file. A package that ships two builds cannot be said that way,
+  and two builds is what §2.2 is about."
+  [^java.io.File proj pkg json files]
+  (let [pd (io/file proj "node_modules" pkg)]
+    (.mkdirs pd)
+    (doseq [[name src] files] (spit (io/file pd ^String name) src))
+    (spit (io/file pd "package.json")
+          (str "{\"name\": \"" pkg "\", \"version\": \"1.0.0\", " json "}\n"))))
+
+(h/deftest-when (and h/node? h/esbuild?) test-a-dual-package-resolves-the-way-shadow-does
+  ;; TWO BUILDS SAYING THE SAME THING, and which one gets loaded is a CONDITION
+  ;; rather than a fact about the package. That is the whole of §2.2, and it is
+  ;; worth a test of its own because the two packages below need OPPOSITE answers
+  ;; and a rule that reads only one of them gets the other wrong.
+  ;;
+  ;;   "twinned" has an `exports' map, and its CommonJS build assigns the value
+  ;;   itself - module.exports = Thing. Resolved through `import' the alias becomes
+  ;;   {default: Thing} and Thing/from is undefined; through `require' it is Thing.
+  ;;   This is orderedmap, and shadow-cljs loads dist/index.cjs for it.
+  ;;
+  ;;   "fielded" has no `exports' map, so mainFields decide, and esbuild's browser
+  ;;   order is ["browser", "module", "main"] - which is shadow's order too, so BOTH
+  ;;   load the ES build and `$default' reads a `default' off the namespace that
+  ;;   require hands back. This is date-fns/sub, and its CommonJS build is the
+  ;;   babel shape - exports.default, then module.exports = exports.default - so a
+  ;;   rule that forced everything through `main' would break it in the other
+  ;;   direction: the alias would be the function and $default would be undefined.
+  (let [proj (h/fake-project! {})]
+    (package! proj "twinned"
+              (str "\"main\": \"index.cjs\", \"module\": \"index.mjs\","
+                   " \"exports\": {\"import\": \"./index.mjs\","
+                   " \"require\": \"./index.cjs\"}")
+              {"index.mjs" (str "const Twin = { from: (s) => \"from:\" + s, tag: \"twin\" };\n"
+                                "export default Twin;\n")
+               "index.cjs" (str "module.exports = { from: function (s) { return \"from:\" + s; },"
+                                " tag: \"twin\" };\n")})
+    (package! proj "fielded"
+              "\"main\": \"index.js\", \"module\": \"index.mjs\""
+              {"index.mjs" "export default function (s) { return \"f:\" + s; }\n"
+               "index.js"  (str "Object.defineProperty(exports, \"__esModule\","
+                                " { value: true });\n"
+                                "exports.default = function (s) { return \"f:\" + s; };\n"
+                                "module.exports = exports.default;\n")})
+    ;; and the one `require' cannot reach AT ALL: an `exports' map offering an
+    ;; `import' condition and nothing else. The entry every other specifier gets
+    ;; does not resolve it, so it has to fall back to `import * as' - which is
+    ;; §2.1's first row, reached by the only route left.
+    (package! proj "importonly"
+              "\"type\": \"module\", \"exports\": {\"import\": \"./index.js\"}"
+              {"index.js" "export const only = (s) => \"o:\" + s;\n"})
+    (let [[result said out]
+          (built '{probe.core "(ns probe.core (:require [\"twinned\" :as tw]
+                                                        [\"fielded$default\" :as fd]
+                                                        [\"importonly\" :refer [only]]))
+                               (defn run [] (str (tw/from \"x\") \"|\" tw/tag
+                                                 \"|\" (fd \"y\") \"|\" (only \"z\")))"}
+                 'probe.core {:root (str proj) :acquire false})]
+      (try
+        (is (= [] (:js-missing result)))
+        (is (= "" said))
+        (is (true? (:ok (:js-build result))))
+        (testing "each reports the format of the file that was actually reached"
+          (is (= {"fielded" :esm "importonly" :esm "twinned" :cjs}
+                 (:kinds (:js-build result)))))
+        (let [entry (io/file out "check.mjs")]
+          (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
+                           "import \"./ns/probe/core.js\";\n"
+                           "console.log($ns(\"probe.core\").run());\n"))
+          ;; from:x twin   the alias is module.exports of the CommonJS build, so the
+          ;;               package's own names are read off it
+          ;; f:y           and the other one went the other way: $default read a
+          ;;               `default' off the namespace of an ES build
+          ;; o:z           and the one require could not reach, which fell back
+          (is (= "from:x|twin|f:y|o:z" (node entry))))
+        (finally (h/delete-tree! proj) (h/delete-tree! out))))))
+
 (h/deftest-when (and h/node? h/esbuild?) test-a-second-compile-builds-nothing
   ;; A compile that changed nothing must not run esbuild again - the manifest
   ;; beside the tree holds the specifier list, the esbuild and what the project
