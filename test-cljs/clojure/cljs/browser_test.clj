@@ -809,6 +809,78 @@
       (is (str/includes? (:value r) "No browser is connected") (:value r)))))
 
 
+;; --- a caller that gives up AND wants every page ----------------------------
+;;
+;; The fourth cell of a two-axis matrix the protocols had split between them:
+;; -evaluate-all spreads the script and cannot be told to stop waiting for it,
+;; -evaluate-within can be told and reaches one page. Tooling that asks something
+;; of every page at once - reloading a stylesheet in all of them - wants the
+;; fan-out and is exactly the caller that must not be made to wait.
+
+(deftest test-a-bounded-broadcast-reaches-every-page-and-the-target-answers
+  ;; Both halves in one evaluation. Spoken by hand for the reason
+  ;; test-a-load-reaches-every-page is: what is under test is which sockets the
+  ;; script was written into, and a real page would answer before it could be seen.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [[^WebSocket a as] (fake-page! rt)
+          _                 (wait-for #(:session rt))
+          [^WebSocket b bs] (fake-page! rt)]
+      (is (wait-for #(= 2 (count (:connections rt)))) "both are connected")
+      (let [done (future (repl/evaluate-all-within rt "SCRIPT-EVERYWHERE" 10000))]
+        (is (= "SCRIPT-EVERYWHERE" (took as)))
+        (is (= "SCRIPT-EVERYWHERE" (took bs)) "the same script reached both pages")
+        ;; b is the page an ordinary evaluation targets - the newest - so b's is
+        ;; the answer, the way it is for a load.
+        (answer! a "{:status :success :value \"1\"}")
+        (answer! b "{:status :success :value \"2\"}")
+        (is (= "2" (:value (deref done 10000 :never)))
+            "and the one evaluation targets is the one that answered"))
+      (.abort a)
+      (.abort b))))
+
+(deftest test-a-bounded-broadcast-stops-waiting-for-pages-that-do-not-answer
+  ;; The half -evaluate-all does not have. Both pages took the script and said
+  ;; nothing; an unbounded broadcast would wait for as long as that takes, which is
+  ;; right for a require you typed and wrong for a question asked on your behalf.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [[^WebSocket a as] (fake-page! rt)
+          _                 (wait-for #(:session rt))
+          [^WebSocket b bs] (fake-page! rt)]
+      (is (wait-for #(= 2 (count (:connections rt)))) "both are connected")
+      (let [r (repl/evaluate-all-within rt "SCRIPT-UNANSWERED-EVERYWHERE" 400)]
+        (is (= "SCRIPT-UNANSWERED-EVERYWHERE" (took as)))
+        (is (= "SCRIPT-UNANSWERED-EVERYWHERE" (took bs)) "it was sent to both")
+        (is (= :error (:status r)))
+        (is (str/includes? (:value r) "did not answer within 400ms") (:value r)))
+      (.abort a)
+      (.abort b))))
+
+(deftest test-a-bounded-broadcast-that-never-reached-the-pages-says-a-different-thing
+  ;; The distinction is the deadline's whole point and it survives the fan-out:
+  ;; the permit is held by a form at a prompt, so nothing was sent to ANY page and
+  ;; whoever asked can say so without hedging.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [[^WebSocket ws scripts] (fake-page! rt)]
+      (is (some? (wait-for #(:session rt))) "connected")
+      (let [held (future (repl/-evaluate rt "SCRIPT-AT-THE-PROMPT"))]
+        (is (= "SCRIPT-AT-THE-PROMPT" (took scripts)))
+        (let [r (repl/evaluate-all-within rt "SCRIPT-FOR-TOOLING" 300)]
+          (is (= :error (:status r)))
+          (is (str/includes? (:value r) "busy for the whole 300ms") (:value r))
+          (is (nil? (.poll ^LinkedBlockingQueue scripts 200 TimeUnit/MILLISECONDS))
+              "and it never reached the page"))
+        (answer! ws "{:status :success :value \"1\"}")
+        (is (= "1" (:value @held))))
+      (.abort ws))))
+
+(deftest test-a-bounded-broadcast-with-no-page-answers-at-once
+  ;; Every page is no pages, and the answer is still the URL rather than a wait.
+  (with-open [rt (browser/browser-runtime {})]
+    (let [r (repl/evaluate-all-within rt "ANYTHING" 30000)]
+      (is (= :error (:status r)))
+      (is (str/includes? (:value r) "No browser is connected") (:value r)))))
+
+
 ;; --- starting on a namespace ------------------------------------------------
 
 (deftest test-a-main-given-before-the-page-is-open-says-what-to-open

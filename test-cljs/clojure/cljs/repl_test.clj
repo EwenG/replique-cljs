@@ -834,6 +834,31 @@
     (is (= :error (:status r)))
     (is (str/includes? (:value r) "IJsDeadline") (:value r))))
 
+(h/deftest-when h/node? test-a-bounded-broadcast-on-a-single-runtime-is-that-runtime
+  ;; Node implements IJsDeadline and NOT IJsRuntimes, and asking it for every
+  ;; runtime it has is asking it for itself - which is the reason
+  ;; -evaluate-all-within is a method of the deadline protocol rather than of the
+  ;; fan-out one. Put the other way round, node would have to answer a refusal to
+  ;; a question it can answer perfectly well.
+  (is (= {:status :success :value "99"}
+         (repl/evaluate-all-within *runtime* "(async function(){ return 99; })()" 15000))))
+
+(deftest test-a-runtime-that-can-spread-a-script-but-not-give-up-is-refused-as-well
+  ;; The near miss evaluate-all-within is written against: this runtime CAN reach
+  ;; every page, so falling back to broadcast! would look like the obliging thing
+  ;; to do - and it would answer an ask that named a bound by ignoring the bound,
+  ;; which is how a tooling caller ends up hung behind a page that is asleep.
+  (let [rt (reify
+             repl/IJsRuntime
+             (-evaluate [_ _] {:status :success :value "1"})
+             repl/IJsRuntimes
+             (-evaluate-all [_ _] {:status :success :value "1"})
+             (-pages [_] [])
+             (-select-page! [_ _] false))
+        r  (repl/evaluate-all-within rt "1" 10)]
+    (is (= :error (:status r)))
+    (is (str/includes? (:value r) "IJsDeadline") (:value r))))
+
 ;; --- starting on a namespace ------------------------------------------------
 
 (h/deftest-when h/node? test-a-repl-started-on-a-namespace-has-it-loaded

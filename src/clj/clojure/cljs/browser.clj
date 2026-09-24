@@ -732,6 +732,13 @@
        ;; tryAcquire says whether it would have to.
        (-evaluate-within [_ js ms]
          (or (nobody-connected url srv) (evaluate! srv out js false ms)))
+       ;; The fourth cell, and the transport had it all along: `evaluate!' takes
+       ;; both axes, and until now three of the four combinations were reachable.
+       ;; What asks for this is tooling that wants every page rather than one -
+       ;; and tooling is the half that cannot wait, which is why the method lives
+       ;; in IJsDeadline and not beside -evaluate-all.
+       (-evaluate-all-within [_ js ms]
+         (or (nobody-connected url srv) (evaluate! srv out js true ms)))
        repl/IJsRuntimes
        ;; the load path. Every page gets the script; the one evaluation targets is
        ;; the one whose answer is the answer. See this namespace's "who is

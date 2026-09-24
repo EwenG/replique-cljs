@@ -139,7 +139,27 @@
     "-evaluate, except that it answers within roughly `ms` whatever the runtime
     does. The timeout covers the wait for a turn and the turn itself, and an
     evaluation that outlived it answers nobody: its result is dropped when it
-    arrives."))
+    arrives.")
+  (-evaluate-all-within [this js ms]
+    "-evaluate-all, bounded the same way: every connected runtime is handed `js`,
+    and the one an ordinary evaluation would have gone to answers within roughly
+    `ms`.
+
+    HERE RATHER THAN IN IJsRuntimes, although fanning out is that protocol's
+    whole subject, and the reason is which of the two fallbacks would be a lie. A runtime
+    that is ONE runtime implements this truthfully by doing what -evaluate-within
+    does, and node's does exactly that: evaluating in every runtime it has IS
+    evaluating in it. A runtime that fans out but cannot be asked to give up has
+    no such move - it would have to take `ms` and ignore it - so the cell belongs
+    to the protocol that can honour the bound rather than to the one that can
+    spread the script.
+
+    WHAT IT IS FOR, which is neither of the callers the other two methods have.
+    ship! broadcasts a load and then waits for as long as the load takes, because
+    that is the REPL's semantics and a load is what you typed. Tooling that wants
+    every page - reloading a stylesheet in all of them, say - wants the fan-out
+    and must not have the wait, and until this there was no way to ask for one
+    without the other."))
 
 (def ^:private unbounded
   {:status :error :phase :repl
@@ -182,6 +202,23 @@
   [runtime js ms]
   (if (satisfies? IJsDeadline runtime)
     (-evaluate-within runtime js ms)
+    unbounded))
+
+(defn evaluate-all-within
+  "-evaluate-all-within where the runtime has it, and a refusal where it does not.
+
+  evaluate-within's fallback, for evaluate-within's reason: what a JVM-side timer
+  would bound is the WAIT and not the queue, so the evaluation nobody is listening
+  to any more would stay in front of every later one.
+
+  NOT A FALLBACK TO broadcast!, which is the other near miss and is the same
+  mistake read the other way round: a runtime with IJsRuntimes and no IJsDeadline
+  can spread the script but cannot be told to stop waiting for it, and answering
+  an ask that named a bound by ignoring the bound is how a tooling caller ends up
+  hung behind a page that is asleep."
+  [runtime js ms]
+  (if (satisfies? IJsDeadline runtime)
+    (-evaluate-all-within runtime js ms)
     unbounded))
 
 (defn- broadcast!
@@ -940,6 +977,11 @@
              (-evaluate [_ js] (evaluate* js nil))
              IJsDeadline
              (-evaluate-within [_ js ms] (evaluate* js ms))
+             ;; THE SAME EVALUATION, because there is one runtime here and
+             ;; evaluating in every runtime node has is evaluating in node. See
+             ;; -evaluate-all-within for why that is the honest fallback and the
+             ;; one in IJsRuntimes would not have been.
+             (-evaluate-all-within [_ js ms] (evaluate* js ms))
              java.io.Closeable
              (close [_] (bye)))))))))
 
