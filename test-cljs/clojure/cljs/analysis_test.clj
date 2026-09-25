@@ -12,6 +12,8 @@
   (:require [clojure.cljs.analysis :as an]
             [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env]
+            [clojure.cljs.repl :as repl]
+            [clojure.string :as str]
             [clojure.cljs.test-harness :as h]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing use-fixtures]]))
@@ -334,3 +336,90 @@
       (is (= 2 (count (an/find-host-usages {:kind :js-module :specifier "react"}))))
       (is (= #{["app/core.cljs" 11 9]}
              (lines (an/find-host-usages {:kind :goog-var :name 'goog.string/trimRight})))))))
+
+;; --- staleness -------------------------------------------------------------------
+
+(def ^:private clock (atom 0))
+
+(defn- touch!
+  "Write `text` to `f` with an mtime no earlier write in this run can share - an
+  edit within the filesystem's mtime resolution would otherwise go unnoticed."
+  [^java.io.File f text]
+  (spit f text)
+  (.setLastModified f (+ (System/currentTimeMillis) (* 10000 (swap! clock inc)))))
+
+(defn- with-classpath-dir
+  "(f) with `dir` on the classpath: the thread's context loader is where
+  io/resource looks, so a macro file written there can be loaded, and
+  edited, and loaded again."
+  [^java.io.File dir f]
+  (let [t   (Thread/currentThread)
+        old (.getContextClassLoader t)
+        cl  (doto (clojure.lang.DynamicClassLoader. old) (.addURL (.toURL (.toURI dir))))]
+    (.setContextClassLoader t cl)
+    ;; and Compiler/LOADER, which is what RT.load asks first while it is bound -
+    ;; and it is, inside any load, this test namespace's included
+    (try (with-bindings {clojure.lang.Compiler/LOADER cl} (f))
+         (finally (.setContextClassLoader t old)))))
+
+(deftest test-an-edited-file-is-stale-and-reloads
+  (let [{:keys [cenv opts src]} (compile! program)
+        f (io/file src "deep/util.cljs")]
+    (is (empty? (an/stale-files)))
+    (touch! f "(ns deep.util)\n(def double (fn* ([x] x)))\n(deftype Box [v])\n(def extra double)\n")
+    (is (= #{"deep/util.cljs"} (an/changed-files) (an/stale-files)))
+    (testing "not app.core, which uses it: a var is looked up at run time"
+      (is (not (contains? (an/stale-files) "app/core.cljs"))))
+    (let [r (an/stale-reload! cenv opts)]
+      (is (= ["deep/util.cljs"] (:reloaded r)))
+      (is (= '[deep.util] (mapv first (:scripts r)))))
+    (is (empty? (an/stale-files)))
+    (testing "the file's facts are its new ones; app.core's are its own and stay"
+      (is (= #{["deep/util.cljs" 4 12] ["app/core.cljs" 4 9] ["app/core.cljs" 5 18]
+               ["app/core.cljs" 5 28]}
+             (lines (an/find-usages 'deep.util/double)))))))
+
+(deftest test-a-changed-macro-makes-its-expanders-stale
+  (let [cp  (h/temp-dir)
+        mf  (io/file cp "stale" "macros.clj")
+        _   (.mkdirs (.getParentFile mf))
+        _   (touch! mf "(ns stale.macros)\n(defmacro answer [] 1)\n")]
+    (with-classpath-dir cp
+      (fn []
+        (let [{:keys [cenv opts]}
+              (compile! '{other.lib "(ns other.lib)\n(def z 3)"
+                          app.core  "(ns app.core
+  (:require [other.lib])
+  (:require-macros [stale.macros :refer [answer]]))
+(def a (answer))"})]
+          (is (empty? (an/stale-files)))
+          (touch! mf "(ns stale.macros)\n(defmacro answer [] 42)\n")
+          (is (= #{"stale/macros.clj"} (an/stale-macro-files)))
+          (testing "the file that expanded it, and only that one"
+            (is (= #{"app/core.cljs"} (an/stale-files)))
+            (is (empty? (an/changed-files))))
+          (let [r (an/stale-reload! cenv opts)]
+            (is (= ["stale/macros.clj"] (:macro-files r)))
+            (is (= ["app/core.cljs"] (:reloaded r)))
+            (testing "recompiled against the macro as it is now"
+              (is (str/includes? (second (last (:scripts r))) "42"))))
+          (is (empty? (an/stale-files)))
+          (is (empty? (an/stale-macro-files))))))))
+
+(deftest test-stale-reload-at-the-repl
+  (let [{:keys [cenv opts src]} (compile! program)
+        shipped (atom [])
+        rt      (reify repl/IJsRuntime
+                  (-evaluate [_ js] (swap! shipped conj js) {:status :success :value "nil"}))]
+    (touch! (io/file src "deep/util.cljs")
+            "(ns deep.util)\n(def double (fn* ([x] x)))\n(deftype Box [v])\n")
+    (is (= {:status :success :value (pr-str ["deep/util.cljs"])}
+           (repl/eval-form cenv rt '(stale-reload) opts)))
+    (is (= 1 (count @shipped)))
+    (testing "and a REPL started with :analysis keeps the model as it loads files"
+      (an/reset-model!)
+      (repl/eval-form cenv rt (list 'load-file (str (io/file src "app/core.cljs")))
+                      (assoc opts :analysis true))
+      (is (seq (an/file-forms "app/core.cljs")))
+      (repl/eval-form cenv rt (list 'load-file (str (io/file src "deep/util.cljs"))) opts)
+      (is (empty? (an/file-forms "deep/util.cljs"))))))

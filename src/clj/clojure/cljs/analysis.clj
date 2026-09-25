@@ -52,19 +52,29 @@
   under its source directory, my_lib/core.cljs, which is also what a var's :file
   records. Each form keeps the namespace it was compiled in as :ns.
 
-  Drivers: run-analysis, load-file!, retract-file!, reset-model!. Queries:
+  STALENESS, as clojure.analysis has it and for the same reason: a file changed on
+  disk since it was compiled is stale, and so is a file that expanded a macro
+  whose Clojure file changed since - the one kind of compile-time dependency a
+  ClojureScript file has. stale-reload! recompiles them, reloading the macro files
+  on the JVM first, and hands back the scripts a runtime needs.
+
+  Drivers: run-analysis, load-file!, retract-file!, reset-model!, stale-reload!. Queries:
   find-usages, definition, find-keyword-usages, find-macro-usages,
   find-host-usages, macro-deps, ns-referenced-namespaces, unused-locals,
   unused-aliases, unused-refers, unused-imports, unused-macro-aliases,
-  unused-macro-refers, file-forms, file-namespaces, ns-forms,
+  unused-macro-refers, changed-files, stale-macro-files, stale-files, file-forms, file-namespaces, ns-forms,
   snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
-  (:require [clojure.cljs.ast :as ast]
+  (:require [clojure.analysis :as clj-analysis]
+            [clojure.cljs.ast :as ast]
             [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env]
-            [clojure.cljs.macroexpand :as mx])
+            [clojure.cljs.macroexpand :as mx]
+            [clojure.java.io :as io])
   (:import [clojure.lang IAnalysisSink Keyword Namespace RT Var]
+           [java.io File]
+           [java.net URL]
            [java.util ArrayList]))
 
 ;; stored (write model - mutated only by commit-frame! and retraction):
@@ -74,6 +84,10 @@
 ;;                         :host-usages}}
 ;;   :source->forms  {source #{fid}}
 ;;   :locations      {source File-or-URL}  where each file was last found
+;;   :file-mtime     {source long-or-nil}  its mtime when it was last compiled; nil
+;;                                         for one that is not a file (a jar entry)
+;;   :macro-files    {source {resource long}}  the Clojure files of the macros it
+;;                                         expanded, and their mtimes at that compile
 ;;   :next-fid       long
 ;; derived (build-index, cached by :forms identity):
 ;;   :usages         {qsym #{span}}
@@ -87,7 +101,8 @@
 ;;   :macro-deps     {ns-sym {macro-qsym #{fid}}}
 ;;   :host-usages    {host-ref #{span}}   host-ref is a map - see host-ref
 (def ^:private empty-model
-  {:forms {} :source->forms {} :locations {} :next-fid 0})
+  {:forms {} :source->forms {} :locations {} :file-mtime {} :macro-files {}
+   :next-fid 0})
 
 (defonce ^:private model (atom empty-model))
 
@@ -159,7 +174,32 @@
 ;; other - so a form's facts always land in the frame of the file it belongs to -
 ;; and whose facts go nowhere. `forms` is the stack of open forms, `buffer` the
 ;; finished ones, `counter` the next begin-order rank.
-(deftype FileFrame [source location ignored ^ArrayList forms ^ArrayList buffer ^longs counter])
+(deftype FileFrame [source location mtime ignored ^ArrayList forms ^ArrayList buffer
+                    ^longs counter])
+
+;; --- where a file is, and when it changed ------------------------------------
+
+(defn- url->file
+  "The File a file: URL points at - through toURI, which decodes %20, and falling
+  back to the raw path for a URL a classloader built with a literal space in it,
+  which toURI refuses (clojure.analysis/resource->file)."
+  ^File [^URL u]
+  (try (File. (.toURI u))
+       (catch java.net.URISyntaxException _ (File. (.getPath u)))))
+
+(defn- location-file
+  "The File behind a location - a File, a URL or a classpath resource path - or nil
+  when it is not a file on disk (a jar entry, nothing at all)."
+  ^File [loc]
+  (let [loc (if (string? loc) (io/resource loc) loc)]
+    (cond (instance? File loc) loc
+          (and (instance? URL loc) (= "file" (.getProtocol ^URL loc))) (url->file loc))))
+
+(defn- mtime
+  "The modification time of the file behind `loc`, or nil when there is none."
+  [loc]
+  (when-let [f (location-file loc)]
+    (when (.isFile f) (.lastModified f))))
 
 (defn- peek-list [^ArrayList l]
   (when-not (.isEmpty l) (.get l (dec (.size l)))))
@@ -318,6 +358,18 @@
         m))
     m))
 
+(defn- macro-files
+  "The Clojure files the macros a file's forms expanded were loaded from, each with
+  its mtime NOW - at the end of the compile that expanded them. A macro whose var
+  has no :file on the classpath (one defined at a REPL) has no file to go stale."
+  [buffer]
+  (into {} (for [fe buffer
+                 [_ _ file] (:macro-deps fe)
+                 :when file
+                 :let [t (mtime file)]
+                 :when t]
+             [file t])))
+
 (defn- commit-frame!
   "Install a whole file's forms in one swap!, replacing that file's prior forms -
   clojure.analysis/commit-frame!, whose docstring has the argument."
@@ -340,8 +392,13 @@
                      s->f  (reduce (fn [s2f fe] (update s2f source (fnil conj #{}) (fid fe)))
                                    (:source->forms m) buffer)]
                  (assoc m :forms forms :source->forms s->f
-                          :locations (assoc (:locations m) source (.location fr))
                           :next-fid (+ base (long begin-count)))))))
+    (swap! model
+           (fn [m]
+             (-> m
+                 (assoc-in [:locations source] (.location fr))
+                 (assoc-in [:file-mtime source] (.mtime fr))
+                 (assoc-in [:macro-files source] (macro-files buffer)))))
     nil))
 
 (defn- def-echo?
@@ -431,7 +488,7 @@
     (when-let [of (open-form files)]
       (let [k  (jvm-var-key v)
             ns env/*current-ns*]
-        (add-fact! of CAT-MACRODEP [ns k])
+        (add-fact! of CAT-MACRODEP [ns k (:file (meta v))])
         (when-let [m (written-at op)]
           (add-fact! of CAT-MACROUSE
                      (span k (.source ^FileFrame (peek-list files)) (:line m) (:column m)
@@ -443,7 +500,7 @@
   driver/CompileSink
   (reader-sink [_] reader)
   (begin-file [_ ns-sym source location]
-    (.add files (FileFrame. source location (= 'cljs.core ns-sym)
+    (.add files (FileFrame. source location (mtime location) (= 'cljs.core ns-sym)
                             (ArrayList.) (ArrayList.) (long-array 1)))
     nil)
   (begin-form [_]
@@ -515,9 +572,13 @@
 
 (defn retract-file!
   "Remove every form of file `source` (its label, e.g. \"app/util.cljs\") from the
-  model. Other files' usages of its vars are theirs, and stay."
+  model, and its staleness baselines with it. Other files' usages of its vars are
+  theirs, and stay."
   [source]
-  (swap! model (fn [m] (reduce retract-form m (get-in m [:source->forms source]))))
+  (swap! model (fn [m] (-> (reduce retract-form m (get-in m [:source->forms source]))
+                           (update :locations dissoc source)
+                           (update :file-mtime dissoc source)
+                           (update :macro-files dissoc source))))
   nil)
 
 ;; --- derived indexes ------------------------------------------------------------
@@ -846,3 +907,101 @@
                                      {} (:macro-usages idx))
             :defs   (reduce-kv (fn [a k e] (assoc a k (update e :span span->map)))
                                {} (:defs idx))})))
+
+;; --- staleness and stale reload -------------------------------------------------
+
+(defn changed-files
+  "Analysed files whose mtime differs from the one they were compiled at - edited
+  since. A file with no mtime then (inside a jar) or none now (moved, deleted) is
+  not reported: there is nothing to recompile it from."
+  []
+  (let [m @model]
+    (into #{} (for [[source t] (:file-mtime m)
+                    :when t
+                    :let [now (mtime (get-in m [:locations source]))]
+                    :when (and now (not= now t))]
+                source))))
+
+(defn- changed-macro-files*
+  "{source #{resource}}: for each analysed file, the macro files that changed since
+  it expanded them."
+  [m]
+  (into {} (for [[source files] (:macro-files m)
+                 :let [changed (into #{} (for [[file t] files
+                                               :let [now (mtime file)]
+                                               :when (and now (not= now t))]
+                                           file))]
+                 :when (seq changed)]
+             [source changed])))
+
+(defn stale-macro-files
+  "The Clojure files (classpath resources, e.g. \"app/macros.clj\") of macros some
+  analysed file expanded, changed since it did. They are what stale-reload! loads
+  on the JVM before it recompiles anything."
+  []
+  (into #{} cat (vals (changed-macro-files* @model))))
+
+(defn stale-files
+  "The analysed files to recompile: those edited since they were compiled
+  (changed-files), and those that expanded a macro whose file was edited since
+  they expanded it. No cascade beyond that: a ClojureScript file depends at compile
+  time on macros only, and a var it uses is looked up at run time."
+  []
+  (into (changed-files) (keys (changed-macro-files* @model))))
+
+(defn- strip-ext [^String res]
+  (subs res 0 (.lastIndexOf res ".")))
+
+(defn- reload-macro-file!
+  "Load the Clojure file `res` again. Through clojure.analysis/load-file! when the
+  Clojure model knows it, so that model stays in step; a plain load otherwise."
+  [res]
+  (if (seq (clj-analysis/file-forms res))
+    (clj-analysis/load-file! res)
+    (load (str "/" (strip-ext res)))))
+
+(defn- in-require-order
+  "`sources` ordered so that a file comes after the files it requires, as far as
+  they are among `sources` - the order a runtime should run them in."
+  [cenv sources]
+  (let [ns-of (into {} (for [s sources] [(first (file-namespaces s)) s]))
+        deps  (fn [s] (keep ns-of (env/requires cenv (first (file-namespaces s)))))]
+    (loop [order [] placed #{} left (set sources)]
+      (if (empty? left)
+        order
+        (let [ready (filter (fn [s] (every? #(or (placed %) (not (left %))) (deps s)))
+                            (sort left))
+              ready (if (seq ready) ready [(first (sort left))])]   ; a cycle: break it
+          (recur (into order ready) (into placed ready) (reduce disj left ready)))))))
+
+(defn stale-reload!
+  "Bring the compiled program back in step with the disk: load every stale macro
+  file on the JVM (stale-macro-files), then recompile every stale file
+  (stale-files) under the sink, in require order. Returns
+
+    :macro-files  the Clojure files loaded again
+    :reloaded     the files recompiled, in order
+    :scripts      [ns script] for every namespace compiled, in order - what a REPL
+                  ships to its runtimes (clojure.cljs.repl's stale-reload)
+
+  `opts` are the driver's (compile-file!).
+
+  FAIL-FAST, as clojure.analysis/stale-reload! is: a file that does not compile
+  throws, and the ones after it are not reached. Nothing is lost - a file that did
+  not commit keeps its old baselines and is stale again next time.
+
+  The macro files are loaded in no particular order. One that uses another's
+  macros at load time and is loaded first expands the old version; that is
+  clojure.analysis's cascade to get right, and it gets it right when the Clojure
+  model covers those files - reload them with its stale-reload! first."
+  [cenv opts]
+  (let [mfiles  (sort (stale-macro-files))
+        _       (run! reload-macro-file! mfiles)
+        sources (in-require-order cenv (stale-files))
+        locs    (:locations @model)
+        results (mapv (fn [s]
+                        (load-file! cenv (str (location-file (get locs s))) opts))
+                      sources)]
+    {:macro-files (vec mfiles)
+     :reloaded    sources
+     :scripts     (into [] (mapcat :scripts) results)}))

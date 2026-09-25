@@ -21,7 +21,8 @@
                  protocol method (§6.1)
     node-runtime the R0 host: node dialled on a socket, no HTTP anywhere
     repl         read-eval-print over clojure.cljs.reader/read-one
-    the specials require, load-file, in-ns, remove-var and pages, recognised in head
+    the specials require, load-file, in-ns, remove-var, stale-reload and pages,
+                 recognised in head
                  position of an input and never reaching the compiler
 
   ONE LOOP, TWO TRANSPORTS. `repl` does not know which runtime it is talking to,
@@ -48,7 +49,8 @@
   them and writes a map beside the script, so a frame in a typed form names the form
   and the line within it. R2 is closed."}
   clojure.cljs.repl
-  (:require [clojure.cljs.analyzer :as ana]
+  (:require [clojure.cljs.analysis :as analysis]
+            [clojure.cljs.analyzer :as ana]
             [clojure.cljs.driver :as driver]
             [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
@@ -484,6 +486,14 @@
                     {})))
   opts)
 
+(defn- compiling
+  "(f), under clojure.cljs.analysis's sink when the REPL was started with
+  :analysis - so every file a require or a load-file compiles keeps the analysis
+  model, and stale-reload has something to go on. Only files: a form typed here is
+  never analysed (clojure.cljs.analysis is disk-only)."
+  [opts f]
+  (if (:analysis opts) (analysis/run-analysis f) (f)))
+
 (defn- ship!
   "Evaluate each of `scripts` in order, stopping at the first failure and returning
   it - or nil_result when they all succeed.
@@ -533,7 +543,8 @@
                      [acc seen]
                      [(conj acc script) (conj seen nsym)]))
                  [[] #{}]
-                 (mapcat #(:scripts (driver/compile-namespace! cenv % opts))
+                 (mapcat #(:scripts (compiling opts
+                                               (fn [] (driver/compile-namespace! cenv % opts))))
                          targets))))
 
 (defn- do-require
@@ -613,8 +624,25 @@
   file is deleted from the runtime in the same script that redefines the rest."
   [cenv runtime opts args]
   (need-out-dir! opts "load-file")
-  (let [r (driver/compile-file! cenv (unquoted (first args)) opts)]
+  (let [r (compiling opts #(driver/compile-file! cenv (unquoted (first args)) opts))]
     (ship! runtime [(second (last (:scripts r)))])))
+
+(defn- do-stale-reload
+  "(stale-reload) - recompile what changed on disk, and what expanded a macro that
+  changed, and run it: clojure.cljs.analysis/stale-reload!, whose macro files are
+  loaded on this JVM and whose bodies are shipped here in require order. The value
+  is the files recompiled.
+
+  It knows what the analysis model knows, so it wants a REPL started with
+  :analysis - one without it has compiled nothing under the sink, and has nothing
+  to find stale."
+  [cenv runtime opts _args]
+  (need-out-dir! opts "stale-reload")
+  (let [r   (analysis/stale-reload! cenv opts)
+        res (ship! runtime (mapv second (:scripts r)))]
+    (if (= :error (:status res))
+      res
+      {:status :success :value (pr-str (:reloaded r))})))
 
 (defn- do-in-ns
   "(in-ns 'foo) - move the cursor, creating the namespace if it is new.
@@ -700,6 +728,7 @@
    'load-file  do-load-file
    'in-ns      do-in-ns
    'remove-var do-remove-var
+   'stale-reload do-stale-reload
    'pages      do-pages})
 
 (defn- symbolicated
@@ -1020,6 +1049,9 @@
                    modules from, or require would compile where nothing looks
     :source-paths  where .cljs files are found, default the classpath directories
 
+    :analysis      true to keep clojure.cljs.analysis's model as require and
+                   load-file compile files, which is what (stale-reload) reads
+
   :out-dir and :source-paths are what require, load-file and :reload need, and
   nothing else does; node-repl below fills them in.
 
@@ -1036,7 +1068,7 @@
    (env/with-current-ns (or ns env/*current-ns*)
     (let [rdr        (reader/push-back-reader in)
           ^Writer wr out
-          eval-opts  (select-keys opts [:out-dir :source-paths])]
+          eval-opts  (select-keys opts [:out-dir :source-paths :analysis])]
       ;; cljs.core BEFORE the first prompt. Every script this REPL ships opens with
       ;; `await $CLJS.require("cljs.core")` - every namespace requires it, said or
       ;; not (env/requires) - and that require reads a file off disk, so something
@@ -1097,13 +1129,14 @@
     :main          a namespace to require before the first prompt, if any
     :in :out       as repl takes them
     :program-out   where the runtime's own output goes, default :out
+    :analysis      as clojure.cljs.repl/repl takes it
 
   One call, because the two halves have to agree about one directory: the driver
   compiles into it and the runtime fetches out of it, and a require would silently
   compile somewhere nothing looks if they differed. Wiring them by hand is still
   available - this is node-runtime and repl, in that order, over one directory."
   ([] (node-repl nil))
-  ([{:keys [dir source-paths ns main in out program-out]
+  ([{:keys [dir source-paths ns main in out program-out analysis]
      :or   {ns 'cljs.user in *in* out *out*}}]
    ;; THE CURSOR IS ESTABLISHED HERE, before anything that moves it. env/compile-env
    ;; positions itself with set-current-ns!, which is a set! and so needs a binding
@@ -1119,5 +1152,5 @@
        (try
          (with-open [rt (node-runtime {:dir d :out (or program-out out)})]
            (repl cenv rt {:ns ns :main main :in in :out out
-                          :out-dir d :source-paths source-paths}))
+                          :out-dir d :source-paths source-paths :analysis analysis}))
          (finally (when own (delete-tree! own))))))))

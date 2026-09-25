@@ -782,6 +782,7 @@
                    compile happens either way
     :in :out       as clojure.cljs.repl/repl takes them
     :program-out   where the page's console output goes, default :out
+    :analysis      as clojure.cljs.repl/repl takes it
 
   One call, for the reason node-repl is one call: the driver compiles into a
   directory and the browser fetches out of it, and a require would silently compile
@@ -791,7 +792,7 @@
   evaluated before a page connects says so and the REPL goes on, which is what lets
   you start the REPL first and open the page when you get to it."
   ([] (browser-repl nil))
-  ([{:keys [dir port ws-port source-paths ns main in out program-out]
+  ([{:keys [dir port ws-port source-paths ns main in out program-out analysis]
      :or   {ns 'cljs.user in *in* out *out*}}]
    ;; The cursor is established here, for the reason repl/node-repl says.
    (env/with-current-ns ns
@@ -806,6 +807,7 @@
              (.write (str "Waiting for a browser on " (:url rt) "\n"))
              (.flush))
            (repl/repl cenv rt {:ns ns :main main :in in :out out
-                               :out-dir d :source-paths source-paths}))
+                               :out-dir d :source-paths source-paths
+                               :analysis analysis}))
          (finally (when own (delete-tree! own))))))))
 
