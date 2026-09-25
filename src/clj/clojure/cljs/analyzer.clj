@@ -3039,7 +3039,17 @@
       ;; to the form rather than built as a node, so that the object's own name goes
       ;; through ordinary local resolution: shadowing, closing over it from a nested
       ;; fn and set! on a mutable field all then work with no code of their own.
-      (analyze cenv env (list '. (:self b) (symbol (str "-" (:name b)))))
+      ;;
+      ;; The rewritten form remembers which field it reads and where its name was
+      ;; written, so clojure.cljs.analysis can count it as a use of the field.
+      ;; Under keys of their own rather than :line, for macroexpand/host-sugar's
+      ;; reason: a :line here would be a position source maps read.
+      (analyze cenv env
+               (cond-> (list '. (:self b) (symbol (str "-" (:name b))))
+                 (:line (meta sym))
+                 (with-meta {::field-of (:js-name b)
+                             :clojure.cljs.macroexpand/written
+                             (select-keys (meta sym) [:line :column :end-line :end-column])})))
       (local-node env sym b))
     (if (namespace sym)
       (if (= "js" (namespace sym))

@@ -121,3 +121,52 @@
   (is (empty? (an/file-forms "app/core.cljs")))
   (is (empty? (an/find-usages 'deep.util/double)))
   (is (some? (an/definition 'deep.util/double))))
+
+;; --- locals ------------------------------------------------------------------
+
+(def ^:private locals-program
+  '{app.core "(ns app.core)
+(def f (fn* ([x y] (let* [z x unused 1] z))))
+(defn g [p & more] p)
+(deftype P [a b] Object (toString [this] a))
+(defn h [m] (let [{:keys [k]} m] k))
+(defn t [] (try 1 (catch :default e 2)))
+(def s (fn self [] (self)))
+(defn h2 [m] (let [{:keys [k2]} m [v2] m] 1))"})
+
+(defn- unused-names [] (into #{} (map (juxt :name :line)) (an/unused-locals)))
+
+(deftest test-unused-locals
+  (compile! locals-program)
+  (is (= '#{[y 2] [unused 2] [more 3] [b 4] [this 4] [e 6] [k2 8] [v2 8]}
+         (unused-names)))
+  (testing "a destructured name is a binding the source wrote"
+    (is (some #(= '[k2 8 28] ((juxt :name :line :column) %)) (an/unused-locals))))
+  (testing "a site carries its name, namespace and span"
+    (is (some #(= '{:source "app/core.cljs" :line 2 :column 31 :end-line 2 :end-column 37
+                    :ns app.core :name unused} %)
+              (an/unused-locals 'app.core))))
+  (testing "restricted to a namespace"
+    (is (empty? (an/unused-locals 'deep.util)))))
+
+(deftest test-local-uses
+  (compile! locals-program)
+  (let [locals (vals (:locals (an/snapshot)))
+        by     (fn [nm line] (filter #(and (= nm (:name %)) (= line (:line %))) locals))]
+    (testing "a use points at the symbol that used it"
+      (is (= #{{:source "app/core.cljs" :line 2 :column 29 :end-line 2 :end-column 30
+                :ns 'app.core}}
+             (:uses (first (by 'x 2))))))
+    (testing "a deftype field read in a method is a use of the field"
+      ;; two bindings are written at a's site - the field, and the parameter of
+      ;; the ->P factory the macro generates - and only the field is read
+      (is (= #{["app/core.cljs" 4 42]} (lines (mapcat :uses (by 'a 4))))))
+    (testing "the def's own name is not a local"
+      (is (empty? (by 'f 2))))))
+
+(deftest test-reloading-replaces-locals
+  (let [{:keys [cenv opts src]} (compile! locals-program)
+        f (io/file src "app/core.cljs")]
+    (spit f "(ns app.core)\n(def f (fn* ([q] 1)))\n")
+    (an/load-file! cenv (str f) opts)
+    (is (= '#{[q 2]} (unused-names)))))

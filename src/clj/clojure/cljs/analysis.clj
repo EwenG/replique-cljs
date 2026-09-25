@@ -7,7 +7,8 @@
 ;   You must not remove this notice, or any other, from this software.
 
 (ns ^{:doc "In-memory semantic model of the ClojureScript this compiler compiled:
-  var usages and definitions, with precise source spans, across files.
+  var usages and definitions and local bindings and their uses, with precise
+  source spans, across files.
 
   THE SAME MODEL AS replique-clj's clojure.analysis, and a separate one. Same
   shape - a log of top-level forms, each carrying the facts it produced, filed
@@ -41,7 +42,8 @@
   records. Each form keeps the namespace it was compiled in as :ns.
 
   Drivers: run-analysis, load-file!, retract-file!, reset-model!. Queries:
-  find-usages, definition, file-forms, file-namespaces, ns-forms, snapshot."
+  find-usages, definition, unused-locals, file-forms, file-namespaces, ns-forms,
+  snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
   (:require [clojure.cljs.ast :as ast]
@@ -52,13 +54,14 @@
 
 ;; stored (write model - mutated only by commit-frame! and retraction):
 ;;   :forms          {fid {:ns :source :line :column + one key per non-empty fact
-;;                         category: :usages :defs}}
+;;                         category: :usages :defs :locals :local-uses}}
 ;;   :source->forms  {source #{fid}}
 ;;   :locations      {source File-or-URL}  where each file was last found
 ;;   :next-fid       long
 ;; derived (build-index, cached by :forms identity):
 ;;   :usages         {qsym #{span}}
 ;;   :defs           {qsym {:span span}}   only vars a live form defines
+;;   :locals         {binding {:ns :name ...span :uses #{span}}}
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :next-fid 0})
 
@@ -85,6 +88,17 @@
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
 
+(defrecord LocalSpan [binding source ^int line ^int column ^int end-line ^int end-column lns lname])
+
+(defn- local->map
+  "A LocalSpan as the plain map the :locals index holds - clojure.analysis's
+  shape, :name omitted for a use."
+  [l]
+  (cond-> {:source (:source l) :line (:line l) :column (:column l) :ns (:lns l)}
+    (nat-int? (:end-line l))   (assoc :end-line (:end-line l))
+    (nat-int? (:end-column l)) (assoc :end-column (:end-column l))
+    (:lname l)                 (assoc :name (:lname l))))
+
 (defn- var-key
   "A ClojureScript var's model key: its fully-qualified name symbol. nil for a var
   in no namespace, so a lookup misses rather than throws."
@@ -94,11 +108,13 @@
 
 ;; --- frames -------------------------------------------------------------------
 
-(def ^:private ^:const CAT-USAGES 0)
-(def ^:private ^:const CAT-DEFS   1)
-(def ^:private ^:const N-CATS     2)
+(def ^:private ^:const CAT-USAGES   0)
+(def ^:private ^:const CAT-DEFS     1)
+(def ^:private ^:const CAT-LOCALS   2)
+(def ^:private ^:const CAT-LOCALUSE 3)
+(def ^:private ^:const N-CATS       4)
 
-(def ^:private cat-keys [:usages :defs])
+(def ^:private cat-keys [:usages :defs :locals :local-uses])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -155,25 +171,72 @@
     (add-fact! of CAT-USAGES (span (:name node) source (:line m) (:column m)
                                    (:end-line m) (:end-column m) from-ns))))
 
+;; A local's identity is its JavaScript name within its file: clojure.cljs.names
+;; numbers every binding of a file from one counter (the driver compiles a file
+;; inside one name scope), so [source js-name] names exactly one binding, and a
+;; use carries the js-name of the binding it resolved to.
+
+(defn- record-local! [^OpenForm of source ns node]
+  (let [sym (:form node)]
+    ;; a symbol the source wrote - not a macro's gensym, and not the try form a
+    ;; catch's own binding hangs off
+    (when-let [m (and (symbol? sym) (written-at sym))]
+      (add-fact! of CAT-LOCALS
+                 (->LocalSpan [source (:js-name node)] source
+                              (norm-pos (:line m)) (norm-pos (:column m))
+                              (norm-pos (:end-line m)) (norm-pos (:end-column m))
+                              ns (:name node))))))
+
+(defn- record-local-use! [^OpenForm of source ns js-name m]
+  (when m
+    (add-fact! of CAT-LOCALUSE
+               (->LocalSpan [source js-name] source
+                            (norm-pos (:line m)) (norm-pos (:column m))
+                            (norm-pos (:end-line m)) (norm-pos (:end-column m))
+                            ns nil))))
+
 (defn- record-facts!
   "Walk one top-level form's AST into the open form.
 
   A :def and a :deftype each hold the var they define as a :var CHILD, which is a
   definition and not a use of it - so that child is recorded as the def and not
-  walked."
-  [^OpenForm of source from-ns node]
-  (letfn [(visit [n]
-            (case (:op n)
-              (:def :deftype)
-              (let [v (:var n)]
-                (record-def! of source v)
-                (doseq [c (ast/children n) :when (not (identical? c v))]
-                  (visit c)))
+  walked.
 
-              :var (record-usage! of source from-ns n)
+  (def f (fn* ...)) gives the fn a :binding named f that is no local at all - it
+  names the emitted JavaScript function and is in nobody's scope (analyzer's
+  name-defd-fn) - and it is built from the def's own name symbol, position and
+  all. Such a binding is skipped by that identity.
 
-              (run! visit (ast/children n))))]
-    (visit node)))
+  A deftype field is read through a rewrite, (. self -x) (analyzer's
+  analyze-symbol), whose form remembers the field under ::field-of."
+  [^OpenForm of source ns node]
+  (let [def-names (java.util.IdentityHashMap.)]
+    (letfn [(visit [n]
+              (case (:op n)
+                (:def :deftype)
+                (let [v (:var n)]
+                  (record-def! of source v)
+                  (.put def-names (:form v) true)
+                  (doseq [c (ast/children n) :when (not (identical? c v))]
+                    (visit c)))
+
+                :var (record-usage! of source ns n)
+
+                :binding
+                (do (when-not (.containsKey def-names (:form n))
+                      (record-local! of source ns n))
+                    (run! visit (ast/children n)))
+
+                :local (record-local-use! of source ns (:js-name n) (written-at (:form n)))
+
+                :host-field
+                (let [m (meta (:form n))]
+                  (when-let [js (:clojure.cljs.analyzer/field-of m)]
+                    (record-local-use! of source ns js (written-at (:form n))))
+                  (run! visit (ast/children n)))
+
+                (run! visit (ast/children n))))]
+      (visit node))))
 
 ;; --- commit -------------------------------------------------------------------
 
@@ -222,16 +285,30 @@
   [defs ^Span s]
   (contains? defs [(.entity s) (.line s) (.column s)]))
 
+(defn- remove-if! [^ArrayList l pred]
+  (when l
+    (.removeIf l (reify java.util.function.Predicate (test [_ x] (boolean (pred x)))))))
+
 (defn- freeze-form
-  "An open form as a model entry, or nil when it recorded nothing."
+  "An open form as a model entry, or nil when it recorded nothing.
+
+  Echoes are dropped first. A var usage lying on a def of the same var is the
+  definition seen twice (def-echo?). A local use lying on ANY binding's position is
+  too, for the same reason: a macro writes a binding's symbol again into code it
+  generates - defrecord reads every field back in its lookup - and nothing a
+  program writes can use a local exactly where a local is bound."
   [^OpenForm of source]
   (let [^objects cats (.cats of)
         ^longs pos    (.pos of)
         defs (into #{} (map (fn [^Span s] [(.entity s) (.line s) (.column s)]))
                    (aget cats CAT-DEFS))
-        _    (when-let [^ArrayList l (and (seq defs) (aget cats CAT-USAGES))]
-               (.removeIf l (reify java.util.function.Predicate
-                              (test [_ s] (def-echo? defs s)))))
+        _    (when (seq defs)
+               (remove-if! (aget cats CAT-USAGES) #(def-echo? defs %)))
+        bound (into #{} (map (fn [^LocalSpan l] [(.line l) (.column l)]))
+                    (aget cats CAT-LOCALS))
+        _    (when (seq bound)
+               (remove-if! (aget cats CAT-LOCALUSE)
+                           (fn [^LocalSpan l] (contains? bound [(.line l) (.column l)]))))
         fe (reduce (fn [fe i]
                      (let [^ArrayList l (aget cats (long i))]
                        (if (and l (not (.isEmpty l)))
@@ -356,8 +433,24 @@
                            idx (:usages fe))
                    (reduce (fn [idx ^Span s]
                              (assoc! idx :defs (assoc! (get idx :defs) (.entity s) {:span s})))
-                           idx (:defs fe)))))
-             (transient {:usages (transient {}) :defs (transient {})})
+                           idx (:defs fe))
+                   ;; bindings before their uses: a local is scoped to its form
+                   (reduce (fn [idx ^LocalSpan l]
+                             (let [sub (get idx :locals)
+                                   b   (.binding l)]
+                               (assoc! idx :locals
+                                       (assoc! sub b (assoc (local->map l)
+                                                            :uses (get (get sub b) :uses #{}))))))
+                           idx (:locals fe))
+                   (reduce (fn [idx ^LocalSpan l]
+                             (let [sub (get idx :locals)
+                                   b   (.binding l)]
+                               (if-let [cur (get sub b)]
+                                 (assoc! idx :locals
+                                         (assoc! sub b (update cur :uses conj (local->map l))))
+                                 idx)))
+                           idx (:local-uses fe)))))
+             (transient {:usages (transient {}) :defs (transient {}) :locals (transient {})})
              (sort (keys forms)))]
     (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
 
@@ -389,6 +482,24 @@
   [var-or-sym]
   (some-> (:span (get (:defs (derived @model)) (->var-key var-or-sym))) span->map))
 
+(defn unused-locals
+  "Local bindings the source wrote and nothing uses, optionally only those of
+  namespace `ns-sym`. Each is the binding's site plus :name and :ns.
+
+  A SITE, NOT A BINDING. A macro may bind one written symbol more than once - a
+  variadic defn's parameters are bound by each function it expands to - and a
+  binding the macro never reads is not the programmer's to remove while another
+  one at the same place is read. So a site is unused only when every binding
+  written there is."
+  ([] (unused-locals nil))
+  ([ns-sym]
+   (for [[_ infos] (group-by (juxt :source :line :column)
+                             (vals (:locals (derived @model))))
+         :let  [info (first infos)]
+         :when (every? (comp empty? :uses) infos)
+         :when (or (nil? ns-sym) (= ns-sym (:ns info)))]
+     (dissoc info :uses))))
+
 (defn file-forms
   "The fids currently attributed to file `source`."
   [source]
@@ -411,7 +522,7 @@
   []
   (let [m   @model
         idx (derived m)]
-    (merge m
+    (merge m idx
            {:usages (reduce-kv (fn [a k s] (assoc a k (spans->maps s))) {} (:usages idx))
             :defs   (reduce-kv (fn [a k e] (assoc a k (update e :span span->map)))
                                {} (:defs idx))})))
