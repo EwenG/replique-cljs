@@ -9,7 +9,8 @@
 (ns ^{:doc "The ClojureScript analysis model: var definitions and usages, filed per
   top-level form and per file, fed by the driver as it compiles."}
   clojure.cljs.analysis-test
-  (:require [clojure.cljs.analysis :as an]
+  (:require [clojure.analysis :as clj-analysis]
+            [clojure.cljs.analysis :as an]
             [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env]
             [clojure.cljs.repl :as repl]
@@ -432,6 +433,103 @@
             (is (str/includes? (second (last (:scripts r))) "42")))
           (is (empty? (an/stale-files)))
           (is (empty? (an/stale-macro-files))))))))
+
+(defn- clj-macro-files!
+  "Write the Clojure macro files `files` ({\"res/path.clj\" text}) under `cp` and
+  load them under the Clojure model, as a session running both analyses would."
+  [cp files]
+  (doseq [[res text] files]
+    (let [f (io/file cp res)]
+      (.mkdirs (.getParentFile f))
+      (touch! f text)))
+  (clj-analysis/run-analysis
+   #(doseq [res (sort (keys files))]
+      (load (str "/" (subs res 0 (- (count res) 4)))))))
+
+(deftest test-a-clojure-edit-reloads-the-macro-files-built-on-it
+  ;; hub.macros's helper expands base.macros's m1 when hub/macros.clj loads; app.core
+  ;; expands only hub.macros's m2. Editing base/macros.clj alone must reload both, in
+  ;; that order, and recompile app.core - which only the Clojure model can tell.
+  (let [cp   (h/temp-dir)
+        base "(ns base.macros)\n(defmacro m1 [] %s)\n"
+        hub  "(ns hub.macros (:require [base.macros :refer [m1]]))
+(defn helper [] (m1))
+(defmacro m2 [] (helper))
+"]
+    (with-classpath-dir cp
+      (fn []
+        (try
+          (clj-macro-files! cp {"base/macros.clj" (format base 1) "hub/macros.clj" hub})
+          (let [{:keys [cenv opts]}
+                (compile! '{app.core "(ns app.core
+  (:require-macros [hub.macros :refer [m2]]))
+(def a (m2))"})]
+            (is (empty? (an/stale-files)))
+            (touch! (io/file cp "base/macros.clj") (format base 42))
+            (is (= #{"base/macros.clj" "hub/macros.clj"} (an/stale-macro-files)))
+            (is (= #{"app/core.cljs"} (an/stale-files)))
+            (let [r (an/stale-reload! cenv opts)]
+              (is (= ["base/macros.clj" "hub/macros.clj"] (:macro-files r)))
+              (is (str/includes? (second (last (:scripts r))) "42")))
+            (is (empty? (an/stale-files)))
+            (is (empty? (an/stale-macro-files))))
+          (finally (clj-analysis/reset-model!)))))))
+
+(deftest test-macro-files-reload-in-the-clojure-models-order
+  ;; both edited; alphabetical order would load a.macros (which expands z.macros's
+  ;; m1 at load time) first, against the old m1
+  (let [cp  (h/temp-dir)
+        z   "(ns z.macros)\n(defmacro m1 [] %s)\n"
+        a   "(ns a.macros (:require [z.macros :refer [m1]]))
+(defn helper [] (m1))
+(defmacro m2 [] (helper))
+;; %s
+"]
+    (with-classpath-dir cp
+      (fn []
+        (try
+          (clj-macro-files! cp {"z/macros.clj" (format z 1) "a/macros.clj" (format a 1)})
+          (let [{:keys [cenv opts]}
+                (compile! '{app.core "(ns app.core
+  (:require-macros [a.macros :refer [m2]] [z.macros :refer [m1]]))
+(def a (m2))
+(def b (m1))"})]
+            (touch! (io/file cp "z/macros.clj") (format z 7))
+            (touch! (io/file cp "a/macros.clj") (format a 2))
+            (let [r (an/stale-reload! cenv opts)]
+              (is (= ["z/macros.clj" "a/macros.clj"] (:macro-files r)))
+              (is (str/includes? (second (last (:scripts r))) "a = (7)"))))
+          (finally (clj-analysis/reset-model!)))))))
+
+(deftest test-a-reload-that-throws-keeps-what-it-found-stale
+  (let [cp   (h/temp-dir)
+        base "(ns base2.macros)\n(defmacro m1 [] %s)\n"
+        hub  "(ns hub2.macros (:require [base2.macros :refer [m1]]))
+(defn helper [] (m1))
+(defmacro m2 [] (helper))
+"]
+    (with-classpath-dir cp
+      (fn []
+        (try
+          (clj-macro-files! cp {"base2/macros.clj" (format base 1) "hub2/macros.clj" hub})
+          (let [{:keys [cenv opts]}
+                (compile! '{app.core "(ns app.core
+  (:require-macros [hub2.macros :refer [m2]]))
+(def a (m2))"})]
+            (touch! (io/file cp "base2/macros.clj") (format base 42))
+            (touch! (io/file cp "hub2/macros.clj") (str hub "(oops\n"))
+            (is (thrown? Exception (an/stale-reload! cenv opts)))
+            (testing "base2 loaded and hub2 not, and nothing lost: both still to load
+              - base2 once more, since the Clojure side's reload threw as a whole -
+              and app.core still stale"
+              (is (= #{"base2/macros.clj" "hub2/macros.clj"} (an/stale-macro-files)))
+              (is (= #{"app/core.cljs"} (an/stale-files))))
+            (touch! (io/file cp "hub2/macros.clj") hub)
+            (let [r (an/stale-reload! cenv opts)]
+              (is (= ["base2/macros.clj" "hub2/macros.clj"] (:macro-files r)))
+              (is (str/includes? (second (last (:scripts r))) "42")))
+            (is (empty? (an/stale-files))))
+          (finally (clj-analysis/reset-model!)))))))
 
 (deftest test-stale-reload-at-the-repl
   (let [{:keys [cenv opts src]} (compile! program)

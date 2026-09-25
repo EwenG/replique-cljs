@@ -94,6 +94,12 @@
 ;;                                         knows: taken the first time a file
 ;;                                         expands one of its macros, advanced only
 ;;                                         when stale-reload! loads it again
+;;   :pending-macro-files #{resource}     macro files a stale-reload! set out to
+;;                                         load and has not loaded yet
+;;   :pending-sources #{source}           files a stale-reload! set out to
+;;                                         recompile and has not committed yet -
+;;                                         so a reload that throws half way loses
+;;                                         no staleness the cascade had found
 ;;   :next-fid       long
 ;; derived (build-index, cached by :forms identity):
 ;;   :usages         {qsym #{span}}
@@ -108,7 +114,7 @@
 ;;   :host-usages    {host-ref #{span}}   host-ref is a map - see host-ref
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :file-mtime {} :macro-files {}
-   :macro-loaded {} :next-fid 0})
+   :macro-loaded {} :pending-macro-files #{} :pending-sources #{} :next-fid 0})
 
 (defonce ^:private model (atom empty-model))
 
@@ -410,6 +416,7 @@
                    (assoc-in [:locations source] (.location fr))
                    (assoc-in [:file-mtime source] (.mtime fr))
                    (assoc-in [:macro-files source] mfiles)
+                   (update :pending-sources disj source)
                    ;; the files seen for the first time: merge keeps a baseline
                    ;; already there, which only a reload advances
                    (update :macro-loaded #(merge mfiles %))))))
@@ -592,7 +599,8 @@
   (swap! model (fn [m] (-> (reduce retract-form m (get-in m [:source->forms source]))
                            (update :locations dissoc source)
                            (update :file-mtime dissoc source)
-                           (update :macro-files dissoc source))))
+                           (update :macro-files dissoc source)
+                           (update :pending-sources disj source))))
   nil)
 
 ;; --- derived indexes ------------------------------------------------------------
@@ -949,39 +957,81 @@
                  :when (seq changed)]
              [source changed])))
 
+(defn- macro-closure
+  "`seed` - macro files to load again - and every Clojure file the Clojure model
+  says expands a macro of one of them at load time, transitively
+  (clojure.analysis/stale-files): a file whose code expanded the old version holds
+  it until it is loaded again too. Only the files on the way to one in `tracked`,
+  a macro file some analysed file expanded, are kept - the rest are the Clojure
+  side's to reload. Without a Clojure model this is `seed`."
+  [seed tracked]
+  (into #{} (filter #(some tracked (clj-analysis/stale-files #{%})))
+        (clj-analysis/stale-files seed)))
+
 (defn stale-macro-files
-  "The Clojure files (classpath resources, e.g. \"app/macros.clj\") of macros some
-  analysed file expanded, changed on disk since the JVM loaded them - as far as
-  this model knows, see :macro-loaded. They are what stale-reload! loads on the
-  JVM before it recompiles anything."
+  "The Clojure files (classpath resources, e.g. \"app/macros.clj\") to load again
+  before anything is recompiled: the macro files some analysed file expanded that
+  changed on disk since the JVM loaded them (as far as this model knows, see
+  :macro-loaded); the Clojure files the Clojure model has as edited since it loaded
+  them; and, through its macro graph, the files that expand their macros at load
+  time - as far as they lead to a macro file an analysed file expanded. Plus any a
+  stale-reload! that threw left unloaded."
   []
-  (let [m @model]
-    (into #{} (for [file (into #{} (mapcat keys) (vals (:macro-files m)))
-                    :let [t   (get-in m [:macro-loaded file])
-                          now (mtime file)]
-                    :when (and t now (not= now t))]
-                file))))
+  (let [m       @model
+        tracked (into #{} (mapcat keys) (vals (:macro-files m)))
+        edited  (for [file tracked
+                      :let [t   (get-in m [:macro-loaded file])
+                            now (mtime file)]
+                      :when (and t now (not= now t))]
+                  file)]
+    (into (into #{} (filter mtime) (:pending-macro-files m))
+          (macro-closure (into (set edited) (clj-analysis/changed-files)) tracked))))
 
 (defn stale-files
   "The analysed files to recompile: those edited since they were compiled
-  (changed-files), and those that expanded a version of a macro file other than
-  the one on disk now. No cascade beyond that: a ClojureScript file depends at compile
-  time on macros only, and a var it uses is looked up at run time."
+  (changed-files); those that expanded a version of a macro file other than the
+  one on disk now; those that expanded a macro from a file stale-macro-files will
+  load again, which an edit to another Clojure file can put there; and any a
+  stale-reload! that threw left uncompiled. No cascade among ClojureScript files: one
+  depends at compile time on macros only, and a var it uses is looked up at run
+  time."
   []
-  (into (changed-files) (keys (changed-macro-files* @model))))
+  (let [m      @model
+        reload (stale-macro-files)]
+    (-> (changed-files)
+        (into (keys (changed-macro-files* m)))
+        (into (for [[source files] (:macro-files m)
+                    :when (some reload (keys files))]
+                source))
+        ;; one deleted since has nothing to recompile it from
+        (into (filter #(mtime (get-in m [:locations %]))) (:pending-sources m)))))
 
 (defn- strip-ext [^String res]
   (subs res 0 (.lastIndexOf res ".")))
 
-(defn- reload-macro-file!
-  "Load the Clojure file `res` again. Through clojure.analysis/load-file! when the
-  Clojure model knows it, so that model stays in step; a plain load otherwise."
-  [res]
-  (if (seq (clj-analysis/file-forms res))
-    (clj-analysis/load-file! res)
-    (load (str "/" (strip-ext res))))
-  (when-let [t (mtime res)]
-    (swap! model assoc-in [:macro-loaded res] t)))
+(defn- mark-loaded! [files]
+  (swap! model (fn [m]
+                 (reduce (fn [m res]
+                           (-> (if-let [t (mtime res)] (assoc-in m [:macro-loaded res] t) m)
+                               (update :pending-macro-files disj res)))
+                         m files))))
+
+(defn- reload-macro-files!
+  "Load the Clojure files `files` again and return them in the order loaded. Those
+  the Clojure model knows go through clojure.analysis/reload-files!, which orders
+  them by its macro graph - a file after those whose macros its code expands - and
+  keeps that model in step; the rest are loaded first, with a plain load, sorted:
+  nothing says what they depend on."
+  [files]
+  (let [{covered true plain false} (group-by #(boolean (seq (clj-analysis/file-forms %)))
+                                             files)
+        plain (sort plain)]
+    (doseq [res plain]
+      (load (str "/" (strip-ext res)))
+      (mark-loaded! [res]))
+    (let [order (if (seq covered) (clj-analysis/reload-files! covered) [])]
+      (mark-loaded! order)
+      (into (vec plain) order))))
 
 (defn- in-require-order
   "`sources` ordered so that a file comes after the files it requires, as far as
@@ -1009,18 +1059,21 @@
 
   `opts` are the driver's (compile-file!).
 
-  FAIL-FAST, as clojure.analysis/stale-reload! is: a file that does not compile
-  throws, and the ones after it are not reached. Nothing is lost - a file that did
-  not commit keeps its old baselines and is stale again next time.
+  The macro files are loaded in the Clojure model's macro order where it covers
+  them (see reload-macro-files!). Both sets are taken before anything is loaded -
+  loading a macro file clears what made its expanders stale - and kept in the model
+  as pending until each is done.
 
-  The macro files are loaded in no particular order. One that uses another's
-  macros at load time and is loaded first expands the old version; that is
-  clojure.analysis's cascade to get right, and it gets it right when the Clojure
-  model covers those files - reload them with its stale-reload! first."
+  FAIL-FAST, as clojure.analysis/stale-reload! is: a file that does not load or
+  compile throws, and the ones after it are not reached. Nothing is lost - what was
+  not done stays pending, and is stale again next time."
   [cenv opts]
-  (let [mfiles  (sort (stale-macro-files))
-        _       (run! reload-macro-file! mfiles)
+  (let [mfiles  (stale-macro-files)
         sources (in-require-order cenv (stale-files))
+        _       (swap! model #(-> %
+                                  (update :pending-macro-files into mfiles)
+                                  (update :pending-sources into sources)))
+        mfiles  (reload-macro-files! mfiles)
         locs    (:locations @model)
         results (mapv (fn [s]
                         (load-file! cenv (str (location-file (get locs s))) opts))
