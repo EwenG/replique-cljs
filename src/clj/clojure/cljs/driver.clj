@@ -86,6 +86,38 @@
             [clojure.string :as str])
   (:import [java.io File]))
 
+;; --- the analysis sink -------------------------------------------------------
+
+(defprotocol CompileSink
+  "What clojure.cljs.analysis is told while a file compiles - Compiler.ANALYSIS_SINK's
+  counterpart for this compiler, and bracketed the same way: a file, and inside it
+  one top-level form at a time.
+
+  DECLARED HERE AND NOT THERE, so the driver depends on nothing: the analysis
+  namespace drives compilations (load-file!) and so has to require this one, and a
+  require back would be a cycle.
+
+    begin-file  `source` is the file's label (source-label), the key the model files
+                it under; `location` is where it was actually found, a File or URL
+    begin-form  before a form is read, so whatever reading it reports lands in it
+    form-start  the form's own position, once it has been read
+    analyzed    the form's AST
+    end-form    after the form, or after the read that found eof
+    end-file    the file compiled to the end
+    abort-file  it threw; nothing it produced may be kept"
+  (begin-file [sink ns-sym source location])
+  (begin-form [sink])
+  (form-start [sink line column])
+  (analyzed [sink node])
+  (end-form [sink])
+  (end-file [sink source])
+  (abort-file [sink source]))
+
+(def ^:dynamic *sink*
+  "The CompileSink told about every file compiled, or nil - the default, which costs
+  one test per form and nothing else. Bound by clojure.cljs.analysis/run-analysis."
+  nil)
+
 ;; --- finding a source file --------------------------------------------------
 
 (def source-extensions
@@ -281,6 +313,17 @@
     (output/ns->path ns-sym)
     (map-name ns-sym))))
 
+(defn- analyze-form
+  "analyze-top, with the sink - when there is one - told the form's position and
+  handed its AST."
+  [cenv sink form]
+  (when sink
+    (let [m (meta form)]
+      (when (:line m) (form-start sink (:line m) (:column m)))))
+  (let [node (ana/analyze-top cenv (env/analysis-env cenv) form)]
+    (when sink (analyzed sink node))
+    node))
+
 (defn- compile-source!
   "Analyse `src` into `cenv`, write its module, and return what a REPL needs to
   make the same thing happen in a running runtime.
@@ -304,7 +347,8 @@
         ;; and the only way to be sure the embedded text is the one that was
         ;; compiled is for them to be the same string.
         text      (slurp src)
-        rdr       (reader/push-back-reader text)]
+        rdr       (reader/push-back-reader text)
+        sink      *sink*]
     (names/with-name-scope
      ;; THE LABEL IS ALSO WHAT A VAR RECORDS. It is already the name this file
      ;; goes under in its source map, and a var's :file is the same question asked
@@ -316,9 +360,10 @@
      ;; another file, and that compilation binds a label of its own over this one.
      (binding [ana/*source-file* label]
        (let [body (loop [acc []]
+                    (when sink (begin-form sink))
                     (let [form (reader/read-one cenv rdr EOF)]
                       (if (identical? form EOF)
-                        acc
+                        (do (when sink (end-form sink)) acc)
                         ;; The &env PER FORM, not once for the file. It carries
                         ;; {:ns {:name ...}} as a VALUE, read as (-> &env :ns :name)
                         ;; by defprotocol, defmulti and deftype among others - and
@@ -334,12 +379,12 @@
                         ;; would join the lines into text whose interior boundaries
                         ;; nothing can find again, and the emitter attributes a line
                         ;; to a node from the position that pass writes (§5.43).
-                        (recur (into acc
-                                     (emitter/emit-top-lines
-                                      (si/source-info
-                                       (ana/analyze-top
-                                        cenv (env/analysis-env cenv) form)
-                                       (assoc (meta form) :file label))))))))
+                        (let [lines (emitter/emit-top-lines
+                                     (si/source-info
+                                      (analyze-form cenv sink form)
+                                      (assoc (meta form) :file label)))]
+                          (when sink (end-form sink))
+                          (recur (into acc lines))))))
              module (sm/cat (module-text cenv ns-sym body)
                             "//# sourceMappingURL=" (map-name ns-sym) "\n")
              ^File out-map (io/file (str out ".map"))]
@@ -381,6 +426,22 @@
 
 (declare ensure!)
 
+(defn- sunk-file
+  "(f), bracketed as one file for the sink when there is one: end-file if it
+  returned, abort-file if it threw - so a file that failed half way contributes
+  nothing, which is the same rule env/compiled! follows below."
+  [ns-sym src f]
+  (if-let [sink *sink*]
+    (let [label (source-label ns-sym src)
+          _     (begin-file sink ns-sym label src)
+          r     (try (f)
+                     (catch Throwable t
+                       (abort-file sink label)
+                       (throw t)))]
+      (end-file sink label)
+      r)
+    (f)))
+
 (defn- compile-one!
   "Compile the file `src`, which declares `ns-sym`, after everything its ns form
   requires. The post-order step shared by looking a namespace up and being handed a
@@ -398,7 +459,8 @@
         state   (reduce #(ensure! cenv opts %1 %2)
                         (update state :visiting conj ns-sym)
                         deps)
-        {:keys [written mapped script]} (compile-source! cenv opts src ns-sym)
+        {:keys [written mapped script]} (sunk-file ns-sym src
+                                                   #(compile-source! cenv opts src ns-sym))
         ;; RECORDED AFTER IT WORKED, which is the whole of what `ensure!' asks
         ;; about a dependency next time. A file that threw half way through
         ;; leaves the namespace partly analysed and NOT marked, so the next run

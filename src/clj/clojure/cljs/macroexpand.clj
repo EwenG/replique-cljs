@@ -105,9 +105,23 @@
       (let [[target & args] (next form)]
         (with-meta (list* '. target (symbol (subs s 1)) args) (meta form)))
 
+      ;; The type symbol remembers where `Foo.` was written, less the dot, under
+      ;; ::written and NOT as :line. Without it the symbol reads as one a macro made
+      ;; up, and clojure.cljs.analysis records a use of Foo only where the source
+      ;; wrote one. As :line it would be a position like any other, and
+      ;; clojure.cljs.source-info would move the constructor's source-map column
+      ;; from the paren to the name - which repl-test pins, and which is a change
+      ;; to what a stack frame says rather than to what analysis sees.
       (and (.endsWith s ".") (> (count s) 1))
-      (with-meta (list* 'new (symbol (subs s 0 (dec (count s)))) (next form))
-        (meta form))
+      (let [m (meta op)]
+        (with-meta (list* 'new
+                          (cond-> (symbol (subs s 0 (dec (count s))))
+                            (:line m)
+                            (with-meta {::written
+                                        (cond-> (select-keys m [:line :column :end-line :end-column])
+                                          (:end-column m) (update :end-column dec))}))
+                          (next form))
+          (meta form)))
 
       :else form)))
 
