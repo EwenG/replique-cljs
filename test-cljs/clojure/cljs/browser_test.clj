@@ -271,14 +271,51 @@
       (is (= :error (:status r)))
       (is (str/includes? (:value r) "nope_at_all")))))
 
-(h/deftest-when h/node? test-the-print-channel-carries-the-page-s-console
+(h/deftest-when h/node? test-the-print-channel-carries-what-the-program-prints
   ;; A browser has no stdout for the JVM to pump, so unlike node this channel is not
-  ;; optional (doc/cljs-repl.md 8). Before M5 there is no *print-fn* to set, so what
-  ;; is forwarded is the console - tee'd, because devtools is where a browser user
-  ;; looks first.
+  ;; optional (doc/cljs-repl.md 8). What fills it is cljs.core's *print-fn*, which
+  ;; the transport installs over the console cljs.core installs on itself.
+  ;;
+  ;; THROUGH THE VAR RATHER THAN THROUGH println, because the analyzer env these
+  ;; tests compile in has never analyzed cljs.core and so knows none of its vars -
+  ;; which is why every test in this file writes js*. The var is what println calls
+  ;; and what this is about; `*print-newline*' below is the rest of what it needs.
+  ;;
+  ;; THE FIRST FORM, deliberately. The script that carries the first form somebody
+  ;; types is also the one that loads cljs.core, so a transport that waited to see
+  ;; cljs.core go past would lose this print and no other - which is why connect
+  ;; requires it rather than watching for it.
   (with-page [rt out log]
-    (values rt 'browser-out.core "(js* \"console.log('hello from the page'), 1\")")
+    (values rt 'browser-out.core
+            "(js* \"cljs.core.$STAR$print_fn$STAR$('hello from the page'), 1\")")
     (is (wait-for #(str/includes? (str out) "hello from the page")))))
+
+(h/deftest-when h/node? test-a-print-ends-its-line
+  ;; *print-newline* put back. `enable-console-print!' turns it off, because
+  ;; console.log ends a line by itself and a println that ended one too would print
+  ;; every line twice over; a socket ends nothing, so without this every println
+  ;; arrives glued to the one after it.
+  (with-page [rt out log]
+    (is (= ["true"]
+           (values rt 'browser-newline.core
+                   "(js* \"cljs.core.$STAR$print_newline$STAR$\")")))))
+
+(h/deftest-when h/node? test-the-page-s-console-stays-in-the-page
+  ;; The half of the old tee that is gone. A console.log is a program talking to the
+  ;; BROWSER - devtools shows it against the line that produced it, with the object
+  ;; itself rather than a printed copy - and on an application of any size it is most
+  ;; of what there is, so forwarding it made the REPL's output mostly somebody
+  ;; else's. Nothing is lost by leaving it where it was already going.
+  (with-page [rt out log]
+    (values rt 'browser-console.core "(js* \"console.log('only in devtools'), 1\")")
+    (values rt 'browser-console.core
+            "(js* \"cljs.core.$STAR$print_fn$STAR$('and this one travels'), 1\")")
+    (is (wait-for #(str/includes? (str out) "and this one travels")))
+    ;; by which time a tee would have carried the console.log too, having sent it
+    ;; first
+    (is (not (str/includes? (str out) "only in devtools")))
+    ;; and the page did print it, where a page prints
+    (is (wait-for #(str/includes? (str log) "only in devtools")))))
 
 
 (h/deftest-when h/node? test-a-print-arrives-before-the-value-of-the-form-that-printed-it
@@ -293,7 +330,7 @@
   ;; is the point: a wait here would pass under the old transport too.
   (with-page [rt out log]
     (let [v (values rt 'browser-order.core
-                    "(js* \"console.log('printed first'), 42\")")]
+                    "(js* \"cljs.core.$STAR$print_fn$STAR$('printed first'), 42\")")]
       (is (= ["42"] v))
       (is (str/includes? (str out) "printed first")
           "already written when the value came back"))))

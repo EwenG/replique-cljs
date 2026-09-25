@@ -35,7 +35,7 @@
 // (§5): evaluate() returns a promise that is already the whole turn, imports and
 // all, so awaiting it is the entire mechanism.
 
-import { errorEdn, evaluate, print as printValue } from "./runtime.js";
+import { errorEdn, evaluate, munge } from "./runtime.js";
 
 // --- the connection ---------------------------------------------------------
 
@@ -66,10 +66,19 @@ function sleep(ms) {
 // --- printing ---------------------------------------------------------------
 //
 // A browser has no stdout for the JVM to pump, so the :print channel is not
-// optional here the way it is under node (§8). Before M5 there is no *print-fn* to
-// set, so what there is to forward is the console - and it is TEE'd rather than
-// replaced, because the devtools console is where a browser user looks first and
-// taking it away to feed a REPL would be a poor trade.
+// optional here the way it is under node (§8). What fills it is cljs.core's
+// *print-fn*, which is the channel's own name for itself: a println is a program
+// saying something to whoever reads its output, and under a REPL that is the REPL.
+//
+// IT USED TO BE THE CONSOLE, TEE'd, because before cljs.core was vendored there was
+// no *print-fn* to set and the console was the only thing there was to forward.
+// That made ONE WIRE OUT OF TWO DIFFERENT THINGS. A console.log is a program
+// talking to the BROWSER: devtools shows it against the line that produced it, with
+// the object itself rather than a printed copy of it, expandable - and a page's own
+// logging is not something a REPL asked for. On an application of any size it is
+// most of what there is, so a REPL that forwarded it was a REPL whose output buffer
+// was mostly somebody else's. It stays in the console now, where it was going
+// anyway, and only what a program prints deliberately travels.
 //
 // No queue any more. Two POSTs needed one, because they were two connections that
 // could arrive in either order; two frames on one socket cannot.
@@ -78,19 +87,50 @@ export function sendPrint(s) {
   send(message("print", s));
 }
 
-function teeConsole() {
-  if (console.__cljsTee__) return;      // connect() may be called more than once
-  console.__cljsTee__ = true;
-  for (const name of ["log", "info", "warn", "error"]) {
-    const original = console[name].bind(console);
-    console[name] = function (...args) {
-      original(...args);
-      try {
-        sendPrint(args.map((x) => typeof x === "string" ? x : printValue(x))
-                      .join(" ") + "\n");
-      } catch (e) { /* a REPL that is not there is not a reason to lose the log */ }
-    };
-  }
+// The three vars, under the names a property lookup needs. munge is the compiler's
+// own, imported rather than spelt, so these cannot drift from what the emitter
+// wrote: `*print-fn*' is a property of the cljs.core namespace object like any
+// other var (doc/cljs-repl.md §3.1), and dynamic changes nothing about that.
+const PRINT_FN = munge("*print-fn*");
+const PRINT_ERR_FN = munge("*print-err-fn*");
+const PRINT_NEWLINE = munge("*print-newline*");
+
+// What cljs.core hands a *print-fn* is the pieces of one print, already strings.
+function printToRepl(...args) {
+  sendPrint(args.join(""));
+}
+
+// *print-newline* goes back to true with them, and that is not a detail:
+// `enable-console-print!' turns it off because console.log ends a line by itself,
+// and a socket does not. Without this every println arrives glued to the next one.
+function setPrint() {
+  const core = globalThis.$CLJS.namespaces.get("cljs.core");
+  // The namespace OBJECT exists from the prelude on - runtime.js publishes
+  // globalThis.cljs = { core: ns("cljs.core") } before anything is loaded - so what
+  // says cljs.core has RUN is one of its vars being there.
+  if (!core || !(PRINT_FN in core) || core[PRINT_FN] === printToRepl) return;
+  core[PRINT_FN] = printToRepl;
+  core[PRINT_ERR_FN] = printToRepl;
+  core[PRINT_NEWLINE] = true;
+}
+
+// REQUIRED here rather than waited for. cljs.core installs the console on ITSELF as
+// it loads - `maybe-enable-print!' calls `enable-console-print!' wherever there is a
+// js/console, which is every browser - so this has to happen after cljs.core has
+// run, and something has to make sure it does. Waiting for a namespace to go past
+// would lose exactly one println: the first, because the script carrying the first
+// form somebody types opens by requiring cljs.core (§5.12) and prints in the same
+// breath.
+//
+// Idempotent, and cheap when it is not the first: require_ answers a namespace
+// already loaded with null rather than fetching it again.
+//
+// A failure is not one. A page may connect before anything has been compiled into
+// the directory it would fetch from, and the two ends of every turn try again.
+async function installPrint() {
+  try { await globalThis.$CLJS.require("cljs.core"); }
+  catch (e) { /* not there yet; the next turn is another chance */ }
+  setPrint();
 }
 
 // --- what no turn owns -------------------------------------------------------
@@ -113,9 +153,13 @@ export function reportUncaught(e) {
   send(message("uncaught", errorEdn(e)));
 }
 
-// NOTHING IS PREVENTED, which is teeConsole's trade again: the devtools console is
-// where a browser user looks first, and a REPL that swallowed an uncaught error to
-// report it elsewhere would be taking away the better of the two reports.
+// NOTHING IS PREVENTED, and this is the one place a page's own reporting is still
+// listened to. An uncaught error is not console output - a browser reports one
+// through its own path and NOT by calling console.error - so taking the console out
+// of the print channel does not take this with it, and it should not: an exception
+// out of an event handler, in a tab with no devtools open, is the thing a developer
+// is least able to see for themselves. Listened to rather than intercepted: the
+// browser's own report of it is the better of the two, and it is left alone.
 function watchUncaught() {
   if (globalThis.__cljsUncaught__) return;   // connect() may be called more than once
   // A host that has no events to listen to is not a browser - node, under the
@@ -139,6 +183,10 @@ let turn = Promise.resolve();
 
 function onScript(js) {
   turn = turn.then(async () => {
+    // Both ends of the turn, because either can be the one that made it possible:
+    // cljs.core may have been loaded by the page between two forms, or by this form
+    // itself - and a form that loads it is a form that may print through it.
+    setPrint();
     let content;
     try {
       content = await evaluate(js);
@@ -148,6 +196,7 @@ function onScript(js) {
       // wait for an answer that is not coming.
       content = '{:status :error :value "' + String(e && e.message) + '"}';
     }
+    setPrint();
     send(message("result", content));
   });
 }
@@ -181,7 +230,7 @@ function open(url) {
 export async function connect(u) {
   base = u || new URL(".", import.meta.url).href;
   stopped = false;
-  teeConsole();
+  await installPrint();
   watchUncaught();
   for (;;) {
     try {

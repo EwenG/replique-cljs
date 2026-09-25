@@ -100,7 +100,8 @@
        "<html>\n<head><meta charset=\"utf-8\"><title>ClojureScript REPL</title></head>\n"
        "<body>\n"
        "<p>Connected to a ClojureScript REPL. Evaluate a form on the JVM side;\n"
-       "this page is where it runs. Open the console to see what the program prints.</p>\n"
+       "this page is where it runs. What it prints goes back to the REPL; its\n"
+       "console is its own.</p>\n"
        "<script type=\"module\">\n"
        "import { connect } from \"./" client-name "\";\n"
        "connect();\n"
@@ -667,7 +668,8 @@
     :port      what the asset server listens on, default 0, an ephemeral port
     :ws-port   what the socket listens on, default 0. A second port, for the reason
                this namespace's docstring gives
-    :out       where the page's console output is written, default *out*
+    :out       where what the page prints is written, default *out*.  What it
+               prints, and not what it logs: its console is its own
 
   Closeable, and closing it stops both servers and unblocks any evaluation still
   waiting on the page.
@@ -781,7 +783,7 @@
                    that is not open yet cannot be given it, and says so - the
                    compile happens either way
     :in :out       as clojure.cljs.repl/repl takes them
-    :program-out   where the page's console output goes, default :out
+    :program-out   where what the page prints goes, default :out
     :analysis      as clojure.cljs.repl/repl takes it
 
   One call, for the reason node-repl is one call: the driver compiles into a
