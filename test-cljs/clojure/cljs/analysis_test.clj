@@ -406,6 +406,33 @@
           (is (empty? (an/stale-files)))
           (is (empty? (an/stale-macro-files))))))))
 
+(deftest test-a-compile-against-an-unloaded-macro-edit-stays-stale
+  ;; a branch switch changes the macro file; a file is recompiled (a require
+  ;; :reload) before anything loads the macro file again, so it expands the old
+  ;; macro - its baseline must be the version the JVM has, not the one on disk
+  (let [cp  (h/temp-dir)
+        mf  (io/file cp "unloaded" "macros.clj")
+        _   (.mkdirs (.getParentFile mf))
+        _   (touch! mf "(ns unloaded.macros)\n(defmacro answer [] 1)\n")]
+    (with-classpath-dir cp
+      (fn []
+        (let [{:keys [cenv opts src]}
+              (compile! '{app.core "(ns app.core
+  (:require-macros [unloaded.macros :refer [answer]]))
+(def a (answer))"})
+              core (str (io/file src "app/core.cljs"))]
+          (touch! mf "(ns unloaded.macros)\n(defmacro answer [] 42)\n")
+          (let [r (an/load-file! cenv core opts)]
+            (is (not (str/includes? (second (last (:scripts r))) "42"))
+                "the JVM still has the old macro"))
+          (is (= #{"unloaded/macros.clj"} (an/stale-macro-files)))
+          (is (= #{"app/core.cljs"} (an/stale-files)))
+          (let [r (an/stale-reload! cenv opts)]
+            (is (= ["unloaded/macros.clj"] (:macro-files r)))
+            (is (str/includes? (second (last (:scripts r))) "42")))
+          (is (empty? (an/stale-files)))
+          (is (empty? (an/stale-macro-files))))))))
+
 (deftest test-stale-reload-at-the-repl
   (let [{:keys [cenv opts src]} (compile! program)
         shipped (atom [])

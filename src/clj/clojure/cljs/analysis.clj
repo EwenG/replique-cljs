@@ -87,7 +87,13 @@
 ;;   :file-mtime     {source long-or-nil}  its mtime when it was last compiled; nil
 ;;                                         for one that is not a file (a jar entry)
 ;;   :macro-files    {source {resource long}}  the Clojure files of the macros it
-;;                                         expanded, and their mtimes at that compile
+;;                                         expanded, and the mtime of the version
+;;                                         the JVM had loaded then (:macro-loaded)
+;;   :macro-loaded   {resource long}       the mtime of the version of a macro file
+;;                                         the JVM has loaded, as far as this model
+;;                                         knows: taken the first time a file
+;;                                         expands one of its macros, advanced only
+;;                                         when stale-reload! loads it again
 ;;   :next-fid       long
 ;; derived (build-index, cached by :forms identity):
 ;;   :usages         {qsym #{span}}
@@ -102,7 +108,7 @@
 ;;   :host-usages    {host-ref #{span}}   host-ref is a map - see host-ref
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :file-mtime {} :macro-files {}
-   :next-fid 0})
+   :macro-loaded {} :next-fid 0})
 
 (defonce ^:private model (atom empty-model))
 
@@ -360,13 +366,17 @@
 
 (defn- macro-files
   "The Clojure files the macros a file's forms expanded were loaded from, each with
-  its mtime NOW - at the end of the compile that expanded them. A macro whose var
-  has no :file on the classpath (one defined at a REPL) has no file to go stale."
-  [buffer]
+  the mtime of the version the JVM has loaded (`loaded`, :macro-loaded) - not the
+  one on disk now, which the JVM may not have loaded: a macro file edited, or
+  changed by a branch switch, and not loaded since, still expands its old macros.
+  A file this model has not seen before is taken to be loaded as it is on disk.
+  A macro whose var has no :file on the classpath (one defined at a REPL) has no
+  file to go stale."
+  [loaded buffer]
   (into {} (for [fe buffer
                  [_ _ file] (:macro-deps fe)
                  :when file
-                 :let [t (mtime file)]
+                 :let [t (or (get loaded file) (mtime file))]
                  :when t]
              [file t])))
 
@@ -395,10 +405,14 @@
                           :next-fid (+ base (long begin-count)))))))
     (swap! model
            (fn [m]
-             (-> m
-                 (assoc-in [:locations source] (.location fr))
-                 (assoc-in [:file-mtime source] (.mtime fr))
-                 (assoc-in [:macro-files source] (macro-files buffer)))))
+             (let [mfiles (macro-files (:macro-loaded m) buffer)]
+               (-> m
+                   (assoc-in [:locations source] (.location fr))
+                   (assoc-in [:file-mtime source] (.mtime fr))
+                   (assoc-in [:macro-files source] mfiles)
+                   ;; the files seen for the first time: merge keeps a baseline
+                   ;; already there, which only a reload advances
+                   (update :macro-loaded #(merge mfiles %))))))
     nil))
 
 (defn- def-echo?
@@ -923,8 +937,9 @@
                 source))))
 
 (defn- changed-macro-files*
-  "{source #{resource}}: for each analysed file, the macro files that changed since
-  it expanded them."
+  "{source #{resource}}: for each analysed file, the macro files it expanded a
+  version of that is not the one on disk now - edited since, or already edited
+  and not loaded again when it expanded them."
   [m]
   (into {} (for [[source files] (:macro-files m)
                  :let [changed (into #{} (for [[file t] files
@@ -936,15 +951,21 @@
 
 (defn stale-macro-files
   "The Clojure files (classpath resources, e.g. \"app/macros.clj\") of macros some
-  analysed file expanded, changed since it did. They are what stale-reload! loads
-  on the JVM before it recompiles anything."
+  analysed file expanded, changed on disk since the JVM loaded them - as far as
+  this model knows, see :macro-loaded. They are what stale-reload! loads on the
+  JVM before it recompiles anything."
   []
-  (into #{} cat (vals (changed-macro-files* @model))))
+  (let [m @model]
+    (into #{} (for [file (into #{} (mapcat keys) (vals (:macro-files m)))
+                    :let [t   (get-in m [:macro-loaded file])
+                          now (mtime file)]
+                    :when (and t now (not= now t))]
+                file))))
 
 (defn stale-files
   "The analysed files to recompile: those edited since they were compiled
-  (changed-files), and those that expanded a macro whose file was edited since
-  they expanded it. No cascade beyond that: a ClojureScript file depends at compile
+  (changed-files), and those that expanded a version of a macro file other than
+  the one on disk now. No cascade beyond that: a ClojureScript file depends at compile
   time on macros only, and a var it uses is looked up at run time."
   []
   (into (changed-files) (keys (changed-macro-files* @model))))
@@ -958,7 +979,9 @@
   [res]
   (if (seq (clj-analysis/file-forms res))
     (clj-analysis/load-file! res)
-    (load (str "/" (strip-ext res)))))
+    (load (str "/" (strip-ext res))))
+  (when-let [t (mtime res)]
+    (swap! model assoc-in [:macro-loaded res] t)))
 
 (defn- in-require-order
   "`sources` ordered so that a file comes after the files it requires, as far as
