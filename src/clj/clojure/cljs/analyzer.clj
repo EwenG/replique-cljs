@@ -590,6 +590,15 @@
         ;; sites in cljs.core against two thousand that test a predicate's result.
         (when (and (= :fn (:op init)) (:tag (meta sym)))
           (alter-meta! v assoc :ret-tag (:tag (meta sym))))
+        ;; AND A REDEFINITION REPLACES THE TAGS, for the reason below: merged, a
+        ;; ^boolean dropped from the source would stay on the var, and every if
+        ;; compiled against it after would skip truth_ for a value that may be
+        ;; nil. Only a def with an init - a declare says nothing new.
+        (when init?
+          (when-not (:tag (meta sym))
+            (alter-meta! v dissoc :tag))
+          (when-not (and (= :fn (:op init)) (:tag (meta sym)))
+            (alter-meta! v dissoc :ret-tag)))
         ;; A REDEFINITION REPLACES THE SHAPE, IT DOES NOT ADD TO IT. The metadata
         ;; above is merged, which is right for a doc string and wrong for :top-fn:
         ;; redefining a two-arity foo as a one-argument one would leave the old

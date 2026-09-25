@@ -58,17 +58,19 @@
   ClojureScript file has. stale-reload! recompiles them, reloading the macro files
   on the JVM first, and hands back the scripts a runtime needs.
 
-  Drivers: run-analysis, load-file!, retract-file!, reset-model!, stale-reload!. Queries:
-  find-usages, definition, find-keyword-usages, find-macro-usages,
-  find-host-usages, macro-deps, ns-referenced-namespaces, unused-locals,
-  unused-aliases, unused-refers, unused-imports, unused-macro-aliases,
-  unused-macro-refers, changed-files, stale-macro-files, stale-files, file-forms, file-namespaces, ns-forms,
-  snapshot."
+  Drivers: run-analysis, load-file!, retract-file!, reset-model!, stale-reload!,
+  prune-file!. Queries: find-usages, definition, find-keyword-usages,
+  find-macro-usages, find-host-usages, macro-deps, ns-referenced-namespaces,
+  unused-locals, unused-aliases, unused-refers, unused-imports,
+  unused-macro-aliases, unused-macro-refers, changed-files, stale-macro-files,
+  stale-files, meta-stale-files, deleted-files, file-def-vars,
+  file-def-var-snapshot, file-forms, file-namespaces, ns-forms, snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
   (:require [clojure.analysis :as clj-analysis]
             [clojure.cljs.ast :as ast]
             [clojure.cljs.driver :as driver]
+            [clojure.cljs.emitter :as emitter]
             [clojure.cljs.env :as env]
             [clojure.cljs.macroexpand :as mx]
             [clojure.java.io :as io])
@@ -81,7 +83,9 @@
 ;;   :forms          {fid {:ns :source :line :column + one key per non-empty fact
 ;;                         category: :usages :defs :locals :local-uses
 ;;                         :keyword-usages :macro-usages :macro-deps
-;;                         :host-usages}}
+;;                         :host-usages :var-meta-deps}}
+;;                   :var-meta-deps is [qsym key value]: a var's metadata the
+;;                   compile of the form read (see record-meta-deps!)
 ;;   :source->forms  {source #{fid}}
 ;;   :locations      {source File-or-URL}  where each file was last found
 ;;   :file-mtime     {source long-or-nil}  its mtime when it was last compiled; nil
@@ -172,11 +176,12 @@
 (def ^:private ^:const CAT-MACROUSE 5)
 (def ^:private ^:const CAT-MACRODEP 6)
 (def ^:private ^:const CAT-HOST     7)
-(def ^:private ^:const N-CATS       8)
+(def ^:private ^:const CAT-METADEP  8)
+(def ^:private ^:const N-CATS       9)
 
 (def ^:private cat-keys
   [:usages :defs :locals :local-uses :keyword-usages :macro-usages :macro-deps
-   :host-usages])
+   :host-usages :var-meta-deps])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -258,6 +263,25 @@
     (add-fact! of CAT-USAGES (span (:name node) source (:line m) (:column m)
                                    (:end-line m) (:end-column m) from-ns))))
 
+(defn- record-meta-deps!
+  "The var's metadata the emitted code was built from - a compile-time dependency
+  on the file that defines the var, which a run-time lookup does not undo.
+
+    :tag      (def ^boolean x ...): an if on x skips the truth_ check
+    :ret-tag  (defn ^boolean f ...): an if on (f ...) does too
+    :top-fn   the arities; a call site dispatches straight to one - only when
+              emitter/*static-dispatch* is on, which is the only time it is read
+
+  Every :var node, written or not: a macro's expansion is compiled against the
+  same metadata. Only what is there: a tag or arity ADDED later leaves the code
+  correct, merely unoptimised; one changed or removed does not."
+  [^OpenForm of node]
+  (let [q (:name node)]
+    (when-some [t (:tag node)] (add-fact! of CAT-METADEP [q :tag t]))
+    (when-some [t (:ret-tag node)] (add-fact! of CAT-METADEP [q :ret-tag t]))
+    (when (and emitter/*static-dispatch* (:top-fn node))
+      (add-fact! of CAT-METADEP [q :top-fn (:top-fn node)]))))
+
 ;; A local's identity is its JavaScript name within its file: clojure.cljs.names
 ;; numbers every binding of a file from one counter (the driver compiles a file
 ;; inside one name scope), so [source js-name] names exactly one binding, and a
@@ -336,7 +360,8 @@
                   (doseq [c (ast/children n) :when (not (identical? c v))]
                     (visit c)))
 
-                :var (record-usage! of source ns n)
+                :var (do (record-usage! of source ns n)
+                         (record-meta-deps! of n))
 
                 :binding
                 (do (when-not (.containsKey def-names (:form n))
@@ -460,7 +485,9 @@
                          (assoc fe (nth cat-keys i)
                                 ;; one edge per macro per form: a form expanding
                                 ;; `when` a hundred times depends on it once
-                                (if (= i CAT-MACRODEP) (vec (distinct l)) (vec l)))
+                                (if (or (= i CAT-MACRODEP) (= i CAT-METADEP))
+                                  (vec (distinct l))
+                                  (vec l)))
                          fe)))
                    nil (range N-CATS))]
     (when fe
@@ -987,24 +1014,120 @@
     (into (into #{} (filter mtime) (:pending-macro-files m))
           (macro-closure (into (set edited) (clj-analysis/changed-files)) tracked))))
 
+(defn- cljs-var
+  "The ClojureScript Var `qsym` names in `cenv`, or nil."
+  ^Var [cenv qsym]
+  (when-let [^Namespace n (env/find-cljs-ns cenv (symbol (namespace qsym)))]
+    (.findInternedVar n (symbol (name qsym)))))
+
+(defn meta-stale-files
+  "The analysed files compiled against a var's metadata that the var in `cenv` no
+  longer has (see record-meta-deps!): a ^boolean dropped, an arity a static call
+  site named gone, the var itself removed. What changes it is the var's file
+  recompiled, or a def typed at a REPL - which never enters the model but does
+  change the var - so this asks the compile environment, not the disk."
+  [cenv]
+  (let [m   @model
+        cur (memoize (fn [q k] (some-> (cljs-var cenv q) meta (get k))))]
+    (into #{} (for [[_ fe] (:forms m)
+                    :when (some (fn [[q k v]] (not= v (cur q k))) (:var-meta-deps fe))]
+                (:source fe)))))
+
 (defn stale-files
   "The analysed files to recompile: those edited since they were compiled
   (changed-files); those that expanded a version of a macro file other than the
   one on disk now; those that expanded a macro from a file stale-macro-files will
   load again, which an edit to another Clojure file can put there; and any a
-  stale-reload! that threw left uncompiled. No cascade among ClojureScript files: one
-  depends at compile time on macros only, and a var it uses is looked up at run
-  time."
+  stale-reload! that threw left uncompiled. Given `cenv`, also meta-stale-files.
+
+  No cascade among ClojureScript files past that metadata: a var a file uses is
+  looked up at run time, so editing the var's file leaves its users' code right."
+  ([]
+   (let [m      @model
+         reload (stale-macro-files)]
+     (-> (changed-files)
+         (into (keys (changed-macro-files* m)))
+         (into (for [[source files] (:macro-files m)
+                     :when (some reload (keys files))]
+                 source))
+         ;; one deleted since has nothing to recompile it from
+         (into (filter #(mtime (get-in m [:locations %]))) (:pending-sources m)))))
+  ([cenv]
+   (into (stale-files) (meta-stale-files cenv))))
+
+(defn deleted-files
+  "Analysed files that were compiled from a file on disk and whose file is gone -
+  deleted, renamed, or left behind by a branch switch. changed-files skips them:
+  there is nothing to recompile them from."
   []
-  (let [m      @model
-        reload (stale-macro-files)]
-    (-> (changed-files)
-        (into (keys (changed-macro-files* m)))
-        (into (for [[source files] (:macro-files m)
-                    :when (some reload (keys files))]
-                source))
-        ;; one deleted since has nothing to recompile it from
-        (into (filter #(mtime (get-in m [:locations %]))) (:pending-sources m)))))
+  (let [m @model]
+    (into #{} (for [[source t] (:file-mtime m)
+                    :when (and t (nil? (mtime (get-in m [:locations source]))))]
+                source))))
+
+;; --- prune ----------------------------------------------------------------------
+
+(defn file-def-vars
+  "The fully-qualified names of the vars file `source` has a def form for, as the
+  model has it now."
+  [source]
+  (set (for [[k e] (:defs (derived @model))
+             :when (= source (:source (:span e)))]
+         k)))
+
+(defn file-def-var-snapshot
+  "{qsym Var} for the vars file `source` defines, as `cenv` holds them - prune-file!'s
+  `prior`, taken BEFORE the file is recompiled
+  (clojure.analysis/file-def-var-snapshot)."
+  [cenv source]
+  (into {} (for [k (file-def-vars source)] [k (cljs-var cenv k)])))
+
+(defn- prune-vars!
+  "Remove from `cenv` each var of `prior` that no live form defines any more and
+  that is still the Var `prior` saw. Warns when one is still used. Returns them."
+  [cenv prior]
+  (let [idx  (derived @model)
+        gone (for [[k old] prior
+                   :when (and old
+                              (nil? (get (:defs idx) k))
+                              (identical? old (cljs-var cenv k)))]
+               k)]
+    (doseq [k gone]
+      (when-let [us (seq (get (:usages idx) k))]
+        (binding [*out* *err*]
+          (println "WARN: pruning" (str k) "still referenced at"
+                   (vec (sort (for [u us] [(:source u) (:line u) (:column u)]))))))
+      (env/remove-var! cenv k))
+    (vec gone)))
+
+(defn prune-file!
+  "Remove from the compile environment the vars whose def form vanished from file
+  `source` - clojure.analysis/prune-file!, on `cenv` rather than the JVM's
+  namespaces. `prior` is file-def-var-snapshot taken before `source` was
+  recompiled. A var is removed when it was in `prior`, no live form defines it now,
+  and the same Var object is still in `cenv`; env/remove-var! also unmaps it from
+  every namespace that referred it. A use of it recorded anywhere is warned about,
+  and it is removed all the same. Returns the removed names.
+
+  THE COMPILE ENVIRONMENT ONLY. The runtime keeps the property, so code already
+  compiled against the var runs as before; what changes is that nothing compiled
+  from now on resolves it - a file that still uses it warns when it is recompiled,
+  as does a form typed at a REPL. Removing it from the runtime too is
+  clojure.cljs.repl's remove-var.
+
+  Only vars the model saw defined by a def form a reader wrote are candidates: a
+  var a macro made up a name for (deftype's ->T) is never removed, which leaves one
+  whose source is gone behind, and never removes one that is not.
+
+  Refuses a file the model has no forms for, as clojure.analysis's does: it would
+  remove vars it simply never recorded."
+  [cenv source prior]
+  (when-not (seq (get-in @model [:source->forms source]))
+    (throw (ex-info (str "prune-file! refused: " source " has no analysed forms in the "
+                         "model - prune is only valid right after it was compiled under "
+                         "the sink")
+                    {:source source})))
+  (prune-vars! cenv prior))
 
 (defn- strip-ext [^String res]
   (subs res 0 (.lastIndexOf res ".")))
@@ -1050,34 +1173,66 @@
 (defn stale-reload!
   "Bring the compiled program back in step with the disk: load every stale macro
   file on the JVM (stale-macro-files), then recompile every stale file
-  (stale-files) under the sink, in require order. Returns
+  (stale-files, given `cenv`) under the sink, in require order - and then, in more
+  rounds, the files compiled against metadata that recompiling changed
+  (meta-stale-files). Files deleted from disk are retracted from the model first
+  (deleted-files). Returns
 
     :macro-files  the Clojure files loaded again
     :reloaded     the files recompiled, in order
+    :deleted      the files retracted
+    :pruned       the vars removed from the compile environment (:prune)
     :scripts      [ns script] for every namespace compiled, in order - what a REPL
                   ships to its runtimes (clojure.cljs.repl's stale-reload)
 
-  `opts` are the driver's (compile-file!).
+  `opts` are the driver's (compile-file!). With :prune true, the vars a
+  recompiled file no longer defines, and those of a deleted file, are removed from
+  `cenv` (prune-file!) - before the next file compiles, so one that still uses them
+  warns - and not from the runtime.
 
   The macro files are loaded in the Clojure model's macro order where it covers
-  them (see reload-macro-files!). Both sets are taken before anything is loaded -
-  loading a macro file clears what made its expanders stale - and kept in the model
-  as pending until each is done.
+  them (see reload-macro-files!). The stale sets are taken before anything is
+  loaded - loading a macro file clears what made its expanders stale - and kept in
+  the model as pending until each is done.
 
   FAIL-FAST, as clojure.analysis/stale-reload! is: a file that does not load or
   compile throws, and the ones after it are not reached. Nothing is lost - what was
-  not done stays pending, and is stale again next time."
-  [cenv opts]
+  not done stays pending, and is stale again next time; a var not pruned then is
+  not pruned later, though, since its def has left the model."
+  [cenv opts & {:keys [prune]}]
   (let [mfiles  (stale-macro-files)
-        sources (in-require-order cenv (stale-files))
+        sources (in-require-order cenv (stale-files cenv))
+        deleted (sort (deleted-files))
         _       (swap! model #(-> %
                                   (update :pending-macro-files into mfiles)
                                   (update :pending-sources into sources)))
         mfiles  (reload-macro-files! mfiles)
-        locs    (:locations @model)
-        results (mapv (fn [s]
-                        (load-file! cenv (str (location-file (get locs s))) opts))
-                      sources)]
+        pruned  (atom [])
+        _       (doseq [s deleted]
+                  (let [prior (when prune (file-def-var-snapshot cenv s))]
+                    (retract-file! s)
+                    (when prune (swap! pruned into (prune-vars! cenv prior)))))
+        compile (fn [s]
+                  (let [prior (when prune (file-def-var-snapshot cenv s))
+                        r     (load-file! cenv (str (location-file
+                                                     (get-in @model [:locations s])))
+                                          opts)]
+                    (when prune (swap! pruned into (prune-file! cenv s prior)))
+                    r))
+        ;; a round's recompiles can change the metadata another file was compiled
+        ;; against; each round settles the files the last one unsettled. Bounded,
+        ;; because a file's metadata could in principle follow another's in a cycle:
+        ;; what is left then is meta-stale, and found next time.
+        [order results]
+        (loop [order sources, results (mapv compile sources), rounds 0]
+          (let [more (in-require-order cenv (meta-stale-files cenv))]
+            (if (or (empty? more) (> rounds (count (:source->forms @model))))
+              [order results]
+              (do (swap! model update :pending-sources into more)
+                  (recur (into order more) (into results (mapv compile more))
+                         (inc rounds))))))]
     {:macro-files (vec mfiles)
-     :reloaded    sources
+     :reloaded    order
+     :deleted     (vec deleted)
+     :pruned      @pruned
      :scripts     (into [] (mapcat :scripts) results)}))

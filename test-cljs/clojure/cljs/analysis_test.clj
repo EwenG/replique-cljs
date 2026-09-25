@@ -531,6 +531,103 @@
             (is (empty? (an/stale-files))))
           (finally (clj-analysis/reset-model!)))))))
 
+;; --- prune and metadata dependencies ---------------------------------------------
+
+(defn- has-var? [cenv qsym]
+  (some? (some-> (env/find-cljs-ns cenv (symbol (namespace qsym)))
+                 (.findInternedVar (symbol (name qsym))))))
+
+(def ^:private prune-program
+  '{deep.util "(ns deep.util)
+(def keep 1)
+(def gone 2)
+(def ^boolean flag? true)"
+    app.core "(ns app.core
+  (:require [deep.util :as u :refer [gone]]))
+(def a u/keep)
+(def b (if u/flag? 1 2))
+(def c gone)"})
+
+(deftest test-a-deleted-def-is-pruned-from-the-compile-env
+  (let [{:keys [cenv opts src]} (compile! prune-program)
+        f (io/file src "deep/util.cljs")]
+    (is (has-var? cenv 'deep.util/gone))
+    (touch! f "(ns deep.util)\n(def keep 1)\n(def ^boolean flag? true)\n")
+    (let [err (java.io.StringWriter.)
+          r   (binding [*err* err] (an/stale-reload! cenv opts :prune true))]
+      (testing "a var deleted from the source is not deleted by recompiling; prune does"
+        (is (= '[deep.util/gone] (:pruned r)))
+        (is (not (has-var? cenv 'deep.util/gone)))
+        (is (has-var? cenv 'deep.util/keep)))
+      (testing "and from the namespace that referred it"
+        (is (nil? (get (.getMappings (env/find-cljs-ns cenv 'app.core)) 'gone))))
+      (testing "a use of it is warned about"
+        (is (str/includes? (str err) "deep.util/gone")))
+      (testing "the runtime is not told: no delete in what is shipped"
+        (is (not-any? #(str/includes? (second %) "delete ") (:scripts r)))))))
+
+(deftest test-no-prune-unless-asked
+  (let [{:keys [cenv opts src]} (compile! prune-program)]
+    (touch! (io/file src "deep/util.cljs")
+            "(ns deep.util)\n(def keep 1)\n(def ^boolean flag? true)\n")
+    (is (= [] (:pruned (an/stale-reload! cenv opts))))
+    (is (has-var? cenv 'deep.util/gone))))
+
+(deftest test-a-deleted-file-is-retracted-and-pruned
+  (let [{:keys [cenv opts src]}
+        (compile! '{deep.util "(ns deep.util)\n(def x 1)"
+                    other.lib "(ns other.lib)\n(def y 2)"
+                    app.core  "(ns app.core (:require [deep.util] [other.lib]))"})]
+    (.delete (io/file src "other/lib.cljs"))
+    (is (= #{"other/lib.cljs"} (an/deleted-files)))
+    (is (empty? (an/stale-files)))
+    (let [r (an/stale-reload! cenv opts :prune true)]
+      (is (= ["other/lib.cljs"] (:deleted r)))
+      (is (= '[other.lib/y] (:pruned r))))
+    (is (empty? (an/file-forms "other/lib.cljs")))
+    (is (empty? (an/deleted-files)))
+    (is (not (has-var? cenv 'other.lib/y)))
+    (is (has-var? cenv 'deep.util/x))))
+
+(deftest test-a-dropped-tag-makes-its-users-stale
+  (let [{:keys [cenv opts src]} (compile! prune-program)]
+    (is (empty? (an/meta-stale-files cenv)))
+    (touch! (io/file src "deep/util.cljs")
+            "(ns deep.util)\n(def keep 1)\n(def gone 2)\n(def flag? true)\n")
+    (testing "the edit alone does not tell: the var has its old tag until recompiled"
+      (is (= #{"deep/util.cljs"} (an/stale-files cenv))))
+    (let [r (an/stale-reload! cenv opts)]
+      (testing "recompiling it drops the tag, and app.core was compiled against it"
+        (is (= ["deep/util.cljs" "app/core.cljs"] (:reloaded r)))
+        (is (str/includes? (second (last (:scripts r))) "truth_"))))
+    (is (empty? (an/stale-files cenv)))))
+
+(deftest test-a-def-at-the-repl-changes-what-is-meta-stale
+  (let [{:keys [cenv]} (compile! prune-program)
+        v (.findInternedVar (env/find-cljs-ns cenv 'deep.util) 'flag?)]
+    (alter-meta! v dissoc :tag)
+    (is (= #{"app/core.cljs"} (an/meta-stale-files cenv)))
+    (is (not (contains? (an/stale-files) "app/core.cljs")) "the disk-only arity")))
+
+(deftest test-arity-dependencies-only-under-static-dispatch
+  (let [src  (h/write-sources!
+              '{deep.util "(ns deep.util)\n(defn f ([a] a) ([a b] b))"
+                app.core  "(ns app.core (:require [deep.util :as u]))\n(def a (u/f 1 2))"})
+        edit "(ns deep.util)\n(defn f ([a] a))"
+        run  (fn [static?]
+               (an/reset-model!)
+               (let [cenv (env/compile-env {:ns 'cljs.user})
+                     opts {:out-dir (h/temp-dir) :source-paths [src]
+                           :static-dispatch static?}]
+                 (an/run-analysis #(driver/compile-namespace! cenv 'app.core opts))
+                 (let [before (slurp (io/file src "deep/util.cljs"))]
+                   (touch! (io/file src "deep/util.cljs") edit)
+                   (let [r (:reloaded (an/stale-reload! cenv opts))]
+                     (touch! (io/file src "deep/util.cljs") before)
+                     r))))]
+    (is (= ["deep/util.cljs" "app/core.cljs"] (run true)))
+    (is (= ["deep/util.cljs"] (run false)))))
+
 (deftest test-stale-reload-at-the-repl
   (let [{:keys [cenv opts src]} (compile! program)
         shipped (atom [])

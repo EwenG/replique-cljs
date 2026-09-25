@@ -620,8 +620,9 @@
   declares, and run its body.
 
   Always forced, which is what distinguishes it from require: you asked for this
-  file. The sweep rides along in the body's own prologue, so a def deleted from the
-  file is deleted from the runtime in the same script that redefines the rest."
+  file. Nothing is swept: a def deleted from the file stays defined in the runtime
+  (driver/body-script says why). remove-var deletes one; stale-reload, under
+  :analysis, removes such defs from the compile environment."
   [cenv runtime opts args]
   (need-out-dir! opts "load-file")
   (let [r (compiling opts #(driver/compile-file! cenv (unquoted (first args)) opts))]
@@ -635,10 +636,14 @@
 
   It knows what the analysis model knows, so it wants a REPL started with
   :analysis - one without it has compiled nothing under the sink, and has nothing
-  to find stale."
+  to find stale.
+
+  It prunes: a def deleted from a file stops resolving here, in the compile
+  environment (clojure.cljs.analysis/prune-file!), so a form still using it warns.
+  The runtime keeps it - remove-var is the special that deletes it there."
   [cenv runtime opts _args]
   (need-out-dir! opts "stale-reload")
-  (let [r   (analysis/stale-reload! cenv opts)
+  (let [r   (analysis/stale-reload! cenv opts :prune true)
         res (ship! runtime (mapv second (:scripts r)))]
     (if (= :error (:status res))
       res
