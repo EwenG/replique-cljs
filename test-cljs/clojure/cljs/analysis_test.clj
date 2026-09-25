@@ -277,3 +277,60 @@
     (is (empty? (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double)))
     (is (not (contains? (an/macro-deps 'app.core)
                         'clojure.cljs.analysis-test/calls-double)))))
+
+;; --- namespace lints -----------------------------------------------------------
+
+(def ^:private lints-program
+  '{deep.util  "(ns deep.util)
+(def x 1)
+(def y 2)
+(def double (fn* ([n] n)))"
+    other.lib  "(ns other.lib)
+(def z 3)"
+    app.core   "(ns app.core
+  (:require [deep.util :as du :refer [x y]]
+            [other.lib :as ol]
+            [goog.string :as gstring :refer [trimLeft trimRight]]
+            [\"react\" :as React :refer [useState useEffect]]
+            [\"react-dom\" :as ReactDOM])
+  (:import [goog.string StringBuffer])
+  (:require-macros [clojure.cljs.analysis-test :as t :refer [calls-double twice-double]]))
+(def a x)
+(def b (gstring/trim \" a \"))
+(def c (trimRight \" a \"))
+(def d (React/createElement \"div\"))
+(def e (useState 1))
+(def f (calls-double 1))
+(def g ::du/k)"})
+
+(defn- compile-lints! []
+  (let [src  (h/write-sources! lints-program)
+        cenv (env/compile-env {:ns 'cljs.user})]
+    (an/run-analysis #(driver/compile-namespace! cenv 'app.core
+                                                 {:out-dir (h/temp-dir) :source-paths [src]
+                                                  :npm {:build false}}))
+    cenv))
+
+(deftest test-namespace-lints
+  (let [cenv (compile-lints!)]
+    (testing "an alias whose namespace nothing is used from; a JS alias never written"
+      (is (= '{ol other.lib ReactDOM "react-dom"} (an/unused-aliases cenv 'app.core))))
+    (testing "a referred var, Closure name or JS export the source never uses"
+      (is (= '{y deep.util/y trimLeft goog.string/trimLeft useEffect ["react" "useEffect"]}
+             (an/unused-refers cenv 'app.core))))
+    (testing "an :import never named"
+      (is (= '{StringBuffer goog.string.StringBuffer} (an/unused-imports cenv 'app.core))))
+    (testing "macros: an alias nothing is called through counts as used when its
+              namespace is called by any name, as for a ClojureScript alias"
+      (is (= {} (an/unused-macro-aliases cenv 'app.core)))
+      (is (= '{twice-double clojure.cljs.analysis-test/twice-double}
+             (an/unused-macro-refers cenv 'app.core))))
+    (testing "what the namespace refers to"
+      (is (every? (an/ns-referenced-namespaces 'app.core)
+                  '[deep.util goog.string clojure.cljs.analysis-test])))
+    (testing "host references"
+      (is (= #{["app/core.cljs" 12 9]}
+             (lines (an/find-host-usages {:kind :js-module :specifier "react" :export "createElement"}))))
+      (is (= 2 (count (an/find-host-usages {:kind :js-module :specifier "react"}))))
+      (is (= #{["app/core.cljs" 11 9]}
+             (lines (an/find-host-usages {:kind :goog-var :name 'goog.string/trimRight})))))))

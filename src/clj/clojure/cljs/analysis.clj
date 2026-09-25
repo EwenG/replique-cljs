@@ -8,8 +8,11 @@
 
 (ns ^{:doc "In-memory semantic model of the ClojureScript this compiler compiled:
   var usages and definitions, local bindings and their uses, keyword
-  occurrences, macro calls, and the compile-time dependency of a form on every
-  macro it expanded - with precise source spans, across files.
+  occurrences, macro calls, references to the host (JavaScript globals, JS
+  modules, Closure namespaces), and the compile-time dependency of a form on every
+  macro it expanded - with precise source spans, across files. And the lints those
+  add up to, read against the namespace state the ns forms left in the compile
+  environment: unused aliases, refers, imports and macro requires.
 
   THE SAME MODEL AS replique-clj's clojure.analysis, and a separate one. Same
   shape - a log of top-level forms, each carrying the facts it produced, filed
@@ -50,8 +53,10 @@
   records. Each form keeps the namespace it was compiled in as :ns.
 
   Drivers: run-analysis, load-file!, retract-file!, reset-model!. Queries:
-  find-usages, definition, find-keyword-usages, find-macro-usages, macro-deps,
-  unused-locals, file-forms, file-namespaces, ns-forms,
+  find-usages, definition, find-keyword-usages, find-macro-usages,
+  find-host-usages, macro-deps, ns-referenced-namespaces, unused-locals,
+  unused-aliases, unused-refers, unused-imports, unused-macro-aliases,
+  unused-macro-refers, file-forms, file-namespaces, ns-forms,
   snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
@@ -59,13 +64,14 @@
             [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env]
             [clojure.cljs.macroexpand :as mx])
-  (:import [clojure.lang IAnalysisSink Keyword RT Var]
+  (:import [clojure.lang IAnalysisSink Keyword Namespace RT Var]
            [java.util ArrayList]))
 
 ;; stored (write model - mutated only by commit-frame! and retraction):
 ;;   :forms          {fid {:ns :source :line :column + one key per non-empty fact
 ;;                         category: :usages :defs :locals :local-uses
-;;                         :keyword-usages :macro-usages :macro-deps}}
+;;                         :keyword-usages :macro-usages :macro-deps
+;;                         :host-usages}}
 ;;   :source->forms  {source #{fid}}
 ;;   :locations      {source File-or-URL}  where each file was last found
 ;;   :next-fid       long
@@ -79,6 +85,7 @@
 ;;                                          from :usages, whose keys are
 ;;                                          ClojureScript vars - cljs.core/str is both
 ;;   :macro-deps     {ns-sym {macro-qsym #{fid}}}
+;;   :host-usages    {host-ref #{span}}   host-ref is a map - see host-ref
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :next-fid 0})
 
@@ -137,10 +144,12 @@
 (def ^:private ^:const CAT-KEYWORDS 4)
 (def ^:private ^:const CAT-MACROUSE 5)
 (def ^:private ^:const CAT-MACRODEP 6)
-(def ^:private ^:const N-CATS       7)
+(def ^:private ^:const CAT-HOST     7)
+(def ^:private ^:const N-CATS       8)
 
 (def ^:private cat-keys
-  [:usages :defs :locals :local-uses :keyword-usages :macro-usages :macro-deps])
+  [:usages :defs :locals :local-uses :keyword-usages :macro-usages :macro-deps
+   :host-usages])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -221,6 +230,35 @@
                             (norm-pos (:end-line m)) (norm-pos (:end-column m))
                             ns nil))))
 
+(defn- host-ref
+  "What a reference to the host names, as a map, or nil for a node that is not one.
+
+    {:kind :global    :name Foo}                     js/Foo, or a :refer-global
+    {:kind :goog-var  :name goog.string/trim}        a var in a Closure namespace
+    {:kind :goog-ns   :name goog.math.Long}          a Closure namespace as a value
+    {:kind :js-module :specifier \"react\"}           a JS module object
+    {:kind :js-module :specifier \"react\" :export \"useState\"}   one of its exports
+
+  plus :written, the symbol the source wrote, without its metadata. That is what
+  tells an alias from a refer when both reach the same export - React/useState and
+  a :referred useState are one export and two names - which is the question the
+  unused-* lints ask."
+  [n]
+  (when-let [r (case (:op n)
+                 :js-var        {:kind :global :name (:name n)}
+                 :goog-var      {:kind :goog-var :name (:name n)}
+                 :goog-ns       {:kind :goog-ns :name (:name n)}
+                 :js-module     {:kind :js-module :specifier (:specifier n)}
+                 :js-module-var {:kind :js-module :specifier (:specifier n)
+                                 :export (:export n)}
+                 nil)]
+    (cond-> r (symbol? (:form n)) (assoc :written (with-meta (:form n) nil)))))
+
+(defn- record-host! [^OpenForm of source ns node]
+  (when-let [m (written-at (:form node))]
+    (add-fact! of CAT-HOST (span (host-ref node) source (:line m) (:column m)
+                                 (:end-line m) (:end-column m) ns))))
+
 (defn- record-facts!
   "Walk one top-level form's AST into the open form.
 
@@ -260,6 +298,9 @@
                   (when-let [js (:clojure.cljs.analyzer/field-of m)]
                     (record-local-use! of source ns js (written-at (:form n))))
                   (run! visit (ast/children n)))
+
+                (:js-var :goog-var :goog-ns :js-module :js-module-var)
+                (record-host! of source ns n)
 
                 (run! visit (ast/children n))))]
       (visit node))))
@@ -544,10 +585,16 @@
                                (assoc! idx :macro-deps
                                        (assoc! sub n (update (get sub n {}) mk
                                                              (fnil conj #{}) fid)))))
-                           idx (:macro-deps fe)))))
+                           idx (:macro-deps fe))
+                   (reduce (fn [idx ^Span s]
+                             (let [sub (get idx :host-usages)
+                                   e   (.entity s)]
+                               (assoc! idx :host-usages
+                                       (assoc! sub e (conj (get sub e #{}) s)))))
+                           idx (:host-usages fe)))))
              (transient {:usages (transient {}) :defs (transient {}) :locals (transient {})
                          :keyword-usages (transient {}) :macro-usages (transient {})
-                         :macro-deps (transient {})})
+                         :macro-deps (transient {}) :host-usages (transient {})})
              (sort (keys forms)))]
     (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
 
@@ -623,6 +670,151 @@
          :when (every? (comp empty? :uses) infos)
          :when (or (nil? ns-sym) (= ns-sym (:ns info)))]
      (dissoc info :uses))))
+
+(defn find-host-usages
+  "Where the source refers to the host thing `ref` describes: a map in host-ref's
+  shape, matched on the keys it gives. {:kind :js-module :specifier \"react\"} is
+  every use of that module through any name; add :export for one export, or
+  :written for one spelling of it."
+  [ref]
+  (into #{}
+        (comp (filter (fn [[k _]] (= ref (select-keys k (keys ref)))))
+              (mapcat val)
+              (map span->map))
+        (:host-usages (derived @model))))
+
+;; --- namespace lints ------------------------------------------------------------
+;;
+;; clojure.analysis reads live namespace state for these, and so do they - but a
+;; ClojureScript namespace lives in a compile environment rather than in the JVM,
+;; so each takes the environment. What a namespace's ns form ESTABLISHED comes from
+;; there; what its code USES comes from the model. Both are about the last compile:
+;; a file edited since is answered as it was.
+
+(defn- from-ns? [ns-sym ^Span s] (= ns-sym (.from-ns s)))
+
+(defn- used-from
+  "The keys of index `m` with at least one span from `ns-sym`."
+  [m ns-sym]
+  (for [[k spans] m :when (some #(from-ns? ns-sym %) spans)] k))
+
+(defn- written-from
+  "Every symbol `ns-sym` wrote to reach the host - see host-ref's :written."
+  [idx ns-sym]
+  (into #{} (keep :written) (used-from (:host-usages idx) ns-sym)))
+
+(defn- written-as?
+  "Did one of the `written` symbols spell `nm` - bare, or as the namespace part of
+  nm/member?"
+  [written nm]
+  (let [s (str nm)]
+    (some #(or (= % nm) (= (namespace %) s)) written)))
+
+(defn ns-referenced-namespaces
+  "The namespaces `ns-sym` refers to, per the model: the namespace of every var,
+  namespaced keyword and macro its source uses, and every Closure namespace it
+  reaches. A macro's namespace is a JVM one - usually the ClojureScript namespace's
+  own name, which is what a .cljc library requiring itself for its macros relies on."
+  [ns-sym]
+  (let [idx (derived @model)
+        nss (fn [ks] (keep #(some-> (namespace %) symbol) ks))]
+    (into #{}
+          (concat (nss (used-from (:usages idx) ns-sym))
+                  (nss (used-from (:keyword-usages idx) ns-sym))
+                  (nss (used-from (:macro-usages idx) ns-sym))
+                  (keep (fn [r] (case (:kind r)
+                                  :goog-var (symbol (namespace (:name r)))
+                                  :goog-ns  (:name r)
+                                  nil))
+                        (used-from (:host-usages idx) ns-sym))))))
+
+(defn unused-aliases
+  "Aliases in `ns-sym` nothing uses: {alias target}. A ClojureScript or Closure
+  namespace alias is unused when nothing from its target namespace is referenced
+  (ns-referenced-namespaces); a JavaScript module's alias when the source never
+  writes it. The target is the namespace symbol, or the module's specifier - or
+  [specifier path] for one that named a path into the module.
+
+  The aliases an :import made are unused-imports', not these."
+  [cenv ns-sym]
+  (when-let [^Namespace n (env/find-cljs-ns cenv ns-sym)]
+    (let [used     (ns-referenced-namespaces ns-sym)
+          written  (written-from (derived @model) ns-sym)
+          imported (set (keys (env/imports cenv ns-sym)))]
+      (merge
+       (into {} (for [[a ^Namespace target] (.getAliases n)
+                      :let  [t (.getName target)]
+                      :when (not (imported a))
+                      :when (not (used t))]
+                  [a t]))
+       (into {} (for [[a [specifier path]] (env/js-aliases cenv ns-sym)
+                      :when (not (written-as? written a))]
+                  [a (if path [specifier path] specifier)]))))))
+
+(defn unused-refers
+  "Names `ns-sym` referred and never uses: {name target}. A ClojureScript var
+  referred in counts as used when the var is used from `ns-sym` by any name, as
+  clojure.analysis/unused-refers has it; a name drawn out of a JavaScript module or
+  a Closure namespace only when the source writes that name. The target is the
+  var's qualified name, a Closure name, or a JS module's [specifier export].
+  cljs.core's implicit refers are not refers here and are never reported."
+  [cenv ns-sym]
+  (when-let [^Namespace n (env/find-cljs-ns cenv ns-sym)]
+    (let [idx     (derived @model)
+          used    (set (used-from (:usages idx) ns-sym))
+          written (written-from idx ns-sym)]
+      (merge
+       (into {} (for [[sym v] (.getMappings n)
+                      :when (instance? Var v)
+                      :let  [home (.getName (.ns ^Var v))]
+                      :when (not (#{ns-sym 'cljs.core} home))
+                      :let  [k (var-key v)]
+                      :when (not (used k))]
+                  [sym k]))
+       (into {} (for [[sym target] (env/goog-refers cenv ns-sym)
+                      :when (not (written sym))]
+                  [sym target]))
+       (into {} (for [[sym target] (env/js-refers cenv ns-sym)
+                      :when (not (written sym))]
+                  [sym target]))))))
+
+(defn unused-imports
+  "Classes `ns-sym` :imported and never names: {name closure-name}."
+  [cenv ns-sym]
+  (let [written (written-from (derived @model) ns-sym)]
+    (into {} (for [[sym target] (env/imports cenv ns-sym)
+                   :when (not (written-as? written sym))]
+               [sym target]))))
+
+(defn- macro-view
+  "`ns-sym`'s view of the JVM, where :require-macros put its aliases and refers -
+  found, never created."
+  ^Namespace [cenv ns-sym]
+  (.find ^clojure.lang.NamespaceWorld (:macro-world cenv) ns-sym))
+
+(defn unused-macro-aliases
+  "Macro-namespace aliases in `ns-sym` through which no macro is called:
+  {alias jvm-ns}. As with unused-aliases, used means a macro of the target
+  namespace is called from `ns-sym`, by whatever name."
+  [cenv ns-sym]
+  (when-let [view (macro-view cenv ns-sym)]
+    (let [used (set (keep #(some-> (namespace %) symbol)
+                          (used-from (:macro-usages (derived @model)) ns-sym)))]
+      (into {} (for [[a ^Namespace target] (.getAliases view)
+                     :let  [t (.getName target)]
+                     :when (not (used t))]
+                 [a t])))))
+
+(defn unused-macro-refers
+  "Macros `ns-sym` referred and never calls: {name macro-qsym}."
+  [cenv ns-sym]
+  (when-let [view (macro-view cenv ns-sym)]
+    (let [used (set (used-from (:macro-usages (derived @model)) ns-sym))]
+      (into {} (for [[sym v] (.getMappings view)
+                     :when (instance? Var v)
+                     :let  [k (jvm-var-key v)]
+                     :when (not (used k))]
+                 [sym k])))))
 
 (defn file-forms
   "The fids currently attributed to file `source`."
