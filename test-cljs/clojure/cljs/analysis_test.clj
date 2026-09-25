@@ -24,6 +24,12 @@
   [x]
   (list 'deep.util/double x))
 
+(defmacro twice-double
+  "Calls calls-double from its expansion - a call nobody wrote."
+  [x]
+  (list 'clojure.cljs.analysis-test/calls-double
+        (list 'clojure.cljs.analysis-test/calls-double x)))
+
 (def ^:private program
   ;; every position asserted below is 1-based, line and column, as the reader counts
   '{deep.util "(ns deep.util)
@@ -226,3 +232,48 @@
     (is (not-any? #{:plain :app.core/mine} @heard))
     (testing "and the ClojureScript model still hears them"
       (is (seq (an/find-keyword-usages :plain))))))
+
+;; --- macros --------------------------------------------------------------------
+
+(def ^:private macros-program
+  '{deep.util "(ns deep.util)
+(def double (fn* ([x] (js* \"~{} * 2\" x))))"
+    app.core  "(ns app.core
+  (:require [deep.util])
+  (:require-macros [clojure.cljs.analysis-test :refer [calls-double twice-double]]))
+(def a (calls-double 1))
+(def b (twice-double 2))
+(def c (str 1))
+(def d (map str [1]))"})
+
+(deftest test-macro-usages
+  (compile! macros-program)
+  (testing "a call the source wrote"
+    (is (= #{{:source "app/core.cljs" :line 4 :column 9 :end-line 4 :end-column 21
+              :from-ns 'app.core}}
+           (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double)))
+    (is (= #{["app/core.cljs" 5 9]}
+           (lines (an/find-macro-usages #'twice-double)))))
+  (testing "a macro and a function of one name are two things"
+    (is (= #{["app/core.cljs" 6 9]} (lines (an/find-macro-usages 'cljs.core/str))))
+    (is (= #{["app/core.cljs" 7 13]} (lines (an/find-usages 'cljs.core/str))))))
+
+(deftest test-macro-deps
+  (compile! macros-program)
+  (testing "every macro expanded, including the ones another macro called"
+    (is (every? (an/macro-deps 'app.core)
+                '[clojure.cljs.analysis-test/calls-double
+                  clojure.cljs.analysis-test/twice-double
+                  cljs.core/str]))
+    (is (contains? (an/macro-deps) 'app.core)))
+  (testing "not a use, where nobody wrote the call"
+    (is (= 1 (count (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double))))))
+
+(deftest test-reloading-replaces-macro-facts
+  (let [{:keys [cenv opts src]} (compile! macros-program)
+        f (io/file src "app/core.cljs")]
+    (spit f "(ns app.core)\n(def a 1)\n")
+    (an/load-file! cenv (str f) opts)
+    (is (empty? (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double)))
+    (is (not (contains? (an/macro-deps 'app.core)
+                        'clojure.cljs.analysis-test/calls-double)))))

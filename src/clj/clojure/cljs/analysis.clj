@@ -7,8 +7,9 @@
 ;   You must not remove this notice, or any other, from this software.
 
 (ns ^{:doc "In-memory semantic model of the ClojureScript this compiler compiled:
-  var usages and definitions, local bindings and their uses, and keyword
-  occurrences, with precise source spans, across files.
+  var usages and definitions, local bindings and their uses, keyword
+  occurrences, macro calls, and the compile-time dependency of a form on every
+  macro it expanded - with precise source spans, across files.
 
   THE SAME MODEL AS replique-clj's clojure.analysis, and a separate one. Same
   shape - a log of top-level forms, each carrying the facts it produced, filed
@@ -32,7 +33,9 @@
   fact taken from the READER rather than the AST: the driver binds a sink around
   each form's read (clojure.cljs.reader/*analysis-sink*), and the reader reports
   every keyword it reads, auto-resolved ones (::x, ::alias/x) fully qualified in
-  the ClojureScript namespace being compiled.
+  the ClojureScript namespace being compiled. Macro expansions are the other fact
+  the AST cannot hold - a call is gone before a node is built - and come from a
+  hook in clojure.cljs.macroexpand (*on-expand*), which run-analysis binds.
 
   DISK ONLY. Nothing typed at a REPL reaches the model - the REPL does not go
   through the driver's file loop - so it stays in step with what is on disk.
@@ -47,20 +50,22 @@
   records. Each form keeps the namespace it was compiled in as :ns.
 
   Drivers: run-analysis, load-file!, retract-file!, reset-model!. Queries:
-  find-usages, definition, find-keyword-usages, unused-locals, file-forms, file-namespaces, ns-forms,
+  find-usages, definition, find-keyword-usages, find-macro-usages, macro-deps,
+  unused-locals, file-forms, file-namespaces, ns-forms,
   snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
   (:require [clojure.cljs.ast :as ast]
             [clojure.cljs.driver :as driver]
-            [clojure.cljs.env :as env])
+            [clojure.cljs.env :as env]
+            [clojure.cljs.macroexpand :as mx])
   (:import [clojure.lang IAnalysisSink Keyword RT Var]
            [java.util ArrayList]))
 
 ;; stored (write model - mutated only by commit-frame! and retraction):
 ;;   :forms          {fid {:ns :source :line :column + one key per non-empty fact
 ;;                         category: :usages :defs :locals :local-uses
-;;                         :keyword-usages}}
+;;                         :keyword-usages :macro-usages :macro-deps}}
 ;;   :source->forms  {source #{fid}}
 ;;   :locations      {source File-or-URL}  where each file was last found
 ;;   :next-fid       long
@@ -69,6 +74,11 @@
 ;;   :defs           {qsym {:span span}}   only vars a live form defines
 ;;   :locals         {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages {kw #{span}}
+;;   :macro-usages   {macro-qsym #{span}}   a macro is a JVM var: its qsym names a
+;;                                          Clojure namespace, so this is kept apart
+;;                                          from :usages, whose keys are
+;;                                          ClojureScript vars - cljs.core/str is both
+;;   :macro-deps     {ns-sym {macro-qsym #{fid}}}
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :next-fid 0})
 
@@ -106,6 +116,11 @@
     (nat-int? (:end-column l)) (assoc :end-column (:end-column l))
     (:lname l)                 (assoc :name (:lname l))))
 
+(defn- jvm-var-key
+  "A macro's model key: the fully-qualified name of the JVM var it is."
+  [^Var v]
+  (symbol (str (.getName (.ns v))) (str (.sym v))))
+
 (defn- var-key
   "A ClojureScript var's model key: its fully-qualified name symbol. nil for a var
   in no namespace, so a lookup misses rather than throws."
@@ -120,9 +135,12 @@
 (def ^:private ^:const CAT-LOCALS   2)
 (def ^:private ^:const CAT-LOCALUSE 3)
 (def ^:private ^:const CAT-KEYWORDS 4)
-(def ^:private ^:const N-CATS       5)
+(def ^:private ^:const CAT-MACROUSE 5)
+(def ^:private ^:const CAT-MACRODEP 6)
+(def ^:private ^:const N-CATS       7)
 
-(def ^:private cat-keys [:usages :defs :locals :local-uses :keyword-usages])
+(def ^:private cat-keys
+  [:usages :defs :locals :local-uses :keyword-usages :macro-usages :macro-deps])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -320,7 +338,10 @@
         fe (reduce (fn [fe i]
                      (let [^ArrayList l (aget cats (long i))]
                        (if (and l (not (.isEmpty l)))
-                         (assoc fe (nth cat-keys i) (vec l))
+                         (assoc fe (nth cat-keys i)
+                                ;; one edge per macro per form: a form expanding
+                                ;; `when` a hundred times depends on it once
+                                (if (= i CAT-MACRODEP) (vec (distinct l)) (vec l)))
                          fe)))
                    nil (range N-CATS))]
     (when fe
@@ -359,6 +380,21 @@
       (add-fact! of CAT-KEYWORDS
                  (span kw (.source ^FileFrame (peek-list files)) line column el ec
                        env/*current-ns*)))))
+
+(defn- on-expand
+  "The macroexpand hook for one run: every expansion inside an open form is an edge
+  from the namespace being compiled to the macro, and a call the source wrote -
+  its symbol carries the reader's position - is a use of the macro too."
+  [^ArrayList files]
+  (fn [^Var v op]
+    (when-let [of (open-form files)]
+      (let [k  (jvm-var-key v)
+            ns env/*current-ns*]
+        (add-fact! of CAT-MACRODEP [ns k])
+        (when-let [m (written-at op)]
+          (add-fact! of CAT-MACROUSE
+                     (span k (.source ^FileFrame (peek-list files)) (:line m) (:column m)
+                           (:end-line m) (:end-column m) ns)))))))
 
 ;; One per run-analysis. `files` is the stack of files being compiled; it is touched
 ;; only by the thread the compilation runs on, which is the thread that bound it.
@@ -424,9 +460,10 @@
   analysis was on reaches the model only when something compiles it again -
   :reload / :reload-all, or load-file!."
   [thunk]
-  (binding [driver/*sink* (let [files (ArrayList.)]
-                            (->AnalysisSink files (->ReaderSink files)))]
-    (thunk)))
+  (let [files (ArrayList.)]
+    (binding [driver/*sink*     (->AnalysisSink files (->ReaderSink files))
+              mx/*on-expand* (on-expand files)]
+      (thunk))))
 
 (defn load-file!
   "Compile the file at `path` under the sink - clojure.cljs.driver/compile-file!,
@@ -494,9 +531,23 @@
                                    e   (.entity s)]
                                (assoc! idx :keyword-usages
                                        (assoc! sub e (conj (get sub e #{}) s)))))
-                           idx (:keyword-usages fe)))))
+                           idx (:keyword-usages fe))
+                   (reduce (fn [idx ^Span s]
+                             (let [sub (get idx :macro-usages)
+                                   e   (.entity s)]
+                               (assoc! idx :macro-usages
+                                       (assoc! sub e (conj (get sub e #{}) s)))))
+                           idx (:macro-usages fe))
+                   ;; the edge carries its form's fid, which is its file
+                   (reduce (fn [idx [n mk]]
+                             (let [sub (get idx :macro-deps)]
+                               (assoc! idx :macro-deps
+                                       (assoc! sub n (update (get sub n {}) mk
+                                                             (fnil conj #{}) fid)))))
+                           idx (:macro-deps fe)))))
              (transient {:usages (transient {}) :defs (transient {}) :locals (transient {})
-                         :keyword-usages (transient {})})
+                         :keyword-usages (transient {}) :macro-usages (transient {})
+                         :macro-deps (transient {})})
              (sort (keys forms)))]
     (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
 
@@ -533,6 +584,27 @@
   fully qualified, so ::x in app.core is found as :app.core/x."
   [^Keyword kw]
   (spans->maps (get (:keyword-usages (derived @model)) kw)))
+
+(defn find-macro-usages
+  "Where the source calls macro `macro` - the JVM Var, or its fully-qualified name
+  symbol. A set of spans shaped like find-usages'.
+
+  Only calls the source WROTE: a macro called by another macro's expansion is a
+  dependency (macro-deps) and not a use. Uses of the same name as a VALUE -
+  cljs.core/str passed to map rather than called - are the ClojureScript var's,
+  and find-usages has them."
+  [macro]
+  (spans->maps (get (:macro-usages (derived @model))
+                    (if (instance? Var macro) (jvm-var-key macro) macro))))
+
+(defn macro-deps
+  "The compile-time dependency of ClojureScript namespaces on macros: every macro
+  expanded while compiling them, whether the source called it or another macro's
+  expansion did. No argument: {ns-sym #{macro-qsym}}. With a namespace symbol: the
+  set for that namespace."
+  ([] (reduce-kv (fn [acc n mm] (assoc acc n (set (keys mm))))
+                 {} (:macro-deps (derived @model))))
+  ([ns-sym] (set (keys (get (:macro-deps (derived @model)) ns-sym)))))
 
 (defn unused-locals
   "Local bindings the source wrote and nothing uses, optionally only those of
@@ -578,5 +650,7 @@
            {:usages (reduce-kv (fn [a k s] (assoc a k (spans->maps s))) {} (:usages idx))
             :keyword-usages (reduce-kv (fn [a k s] (assoc a k (spans->maps s)))
                                        {} (:keyword-usages idx))
+            :macro-usages (reduce-kv (fn [a k s] (assoc a k (spans->maps s)))
+                                     {} (:macro-usages idx))
             :defs   (reduce-kv (fn [a k e] (assoc a k (update e :span span->map)))
                                {} (:defs idx))})))

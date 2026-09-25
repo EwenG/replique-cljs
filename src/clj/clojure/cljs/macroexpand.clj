@@ -310,6 +310,16 @@
          ;; in. See shadow-ns->mod above.
          :shadow.build/ns->mod (shadow-ns->mod)}))
 
+(def ^:dynamic *on-expand*
+  "nil, or a function of the macro Var and the symbol that named it, called just
+  before each macro this namespace expands. clojure.cljs.analysis binds it: every
+  expansion is a compile-time dependency of the form being compiled on the macro,
+  and a call whose symbol the source wrote is a use of it.
+
+  A hook here and not a node in the AST, because the AST has nothing left to hold
+  it by: the call is replaced by its expansion before any node is built."
+  nil)
+
 (defn macroexpand-1
   "Expand `form` once in `env`. Returns the form unchanged when there is nothing
   to expand - identical?, so callers can test for a fixed point.
@@ -340,22 +350,24 @@
 
         (symbol? op)
         (if-let [v (macro-var cenv env op)]
-          ;; the one place *cenv* is bound. A macro's parameters are &form and
-          ;; &env, so a macro that has to resolve a ClojureScript symbol -
-          ;; defprotocol and its family, which turn one into a property name -
-          ;; has no way to be handed the compile environment explicitly.
-          ;; and cljs.env/*compiler*, for a macro that calls UPSTREAM's analyzer
-          ;; rather than being expanded by ours. core.async's go is the case: it
-          ;; walks its own body to build a state machine, and walking means
-          ;; macroexpanding, so ioc_macros.clj:728 calls cljs.analyzer/macroexpand-1
-          ;; - which derefs that var and, unbound, throws a NullPointerException
-          ;; out of deref-future. See upstream-compiler-state, and
-          ;; doc/cljs-compiler.md 5.55.
-          (with-bindings (cond-> {#'env/*cenv* cenv
-                                  #'*ns* (env/macro-view cenv env/*current-ns*)}
-                           @upstream-compiler-var
-                           (assoc @upstream-compiler-var upstream-compiler-state))
-            (apply @v form env (rest form)))
+          (do
+            (when-let [f *on-expand*] (f v op))
+            ;; the one place *cenv* is bound. A macro's parameters are &form and
+            ;; &env, so a macro that has to resolve a ClojureScript symbol -
+            ;; defprotocol and its family, which turn one into a property name -
+            ;; has no way to be handed the compile environment explicitly.
+            ;; and cljs.env/*compiler*, for a macro that calls UPSTREAM's analyzer
+            ;; rather than being expanded by ours. core.async's go is the case: it
+            ;; walks its own body to build a state machine, and walking means
+            ;; macroexpanding, so ioc_macros.clj:728 calls cljs.analyzer/macroexpand-1
+            ;; - which derefs that var and, unbound, throws a NullPointerException
+            ;; out of deref-future. See upstream-compiler-state, and
+            ;; doc/cljs-compiler.md 5.55.
+            (with-bindings (cond-> {#'env/*cenv* cenv
+                                    #'*ns* (env/macro-view cenv env/*current-ns*)}
+                             @upstream-compiler-var
+                             (assoc @upstream-compiler-var upstream-compiler-state))
+              (apply @v form env (rest form))))
           (host-sugar form op))
 
         :else form))))
