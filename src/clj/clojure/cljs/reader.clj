@@ -296,21 +296,35 @@
   into that file's language."
   nil)
 
+(def ^:dynamic *analysis-sink*
+  "What Compiler/ANALYSIS_SINK is while ClojureScript is read: nil, or the sink
+  clojure.cljs.analysis hands the driver for the read of one top-level form.
+
+  ALWAYS BOUND BY with-cljs-reader*, nil included, and the nil is the half that
+  is not about ClojureScript analysis at all. The reader reports a keyword to
+  whatever sink is bound (LispReader, keywordUsage), and Clojure's analysis binds
+  one around a whole load - so a ClojureScript compile triggered inside a Clojure
+  analysis would file this file's keywords under the Clojure form that triggered
+  it, attributed to the JVM's *ns*."
+  nil)
+
 (defn with-cljs-reader*
   "Invoke `thunk` with the vendored reader configured to read ClojureScript in
   `cenv`, resolving against whichever namespace `cenv` names.
 
-  Five bindings, three of them the switches the fork added:
+  Six bindings, three of them the switches the fork added:
     *data-readers*      the language's tags, the program's (user-data-readers),
                         and the host's (*host-data-readers*)
     *reader-resolver*   resolution goes to the ClojureScript world, not the JVM's
     PLATFORM_FEATURE    :cljs, replacing :clj, so #?(:clj a :cljs b) yields b
     RECORD_POSITIONS    spans on symbols/keywords/collections, with no sink
-    *read-eval*         false - #= evaluates JVM code and has no place here"
+    *read-eval*         false - #= evaluates JVM code and has no place here
+    ANALYSIS_SINK       *analysis-sink* - see that var"
   [cenv thunk]
   (with-bindings* {reader-resolver-var    (resolver cenv)
                    LispReader/PLATFORM_FEATURE :cljs
                    Compiler/RECORD_POSITIONS   true
+                   Compiler/ANALYSIS_SINK      *analysis-sink*
                    #'*read-eval*          false
                    #'*data-readers*       (merge cljs-data-readers
                                                  (user-data-readers)

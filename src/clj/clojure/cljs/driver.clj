@@ -104,14 +104,18 @@
     analyzed    the form's AST
     end-form    after the form, or after the read that found eof
     end-file    the file compiled to the end
-    abort-file  it threw; nothing it produced may be kept"
+    abort-file  it threw; nothing it produced may be kept
+    reader-sink the clojure.lang.IAnalysisSink the reader reports to while it
+                reads a form of this file, or nil - see
+                clojure.cljs.reader/*analysis-sink*"
   (begin-file [sink ns-sym source location])
   (begin-form [sink])
   (form-start [sink line column])
   (analyzed [sink node])
   (end-form [sink])
   (end-file [sink source])
-  (abort-file [sink source]))
+  (abort-file [sink source])
+  (reader-sink [sink]))
 
 (def ^:dynamic *sink*
   "The CompileSink told about every file compiled, or nil - the default, which costs
@@ -361,7 +365,10 @@
      (binding [ana/*source-file* label]
        (let [body (loop [acc []]
                     (when sink (begin-form sink))
-                    (let [form (reader/read-one cenv rdr EOF)]
+                    (let [form (if sink
+                                 (binding [reader/*analysis-sink* (reader-sink sink)]
+                                   (reader/read-one cenv rdr EOF))
+                                 (reader/read-one cenv rdr EOF))]
                       (if (identical? form EOF)
                         (do (when sink (end-form sink)) acc)
                         ;; The &env PER FORM, not once for the file. It carries

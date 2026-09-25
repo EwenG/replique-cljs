@@ -170,3 +170,59 @@
     (spit f "(ns app.core)\n(def f (fn* ([q] 1)))\n")
     (an/load-file! cenv (str f) opts)
     (is (= '#{[q 2]} (unused-names)))))
+
+;; --- keywords ----------------------------------------------------------------
+
+(def ^:private keywords-program
+  '{deep.util "(ns deep.util)"
+    app.core  "(ns app.core (:require [deep.util :as u]))
+(def k1 :plain)
+(def k2 ::mine)
+(def k3 ::u/theirs)
+(def k4 {:plain [:app.core/mine]})
+#_(def k5 :discarded [#_:nested])
+(def k6 #?(:clj :jvm-only :cljs :cljs-only))"})
+
+(deftest test-keyword-usages
+  (compile! keywords-program)
+  (is (= #{["app/core.cljs" 2 9] ["app/core.cljs" 5 10]}
+         (lines (an/find-keyword-usages :plain))))
+  (testing "an auto-resolved keyword is found by its full name, and so is it written out"
+    (is (= #{["app/core.cljs" 3 9] ["app/core.cljs" 5 18]}
+           (lines (an/find-keyword-usages :app.core/mine))))
+    (is (= #{["app/core.cljs" 4 9]} (lines (an/find-keyword-usages :deep.util/theirs)))))
+  (testing "a span covers the keyword as written, attributed to the namespace it is in"
+    (is (= #{{:source "app/core.cljs" :line 4 :column 9 :end-line 4 :end-column 19
+              :from-ns 'app.core}}
+           (an/find-keyword-usages :deep.util/theirs))))
+  (testing "the branch of a reader conditional ClojureScript does not take is not recorded"
+    (is (= #{["app/core.cljs" 7 33]} (lines (an/find-keyword-usages :cljs-only))))
+    (is (empty? (an/find-keyword-usages :jvm-only))))
+  (testing "a #_ discard is: it is still written in the file, top level or nested"
+    (is (= #{["app/core.cljs" 6 11]} (lines (an/find-keyword-usages :discarded))))
+    (is (= #{["app/core.cljs" 6 25]} (lines (an/find-keyword-usages :nested))))))
+
+(deftest test-reloading-replaces-keywords
+  (let [{:keys [cenv opts src]} (compile! keywords-program)
+        f (io/file src "app/core.cljs")]
+    (spit f "(ns app.core)\n(def k1 :other)\n")
+    (an/load-file! cenv (str f) opts)
+    (is (empty? (an/find-keyword-usages :plain)))
+    (is (= #{["app/core.cljs" 2 9]} (lines (an/find-keyword-usages :other))))))
+
+(deftest test-a-clojure-sink-hears-no-clojurescript-keywords
+  ;; Clojure's analysis binds Compiler/ANALYSIS_SINK around a whole load, and the
+  ;; reader reports keywords to it - a ClojureScript compile inside one must not
+  (let [heard (atom [])
+        sink  (reify clojure.lang.IAnalysisSink
+                (beginFile [_ _]) (endFile [_ _]) (beginForm [_ _ _ _])
+                (formStart [_ _ _]) (endForm [_])
+                (varUsage [_ _ _ _ _ _ _ _]) (varDef [_ _ _ _ _ _ _])
+                (localDef [_ _ _ _ _ _ _ _ _]) (localUsage [_ _ _ _ _ _ _ _])
+                (classUsage [_ _ _ _ _ _ _ _]) (macroExpansion [_ _ _ _ _ _ _ _ _])
+                (keywordUsage [_ kw _ _ _ _ _ _] (swap! heard conj kw)))]
+    (with-bindings {clojure.lang.Compiler/ANALYSIS_SINK sink}
+      (compile! keywords-program))
+    (is (not-any? #{:plain :app.core/mine} @heard))
+    (testing "and the ClojureScript model still hears them"
+      (is (seq (an/find-keyword-usages :plain))))))

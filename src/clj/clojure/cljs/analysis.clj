@@ -7,8 +7,8 @@
 ;   You must not remove this notice, or any other, from this software.
 
 (ns ^{:doc "In-memory semantic model of the ClojureScript this compiler compiled:
-  var usages and definitions and local bindings and their uses, with precise
-  source spans, across files.
+  var usages and definitions, local bindings and their uses, and keyword
+  occurrences, with precise source spans, across files.
 
   THE SAME MODEL AS replique-clj's clojure.analysis, and a separate one. Same
   shape - a log of top-level forms, each carrying the facts it produced, filed
@@ -28,6 +28,11 @@
 
   THE CAPTURE RULE is clojure.analysis's: a usage is recorded where the name is
   written. A symbol the reader read carries a :line; one a macro made up does not.
+  A keyword carries nothing - it cannot hold metadata - so keywords are the one
+  fact taken from the READER rather than the AST: the driver binds a sink around
+  each form's read (clojure.cljs.reader/*analysis-sink*), and the reader reports
+  every keyword it reads, auto-resolved ones (::x, ::alias/x) fully qualified in
+  the ClojureScript namespace being compiled.
 
   DISK ONLY. Nothing typed at a REPL reaches the model - the REPL does not go
   through the driver's file loop - so it stays in step with what is on disk.
@@ -42,19 +47,20 @@
   records. Each form keeps the namespace it was compiled in as :ns.
 
   Drivers: run-analysis, load-file!, retract-file!, reset-model!. Queries:
-  find-usages, definition, unused-locals, file-forms, file-namespaces, ns-forms,
+  find-usages, definition, find-keyword-usages, unused-locals, file-forms, file-namespaces, ns-forms,
   snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
   (:require [clojure.cljs.ast :as ast]
             [clojure.cljs.driver :as driver]
             [clojure.cljs.env :as env])
-  (:import [clojure.lang Var]
+  (:import [clojure.lang IAnalysisSink Keyword RT Var]
            [java.util ArrayList]))
 
 ;; stored (write model - mutated only by commit-frame! and retraction):
 ;;   :forms          {fid {:ns :source :line :column + one key per non-empty fact
-;;                         category: :usages :defs :locals :local-uses}}
+;;                         category: :usages :defs :locals :local-uses
+;;                         :keyword-usages}}
 ;;   :source->forms  {source #{fid}}
 ;;   :locations      {source File-or-URL}  where each file was last found
 ;;   :next-fid       long
@@ -62,6 +68,7 @@
 ;;   :usages         {qsym #{span}}
 ;;   :defs           {qsym {:span span}}   only vars a live form defines
 ;;   :locals         {binding {:ns :name ...span :uses #{span}}}
+;;   :keyword-usages {kw #{span}}
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :next-fid 0})
 
@@ -112,9 +119,10 @@
 (def ^:private ^:const CAT-DEFS     1)
 (def ^:private ^:const CAT-LOCALS   2)
 (def ^:private ^:const CAT-LOCALUSE 3)
-(def ^:private ^:const N-CATS       4)
+(def ^:private ^:const CAT-KEYWORDS 4)
+(def ^:private ^:const N-CATS       5)
 
-(def ^:private cat-keys [:usages :defs :locals :local-uses])
+(def ^:private cat-keys [:usages :defs :locals :local-uses :keyword-usages])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -323,10 +331,40 @@
 
 ;; --- the sink -----------------------------------------------------------------
 
+;; What the reader reports to while it reads a form of an analysed file. It is a
+;; clojure.lang.IAnalysisSink because the reader is Clojure's and speaks only that;
+;; of everything the interface carries, a ClojureScript read produces keywords and
+;; syntax-quote references, and the second are dropped: LispReader resolves them
+;; against the JVM's namespaces (Compiler.sinkSyntaxQuoteRef), not this world's.
+;; Its source and namespace arguments are the JVM's too, so the file's label and
+;; env/*current-ns* stand in for them.
+(deftype ReaderSink [^ArrayList files]
+  IAnalysisSink
+  (beginFile [_ _])
+  (endFile [_ _])
+  (beginForm [_ _ _ _])
+  (formStart [_ _ _])
+  (endForm [_])
+  (varUsage [_ _ _ _ _ _ _ _])
+  (varDef [_ _ _ _ _ _ _])
+  (localDef [_ _ _ _ _ _ _ _ _])
+  (localUsage [_ _ _ _ _ _ _ _])
+  (classUsage [_ _ _ _ _ _ _ _])
+  (macroExpansion [_ _ _ _ _ _ _ _ _])
+  (keywordUsage [_ kw _ _ line column el ec]
+    ;; the branch of a reader conditional this platform does not take is read with
+    ;; *suppress-read* on - it is another platform's code, not this program's. A #_
+    ;; discard is read normally and IS recorded: it is still written in the file.
+    (when-let [of (and (not (RT/suppressRead)) (open-form files))]
+      (add-fact! of CAT-KEYWORDS
+                 (span kw (.source ^FileFrame (peek-list files)) line column el ec
+                       env/*current-ns*)))))
+
 ;; One per run-analysis. `files` is the stack of files being compiled; it is touched
 ;; only by the thread the compilation runs on, which is the thread that bound it.
-(deftype AnalysisSink [^ArrayList files]
+(deftype AnalysisSink [^ArrayList files reader]
   driver/CompileSink
+  (reader-sink [_] reader)
   (begin-file [_ ns-sym source location]
     (.add files (FileFrame. source location (= 'cljs.core ns-sym)
                             (ArrayList.) (ArrayList.) (long-array 1)))
@@ -386,7 +424,8 @@
   analysis was on reaches the model only when something compiles it again -
   :reload / :reload-all, or load-file!."
   [thunk]
-  (binding [driver/*sink* (->AnalysisSink (ArrayList.))]
+  (binding [driver/*sink* (let [files (ArrayList.)]
+                            (->AnalysisSink files (->ReaderSink files)))]
     (thunk)))
 
 (defn load-file!
@@ -449,8 +488,15 @@
                                  (assoc! idx :locals
                                          (assoc! sub b (update cur :uses conj (local->map l))))
                                  idx)))
-                           idx (:local-uses fe)))))
-             (transient {:usages (transient {}) :defs (transient {}) :locals (transient {})})
+                           idx (:local-uses fe))
+                   (reduce (fn [idx ^Span s]
+                             (let [sub (get idx :keyword-usages)
+                                   e   (.entity s)]
+                               (assoc! idx :keyword-usages
+                                       (assoc! sub e (conj (get sub e #{}) s)))))
+                           idx (:keyword-usages fe)))))
+             (transient {:usages (transient {}) :defs (transient {}) :locals (transient {})
+                         :keyword-usages (transient {})})
              (sort (keys forms)))]
     (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
 
@@ -481,6 +527,12 @@
   them)."
   [var-or-sym]
   (some-> (:span (get (:defs (derived @model)) (->var-key var-or-sym))) span->map))
+
+(defn find-keyword-usages
+  "Occurrence sites recorded for keyword `kw`. An auto-resolved keyword is recorded
+  fully qualified, so ::x in app.core is found as :app.core/x."
+  [^Keyword kw]
+  (spans->maps (get (:keyword-usages (derived @model)) kw)))
 
 (defn unused-locals
   "Local bindings the source wrote and nothing uses, optionally only those of
@@ -524,5 +576,7 @@
         idx (derived m)]
     (merge m idx
            {:usages (reduce-kv (fn [a k s] (assoc a k (spans->maps s))) {} (:usages idx))
+            :keyword-usages (reduce-kv (fn [a k s] (assoc a k (spans->maps s)))
+                                       {} (:keyword-usages idx))
             :defs   (reduce-kv (fn [a k e] (assoc a k (update e :span span->map)))
                                {} (:defs idx))})))
