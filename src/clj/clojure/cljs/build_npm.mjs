@@ -202,25 +202,36 @@ const options = (extra) => ({
   entryPoints: writeEntries(),
   outbase: entryDir,
   bundle: true, format: "esm", splitting: true, platform: "browser",
-  // NOT THE DEFAULT, THOUGH IT LOOKS LIKE IT. esbuild documents this list as the
-  // browser default, and it is - for an import statement. For a `require` call it
-  // puts `main' first instead, which is node's rule and the wrong one here: a
-  // package with no `exports' map and both fields, `module' beside `main', is
-  // resolved to its ES build by shadow-cljs and by an import statement, and to its
-  // CommonJS build by a bare require. Saying the list out loud makes the two agree.
+  // SHADOW-CLJS'S ORDER, SAID OUT LOUD. shadow's default is
+  // `:entry-keys ["browser" "main" "module"]' (shadow.build.npm), and a project
+  // whose `ns' forms were written against it has to get the same file here or the
+  // same form means something else - which is §2's whole promise.
   //
-  // Measured, on a package with main: index.js and module: index.mjs -
+  // `main' BEFORE `module', which is not esbuild's browser default for an import
+  // statement and IS its default for a `require' call, the call this makes. The
+  // difference is the package's CommonJS build against its ES one, and for a
+  // package that ships both with no `exports' map to choose between them the
+  // CommonJS build is the one whose `module.exports' an alias can BE:
   //
-  //   require(), default mainFields    -> index.js
-  //   require(), this list             -> index.mjs
-  //   import * as                      -> index.mjs
+  //   linkify-html   main: dist/linkify-html.cjs   module.exports = linkifyHtml
+  //                  module: dist/linkify-html.mjs export { linkifyHtml as default }
   //
-  // date-fns/sub is that package, and `$default' reading a `default' off the
-  // namespace depends on which of the two was loaded: the ES build exports one,
-  // and the CommonJS build ends `module.exports = exports.default' and has none.
+  // `(:require ["linkify-html" :as linkify-html])' and then calling it is what the
+  // package is for, and it works on the first and not on the second, where the
+  // alias is {default: linkifyHtml}. Measured the same way on turndown,
+  // form-data-entries and scroll-into-view-if-needed: four packages of one project,
+  // each of them an alias that is called and each of them an object under `module'.
+  //
+  // WHAT THE OTHER ORDER WAS FOR does not need it. date-fns/sub was the example -
+  // `["date-fns/sub$default" :as sub]' wants a `default' to read, and its CommonJS
+  // build ends `module.exports = exports.default' and has none - but
+  // date-fns/sub/package.json declares `module' and no `main' at all, so `main'
+  // first finds nothing there and falls through to the ES build regardless. Both
+  // orders resolve it to esm/sub/index.js.
+  //
   // An `exports' map still wins over this, which is what leaves §2.2's other half
   // alone - orderedmap keeps going through its `require' condition.
-  mainFields: ["browser", "module", "main"],
+  mainFields: ["browser", "main", "module"],
   // NOT optional: without it esbuild defaults NODE_ENV to "development" for the
   // browser platform and silently bundles React's development build - 83KB
   // against 14KB, and no error either way.

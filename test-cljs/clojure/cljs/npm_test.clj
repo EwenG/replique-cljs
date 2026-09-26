@@ -938,13 +938,15 @@
   ;;   {default: Thing} and Thing/from is undefined; through `require' it is Thing.
   ;;   This is orderedmap, and shadow-cljs loads dist/index.cjs for it.
   ;;
-  ;;   "fielded" has no `exports' map, so mainFields decide, and esbuild's browser
-  ;;   order is ["browser", "module", "main"] - which is shadow's order too, so BOTH
-  ;;   load the ES build and `$default' reads a `default' off the namespace that
-  ;;   require hands back. This is date-fns/sub, and its CommonJS build is the
-  ;;   babel shape - exports.default, then module.exports = exports.default - so a
-  ;;   rule that forced everything through `main' would break it in the other
-  ;;   direction: the alias would be the function and $default would be undefined.
+  ;;   "fielded" has no `exports' map, so mainFields decide, and the list is
+  ;;   shadow's - ["browser", "main", "module"] - so the CommonJS build is what is
+  ;;   loaded and the alias IS the function the package assigned. This is
+  ;;   linkify-html, whose two builds say the same thing in the two shapes §2.1's
+  ;;   table is about: module.exports = linkifyHtml against
+  ;;   export { linkifyHtml as default }. Calling the alias is what the package is
+  ;;   for, and off the ES build it is a TypeError - a namespace object is not a
+  ;;   function. turndown, form-data-entries and scroll-into-view-if-needed are the
+  ;;   same shape and the same use.
   (let [proj (h/fake-project! {})]
     (package! proj "twinned"
               (str "\"main\": \"index.cjs\", \"module\": \"index.mjs\","
@@ -957,10 +959,7 @@
     (package! proj "fielded"
               "\"main\": \"index.js\", \"module\": \"index.mjs\""
               {"index.mjs" "export default function (s) { return \"f:\" + s; }\n"
-               "index.js"  (str "Object.defineProperty(exports, \"__esModule\","
-                                " { value: true });\n"
-                                "exports.default = function (s) { return \"f:\" + s; };\n"
-                                "module.exports = exports.default;\n")})
+               "index.js"  "module.exports = function (s) { return \"f:\" + s; };\n"})
     ;; and the one `require' cannot reach AT ALL: an `exports' map offering an
     ;; `import' condition and nothing else. The entry every other specifier gets
     ;; does not resolve it, so it has to fall back to `import * as' - which is
@@ -970,7 +969,7 @@
               {"index.js" "export const only = (s) => \"o:\" + s;\n"})
     (let [[result said out]
           (built '{probe.core "(ns probe.core (:require [\"twinned\" :as tw]
-                                                        [\"fielded$default\" :as fd]
+                                                        [\"fielded\" :as fd]
                                                         [\"importonly\" :refer [only]]))
                                (defn run [] (str (tw/from \"x\") \"|\" tw/tag
                                                  \"|\" (fd \"y\") \"|\" (only \"z\")))"}
@@ -980,7 +979,7 @@
         (is (= "" said))
         (is (true? (:ok (:js-build result))))
         (testing "each reports the format of the file that was actually reached"
-          (is (= {"fielded" :esm "importonly" :esm "twinned" :cjs}
+          (is (= {"fielded" :cjs "importonly" :esm "twinned" :cjs}
                  (:kinds (:js-build result)))))
         (let [entry (io/file out "check.mjs")]
           (spit entry (str "import { ns as $ns } from \"./runtime.js\";\n"
@@ -988,8 +987,9 @@
                            "console.log($ns(\"probe.core\").run());\n"))
           ;; from:x twin   the alias is module.exports of the CommonJS build, so the
           ;;               package's own names are read off it
-          ;; f:y           and the other one went the other way: $default read a
-          ;;               `default' off the namespace of an ES build
+          ;; f:y           and the alias of a package that assigns a function IS
+          ;;               that function, which is what `main' before `module' buys
+          ;;               and what an alias being called needs
           ;; o:z           and the one require could not reach, which fell back
           (is (= "from:x|twin|f:y|o:z" (node entry))))
         (finally (h/delete-tree! proj) (h/delete-tree! out))))))
