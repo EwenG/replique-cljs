@@ -573,6 +573,63 @@
     (is (= [] (:pruned (an/stale-reload! cenv opts))))
     (is (has-var? cenv 'deep.util/gone))))
 
+(deftest test-a-deleted-macro-is-unmapped-when-its-file-reloads
+  ;; the jvm half of pruning: a macro deleted from a Clojure file the Clojure model
+  ;; knows is unmapped as that file loads again, so a cljs file expanding it fails
+  ;; rather than expanding a body no longer written anywhere. Not in :pruned, which
+  ;; is the compile environment's - this is clojure.analysis doing its own.
+  (let [cp   (h/temp-dir)
+        base "(ns pruned.macros)\n(defmacro kept [] 1)\n%s"]
+    (with-classpath-dir cp
+      (fn []
+        (try
+          (clj-macro-files! cp {"pruned/macros.clj"
+                                (format base "(defmacro dropped [] 2)\n")})
+          (let [{:keys [cenv opts]}
+                (compile! '{app.core "(ns app.core
+  (:require-macros [pruned.macros :refer [kept]]))
+(def a (kept))"})]
+            (is (some? (resolve 'pruned.macros/dropped)))
+            (touch! (io/file cp "pruned/macros.clj") (format base ""))
+            (is (= #{"pruned/macros.clj"} (an/stale-macro-files)))
+            (let [r (an/stale-reload! cenv opts :prune true)]
+              (is (= ["pruned/macros.clj"] (:macro-files r)))
+              (testing "the macro the file stopped defining is gone from the namespace"
+                (is (nil? (resolve 'pruned.macros/dropped))))
+              (testing "and the one it still defines is not"
+                (is (some? (resolve 'pruned.macros/kept))))
+              (testing "and what went is not in :pruned - the compile environment
+                lost nothing, the jvm did"
+                (is (= [] (:pruned r))))))
+          (finally (clj-analysis/reset-model!)
+                   (remove-ns 'pruned.macros)))))))
+
+(deftest test-a-macro-file-outside-the-clojure-model-keeps-its-deleted-macro
+  ;; the limit of the above, and it is the model's rather than a choice: unmapping
+  ;; what a file stopped defining needs a record of what it defined, and a macro file
+  ;; nothing analysed has none - it is loaded again with a plain load (see
+  ;; reload-macro-files!), which re-defs what is there and removes nothing.
+  (let [cp   (h/temp-dir)
+        mf   (io/file cp "unanalysed" "macros.clj")
+        base "(ns unanalysed.macros)\n(defmacro kept [] 1)\n%s"
+        _    (.mkdirs (.getParentFile mf))
+        _    (touch! mf (format base "(defmacro dropped [] 2)\n"))]
+    (with-classpath-dir cp
+      (fn []
+        (try
+          (let [{:keys [cenv opts]}
+                (compile! '{app.core "(ns app.core
+  (:require-macros [unanalysed.macros :refer [kept]]))
+(def a (kept))"})]
+            (is (empty? (clj-analysis/file-forms "unanalysed/macros.clj")))
+            (touch! mf (format base ""))
+            (let [r (an/stale-reload! cenv opts :prune true)]
+              (is (= ["unanalysed/macros.clj"] (:macro-files r)))
+              (is (some? (resolve 'unanalysed.macros/dropped)))
+              (is (some? (resolve 'unanalysed.macros/kept)))))
+          (finally (clj-analysis/reset-model!)
+                   (remove-ns 'unanalysed.macros)))))))
+
 (deftest test-a-deleted-file-is-retracted-and-pruned
   (let [{:keys [cenv opts src]}
         (compile! '{deep.util "(ns deep.util)\n(def x 1)"

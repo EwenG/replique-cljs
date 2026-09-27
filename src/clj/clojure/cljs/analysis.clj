@@ -1144,15 +1144,25 @@
   the Clojure model knows go through clojure.analysis/reload-files!, which orders
   them by its macro graph - a file after those whose macros its code expands - and
   keeps that model in step; the rest are loaded first, with a plain load, sorted:
-  nothing says what they depend on."
-  [files]
+  nothing says what they depend on.
+
+  `prune` is the caller's (stale-reload!), and it reaches only the covered files:
+  unmapping what a file stopped defining needs the model that recorded what it
+  defined, so a macro file the Clojure model does not know keeps a deleted macro
+  interned until something analyses it. Pruning here is the jvm's namespaces, which
+  is what makes a macro deleted from a .clj file stop expanding rather than expand
+  its old body; the vars unmapped are not returned - clojure.analysis/reload-files!
+  does not answer them - and a usage of one is warned about on *err*."
+  [files prune]
   (let [{covered true plain false} (group-by #(boolean (seq (clj-analysis/file-forms %)))
                                              files)
         plain (sort plain)]
     (doseq [res plain]
       (load (str "/" (strip-ext res)))
       (mark-loaded! [res]))
-    (let [order (if (seq covered) (clj-analysis/reload-files! covered) [])]
+    (let [order (if (seq covered)
+                  (clj-analysis/reload-files! covered :prune prune)
+                  [])]
       (mark-loaded! order)
       (into (vec plain) order))))
 
@@ -1188,7 +1198,10 @@
   `opts` are the driver's (compile-file!). With :prune true, the vars a
   recompiled file no longer defines, and those of a deleted file, are removed from
   `cenv` (prune-file!) - before the next file compiles, so one that still uses them
-  warns - and not from the runtime.
+  warns - and not from the runtime. The macro files are pruned too, on the jvm,
+  where a reloaded Clojure file no longer defines a macro: that is
+  clojure.analysis's own pruning (see reload-macro-files!), so what it unmapped is
+  not in :pruned, which is `cenv`'s.
 
   The macro files are loaded in the Clojure model's macro order where it covers
   them (see reload-macro-files!). The stale sets are taken before anything is
@@ -1206,7 +1219,7 @@
         _       (swap! model #(-> %
                                   (update :pending-macro-files into mfiles)
                                   (update :pending-sources into sources)))
-        mfiles  (reload-macro-files! mfiles)
+        mfiles  (reload-macro-files! mfiles prune)
         pruned  (atom [])
         _       (doseq [s deleted]
                   (let [prior (when prune (file-def-var-snapshot cenv s))]
