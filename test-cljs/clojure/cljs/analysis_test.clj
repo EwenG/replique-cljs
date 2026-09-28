@@ -363,6 +363,20 @@
     (try (with-bindings {clojure.lang.Compiler/LOADER cl} (f))
          (finally (.setContextClassLoader t old)))))
 
+(deftest test-what-has-been-compiled-is-a-question-of-its-own
+  (testing "a model with nothing in it has compiled nothing, which is not the
+            same fact as nothing having changed - one answer apart, and
+            opposite meanings"
+    (is (empty? (an/analysed-files)))
+    (is (empty? (an/changed-files))))
+  (compile! program)
+  (is (= #{"app/core.cljs" "deep/util.cljs"} (an/analysed-files)))
+  (testing "cljs.core is compiled and not analysed, so it is not in here either"
+    (is (not (contains? (an/analysed-files) "cljs/core.cljs"))))
+  (testing "and a file retracted is one it has not compiled"
+    (an/retract-file! "app/core.cljs")
+    (is (= #{"deep/util.cljs"} (an/analysed-files)))))
+
 (deftest test-an-edited-file-is-stale-and-reloads
   (let [{:keys [cenv opts src]} (compile! program)
         f (io/file src "deep/util.cljs")]

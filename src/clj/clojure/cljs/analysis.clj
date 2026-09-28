@@ -959,6 +959,18 @@
 
 ;; --- staleness and stale reload -------------------------------------------------
 
+(defn analysed-files
+  "The sources this process has compiled and has not since had retracted, as the
+  model names them.
+
+  The population `changed-files` and `stale-files` are answers about, and here for
+  the difference between the two ways their answer can be empty: \"nothing has
+  changed since this process compiled these files\" and \"this process has compiled
+  no files\" read identically in an empty answer and are not the same fact. See
+  `clojure.analysis/analysed-files`, which answers it for the JVM side."
+  []
+  (set (for [[source fids] (:source->forms @model) :when (seq fids)] source)))
+
 (defn changed-files
   "Analysed files whose mtime differs from the one they were compiled at - edited
   since. A file with no mtime then (inside a jar) or none now (moved, deleted) is
