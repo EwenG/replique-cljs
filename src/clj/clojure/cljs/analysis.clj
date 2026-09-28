@@ -1139,6 +1139,22 @@
                                (update :pending-macro-files disj res)))
                          m files))))
 
+(defn- told!
+  "Tell clojure.analysis/*reload-progress* about `event`, if anything is listening.
+
+  THAT VAR AND NOT ONE OF OUR OWN, although this is the other model. A
+  ClojureScript reload loads Clojure macro files on the JVM before it compiles
+  anything - through clojure.analysis/reload-files!, which reports through that var
+  - so two channels would mean a watcher that bound only one of them saw half of a
+  single reload, in no particular order relative to the other half. One stream, in
+  the order things happen, with :dialect saying which side of the reload an event
+  came from: :cljs here, absent for the macro files, which is exactly what they are.
+
+  See clojure.analysis/*reload-progress* for the shape of the maps."
+  [event]
+  (when-let [f clj-analysis/*reload-progress*] (f event))
+  nil)
+
 (defn- reload-macro-files!
   "Load the Clojure files `files` again and return them in the order loaded. Those
   the Clojure model knows go through clojure.analysis/reload-files!, which orders
@@ -1157,9 +1173,16 @@
   (let [{covered true plain false} (group-by #(boolean (seq (clj-analysis/file-forms %)))
                                              files)
         plain (sort plain)]
-    (doseq [res plain]
-      (load (str "/" (strip-ext res)))
-      (mark-loaded! [res]))
+    ;; Announced here because nothing else will: these are the macro files the
+    ;; Clojure model does not cover, so they never reach reload-files! and its
+    ;; reporting. A load is a load, and one that hangs is worth having named.
+    (when (seq plain)
+      (told! {:event :plan :pass 0 :files (vec plain)}))
+    (let [n (count plain)]
+      (doseq [[i res] (map-indexed vector plain)]
+        (told! {:event :loading :pass 0 :file res :nth (inc i) :of n})
+        (load (str "/" (strip-ext res)))
+        (mark-loaded! [res])))
     (let [order (if (seq covered)
                   (clj-analysis/reload-files! covered :prune prune)
                   [])]
@@ -1216,6 +1239,13 @@
   (let [mfiles  (stale-macro-files)
         sources (in-require-order cenv (stale-files cenv))
         deleted (sort (deleted-files))
+        ;; The whole of what this is about to do, before any of it has cost
+        ;; anything: the macro files it will load on the JVM, the files it will
+        ;; recompile, and the files it is dropping. Which is the half nobody can
+        ;; work out from their buffers - a .cljs file goes stale because a .clj
+        ;; file it expands a macro from changed, and neither file says so.
+        _       (told! {:event :plan :dialect :cljs :files sources
+                        :macro-files (vec mfiles) :deleted (vec deleted)})
         _       (swap! model #(-> %
                                   (update :pending-macro-files into mfiles)
                                   (update :pending-sources into sources)))
@@ -1232,17 +1262,36 @@
                                           opts)]
                     (when prune (swap! pruned into (prune-file! cenv s prior)))
                     r))
+        ;; Each file named BEFORE it is compiled, for the reason
+        ;; clojure.analysis/reload-files! names one before it loads it: the file
+        ;; that never finishes is the one worth having on the screen, and a line
+        ;; printed afterwards names every file except that one.
+        compile-all (fn [ss]
+                      (let [n (count ss)]
+                        (into [] (map-indexed
+                                  (fn [i s]
+                                    (told! {:event :loading :dialect :cljs :file s
+                                            :nth (inc i) :of n})
+                                    (compile s)))
+                              ss)))
         ;; a round's recompiles can change the metadata another file was compiled
         ;; against; each round settles the files the last one unsettled. Bounded,
         ;; because a file's metadata could in principle follow another's in a cycle:
         ;; what is left then is meta-stale, and found next time.
         [order results]
-        (loop [order sources, results (mapv compile sources), rounds 0]
+        (loop [order sources, results (compile-all sources), rounds 0]
           (let [more (in-require-order cenv (meta-stale-files cenv))]
             (if (or (empty? more) (> rounds (count (:source->forms @model))))
               [order results]
               (do (swap! model update :pending-sources into more)
-                  (recur (into order more) (into results (mapv compile more))
+                  ;; A round nobody could have predicted from the plan above - these
+                  ;; files were settled until the last round recompiled something
+                  ;; whose metadata they were compiled against - so it is announced
+                  ;; as its own plan rather than left to look like the first one
+                  ;; going on longer than it said.
+                  (told! {:event :plan :dialect :cljs :files more
+                          :round (inc rounds)})
+                  (recur (into order more) (into results (compile-all more))
                          (inc rounds))))))]
     {:macro-files (vec mfiles)
      :reloaded    order

@@ -692,9 +692,21 @@
                   (-evaluate [_ js] (swap! shipped conj js) {:status :success :value "nil"}))]
     (touch! (io/file src "deep/util.cljs")
             "(ns deep.util)\n(def double (fn* ([x] x)))\n(deftype Box [v])\n")
+    (testing "the bound is read before anything is compiled, so a caller that
+             got it wrong is told before it has cost anything"
+      (is (= :error (:status (repl/eval-form cenv rt '(stale-reload "soon") opts))))
+      (is (= :error (:status (repl/eval-form cenv rt '(stale-reload 0) opts))))
+      (is (empty? @shipped)))
     (is (= {:status :success :value (pr-str ["deep/util.cljs"])}
            (repl/eval-form cenv rt '(stale-reload) opts)))
     (is (= 1 (count @shipped)))
+    (testing "a bound asks the runtime to give up, and a runtime that cannot be
+             asked says so rather than taking the bound and ignoring it"
+      (touch! (io/file src "deep/util.cljs")
+              "(ns deep.util)\n(def double (fn* ([x] (* 2 x))))\n(deftype Box [v])\n")
+      (let [r (repl/eval-form cenv rt '(stale-reload 1000) opts)]
+        (is (= :error (:status r)))
+        (is (str/includes? (:value r) "IJsDeadline"))))
     (testing "and a REPL started with :analysis keeps the model as it loads files"
       (an/reset-model!)
       (repl/eval-form cenv rt (list 'load-file (str (io/file src "app/core.cljs")))

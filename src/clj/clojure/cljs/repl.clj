@@ -508,6 +508,34 @@
             scripts)
       nil-result))
 
+(defn- ship-within!
+  "ship!, except that each script is given `ms` to come back in.
+
+  THE BOUND IS PER SCRIPT AND NOT PER RELOAD, so a reload of forty files can take
+  forty times `ms` and that is right: each script is a turn of its own, and what is
+  being bounded is a runtime that has stopped answering, not a program that is slow.
+  A bound over the whole reload would abandon a perfectly healthy load of a big
+  program somewhere in the middle, which is the failure this exists to prevent
+  rather than a second kind of it.
+
+  NOT FOR A FORM YOU TYPED, and ship! stays unbounded for that reason - see
+  IJsDeadline. This is for the caller that did not type anything: a whole-program
+  reload after a branch was switched is mechanical, nobody is watching a particular
+  expression, and a page that has stopped answering must come back as a sentence
+  rather than as an editor that never returns. evaluate-all-within says which of the
+  two it was - busy, where the script never got in front of a page, or timed-out,
+  where a page has it and is still thinking - and both are worth reading.
+
+  A runtime that cannot be asked to give up answers that it cannot, and the reload
+  stops there with that said: honouring a bound by ignoring it is what
+  evaluate-all-within refuses to do."
+  [runtime scripts ms]
+  (or (some (fn [script]
+              (let [r (evaluate-all-within runtime script ms)]
+                (when (= :error (:status r)) r)))
+            scripts)
+      nil-result))
+
 (defn- require-script
   "A script that asks the runtime to load `ns-syms` if it does not have them, and to
   fetch the JavaScript modules `specifiers`.
@@ -640,14 +668,31 @@
 
   It prunes: a def deleted from a file stops resolving here, in the compile
   environment (clojure.cljs.analysis/prune-file!), so a form still using it warns.
-  The runtime keeps it - remove-var is the special that deletes it there."
-  [cenv runtime opts _args]
+  The runtime keeps it - remove-var is the special that deletes it there.
+
+  (stale-reload 30000) GIVES EACH SHIPPED SCRIPT THAT MANY MILLISECONDS, and
+  (stale-reload) waits for as long as the runtime takes. The bound is the caller's
+  to choose because whose reload it is is the caller's to know: one you typed at
+  this prompt is a form like any other and waits, and one an editor sent on its own
+  after a branch was switched must not be able to hold that editor still because a
+  tab went to sleep. See ship-within!.
+
+  The argument is read before anything is compiled, so a caller that got it wrong is
+  told so rather than told so after twenty seconds of work."
+  [cenv runtime opts args]
   (need-out-dir! opts "stale-reload")
-  (let [r   (analysis/stale-reload! cenv opts :prune true)
-        res (ship! runtime (mapv second (:scripts r)))]
-    (if (= :error (:status res))
-      res
-      {:status :success :value (pr-str (:reloaded r))})))
+  (let [ms (first args)]
+    (if (and (some? ms) (not (and (integer? ms) (pos? ms))))
+      {:status :error :phase :compile
+       :value  (str "(stale-reload " (pr-str ms) ") - the bound is a positive"
+                    " number of milliseconds, or nothing at all for no bound.")}
+      (let [r   (analysis/stale-reload! cenv opts :prune true)
+            res (if ms
+                  (ship-within! runtime (mapv second (:scripts r)) ms)
+                  (ship! runtime (mapv second (:scripts r))))]
+        (if (= :error (:status res))
+          res
+          {:status :success :value (pr-str (:reloaded r))})))))
 
 (defn- do-in-ns
   "(in-ns 'foo) - move the cursor, creating the namespace if it is new.
