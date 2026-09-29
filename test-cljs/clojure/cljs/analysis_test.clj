@@ -886,3 +886,46 @@
     (testing "a use in a comment keeps a require; one in a #_ does not"
       (is (= '{ol other.lib} (an/unused-aliases cenv 'app.core)))
       (is (= {} (an/unused-macro-refers cenv 'app.core))))))
+
+(deftest test-asking-one-index-does-not-build-the-others
+  ;; What having a cache EACH is for. The derived indexes are all pure functions of
+  ;; the same form log, but they are not wanted at the same moments - a reload reads
+  ;; `:defs` while it prunes and reads nothing else, while `:usages` and `:locals`
+  ;; are the large ones and answer an editor's questions. Held as one index they were
+  ;; all rebuilt whenever any of them was, and every file compiled is a new form log,
+  ;; so recompiling K files replayed the whole model K times.
+  ;;
+  ;; Read off the caches and not off a clock: what is being tested is that work did
+  ;; NOT happen, and a fast answer is not a claim that it did not.
+  (compile! program)
+  (let [m     @@#'an/model
+        built (fn [] (set (for [[k c] @#'an/index-caches
+                                :when (identical? (:forms m) (:forms @c))]
+                            k)))]
+    (is (empty? (built)) "a fresh log, so nothing is built for it yet")
+    (#'an/index m :defs)
+    (is (= #{:defs} (built)))
+    (#'an/index m :usages)
+    (is (= #{:defs :usages} (built)))
+    (testing "and `derived` is all of them, which is why a reload does not ask for it"
+      (#'an/derived m)
+      (is (= (set @#'an/index-keys) (built))))
+    (testing "asking twice does not build twice"
+      (doseq [k @#'an/index-keys]
+        (is (identical? (#'an/index m k) (#'an/index m k))
+            (str "second ask for " k " rebuilt it"))))))
+
+(deftest test-file-def-vars-answers-what-a-walk-of-the-defs-answered
+  ;; `file-def-vars` reads the file's own forms rather than walking every def in the
+  ;; model. Same answer, per file, and the files are the model's own.
+  (compile! program)
+  (let [m      @@#'an/model
+        walked (fn [source]
+                 (set (for [[k e] (#'an/index m :defs)
+                            :when (= source (:source (:span e)))]
+                       k)))]
+    (is (= '#{deep.util/double deep.util/Box deep.util/->Box}
+           (an/file-def-vars "deep/util.cljs")))
+    (doseq [source (keys (:source->forms m))]
+      (is (= (walked source) (an/file-def-vars source)) source))
+    (is (= #{} (an/file-def-vars "nobody/here.cljs")))))

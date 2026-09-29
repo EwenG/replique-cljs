@@ -110,7 +110,7 @@
 ;;                                         so a reload that throws half way loses
 ;;                                         no staleness the cascade had found
 ;;   :next-fid       long
-;; derived (build-index, cached by :forms identity):
+;; derived (built from :forms by `index`, each cached by :forms identity):
 ;;   :usages         {qsym #{span}}
 ;;   :defs           {qsym {:span span}}   only vars a live form defines
 ;;   :locals         {binding {:ns :name ...span :uses #{span}}}
@@ -802,74 +802,116 @@
         (reset! cache {:forms forms :value built})
         built))))
 
-(defonce ^:private index-cache (atom {:forms nil :value nil}))
+;; ONE CACHE PER SUB-INDEX, for the reason clojure.analysis's are one each: they are
+;; all pure functions of the same form log and so go stale by the same rule, but they
+;; are not wanted at the same moments. A reload reads `:defs` while it prunes and
+;; reads nothing else; `:usages`, `:locals` and `:macro-usages` answer an editor's
+;; questions. Held as one index they were all rebuilt whenever any of them was, and
+;; every file compiled is a new form log - so recompiling K files replayed the whole
+;; model K times.
+(defonce ^:private index-caches
+  (into {} (for [k [:usages :defs :locals :keyword-usages :macro-usages :macro-deps
+                    :host-usages]]
+             [k (atom {:forms nil :value nil})])))
 
-(defn- build-index
-  "Replay the form log, in fid order, into the by-entity indexes. A later def of the
-  same var overwrites the earlier one, so the highest fid wins."
+(defn- sorted-fids
+  "The live form ids, ascending, in a primitive array. `:defs` is the one index whose
+  answer depends on the order the log is replayed in, so it is the one place this is
+  needed - and boxing the keys of a large log to sort them is not free."
+  ^longs [forms]
+  (let [^longs a (long-array (keys forms))]
+    (java.util.Arrays/sort a)
+    a))
+
+(defn- build-spans
+  "{entity #{Span}} over one fact category - `:usages`, `:keyword-usages`,
+  `:macro-usages` or `:host-usages`, which differ in nothing but which category they
+  fold. No replay order to respect: each fact joins the set under its own entity key."
+  [forms cat]
+  (persistent!
+   (reduce-kv (fn [idx _ fe]
+                (reduce (fn [idx ^Span s]
+                          (let [e (.entity s)]
+                            (assoc! idx e (conj (get idx e #{}) s))))
+                        idx (get fe cat)))
+              (transient {}) forms)))
+
+(defn- build-defs
+  "{qsym {:span span}} - replayed in fid order, because it is the one index where a
+  later fact has to beat an earlier one: a later def of the same var overwrites the
+  earlier entry, so the highest fid wins."
   [forms]
-  (let [idx (reduce
-             (fn [idx fid]
-               (let [fe (get forms fid)]
-                 (as-> idx idx
-                   (reduce (fn [idx ^Span s]
-                             (let [sub (get idx :usages)
-                                   e   (.entity s)]
-                               (assoc! idx :usages (assoc! sub e (conj (get sub e #{}) s)))))
-                           idx (:usages fe))
-                   (reduce (fn [idx ^Span s]
-                             (assoc! idx :defs (assoc! (get idx :defs) (.entity s) {:span s})))
-                           idx (:defs fe))
-                   ;; bindings before their uses: a local is scoped to its form
-                   (reduce (fn [idx ^LocalSpan l]
-                             (let [sub (get idx :locals)
-                                   b   (.binding l)]
-                               (assoc! idx :locals
-                                       (assoc! sub b (assoc (local->map l)
-                                                            :uses (get (get sub b) :uses #{}))))))
-                           idx (:locals fe))
-                   (reduce (fn [idx ^LocalSpan l]
-                             (let [sub (get idx :locals)
-                                   b   (.binding l)]
-                               (if-let [cur (get sub b)]
-                                 (assoc! idx :locals
-                                         (assoc! sub b (update cur :uses conj (local->map l))))
-                                 idx)))
-                           idx (:local-uses fe))
-                   (reduce (fn [idx ^Span s]
-                             (let [sub (get idx :keyword-usages)
-                                   e   (.entity s)]
-                               (assoc! idx :keyword-usages
-                                       (assoc! sub e (conj (get sub e #{}) s)))))
-                           idx (:keyword-usages fe))
-                   (reduce (fn [idx ^Span s]
-                             (let [sub (get idx :macro-usages)
-                                   e   (.entity s)]
-                               (assoc! idx :macro-usages
-                                       (assoc! sub e (conj (get sub e #{}) s)))))
-                           idx (:macro-usages fe))
-                   ;; the edge carries its form's fid, which is its file
-                   (reduce (fn [idx [n mk]]
-                             (let [sub (get idx :macro-deps)]
-                               (assoc! idx :macro-deps
-                                       (assoc! sub n (update (get sub n {}) mk
-                                                             (fnil conj #{}) fid)))))
-                           idx (:macro-deps fe))
-                   (reduce (fn [idx ^Span s]
-                             (let [sub (get idx :host-usages)
-                                   e   (.entity s)]
-                               (assoc! idx :host-usages
-                                       (assoc! sub e (conj (get sub e #{}) s)))))
-                           idx (:host-usages fe)))))
-             (transient {:usages (transient {}) :defs (transient {}) :locals (transient {})
-                         :keyword-usages (transient {}) :macro-usages (transient {})
-                         :macro-deps (transient {}) :host-usages (transient {})})
-             (sort (keys forms)))]
-    (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
+  (let [^longs fids (sorted-fids forms)
+        n           (alength fids)]
+    (loop [i 0, idx (transient {})]
+      (if (< i n)
+        (recur (inc i)
+               (reduce (fn [idx ^Span s] (assoc! idx (.entity s) {:span s}))
+                       idx (:defs (get forms (aget fids i)))))
+        (persistent! idx)))))
 
-(defn- derived [m]
+(defn- build-locals
+  "{binding {:ns :name ...span :uses #{use}}} - two fact categories in one index,
+  since a local's uses belong to its entry. A form's bindings are folded before its
+  uses, so every binding is registered before a use can attach to it; a local is
+  scoped to its own form, so the order between forms does not come into it."
+  [forms]
+  (persistent!
+   (reduce-kv
+    (fn [idx _ fe]
+      (as-> idx idx
+        (reduce (fn [idx ^LocalSpan l]
+                  (let [b (.binding l)]
+                    (assoc! idx b (assoc (local->map l)
+                                         :uses (get (get idx b) :uses #{})))))
+                idx (:locals fe))
+        (reduce (fn [idx ^LocalSpan l]
+                  (let [b (.binding l)]
+                    (if-let [cur (get idx b)]
+                      (assoc! idx b (update cur :uses conj (local->map l)))
+                      idx)))
+                idx (:local-uses fe))))
+    (transient {}) forms)))
+
+(defn- build-macro-deps
+  "{ns-sym {macro-qsym #{fid}}} - the compile-time edges. Each carries the fid of the
+  form that expanded it, which is its file."
+  [forms]
+  (persistent!
+   (reduce-kv (fn [idx fid fe]
+                (reduce (fn [idx [n mk]]
+                          (assoc! idx n (update (get idx n {}) mk (fnil conj #{}) fid)))
+                        idx (:macro-deps fe)))
+              (transient {}) forms)))
+
+(def ^:private index-keys
+  "The indexes `derived` is all of, which is what `snapshot` shows."
+  [:usages :defs :locals :keyword-usages :macro-usages :macro-deps :host-usages])
+
+(defn- index
+  "One derived index of model value `m`, built from its form log and cached until that
+  log changes. Ask for the one that answers the question: nothing here forces any of
+  the others, which is why there is a cache each."
+  [m k]
   (let [forms (:forms m)]
-    (cached-by-forms index-cache forms #(build-index forms))))
+    (cached-by-forms
+     (get index-caches k) forms
+     (fn []
+       (case k
+         :usages         (build-spans forms :usages)
+         :keyword-usages (build-spans forms :keyword-usages)
+         :macro-usages   (build-spans forms :macro-usages)
+         :host-usages    (build-spans forms :host-usages)
+         :defs           (build-defs forms)
+         :locals         (build-locals forms)
+         :macro-deps     (build-macro-deps forms))))))
+
+(defn- derived
+  "Every by-entity index for model value `m` as one map - what `snapshot` shows, and
+  what a caller wanting several of them off one consistent log should take. It forces
+  all of them, so prefer `index` with the key actually needed."
+  [m]
+  (into {} (for [k index-keys] [k (index m k)])))
 
 ;; --- queries --------------------------------------------------------------------
 
@@ -897,20 +939,20 @@
   other compiler. An :import is not among them: what a ClojureScript one names is a
   Closure namespace, which is a host reference - see find-host-usages."
   [var-or-sym]
-  (spans->maps (get (:usages (derived @model)) (->var-key var-or-sym))))
+  (spans->maps (get (index @model :usages) (->var-key var-or-sym))))
 
 (defn definition
   "Definition site recorded for a var, or nil - nil too for a var no live form
   defines (deleted from its file, or in a file never analysed, cljs.core's among
   them)."
   [var-or-sym]
-  (some-> (:span (get (:defs (derived @model)) (->var-key var-or-sym))) span->map))
+  (some-> (:span (get (index @model :defs) (->var-key var-or-sym))) span->map))
 
 (defn find-keyword-usages
   "Occurrence sites recorded for keyword `kw`. An auto-resolved keyword is recorded
   fully qualified, so ::x in app.core is found as :app.core/x."
   [^Keyword kw]
-  (spans->maps (get (:keyword-usages (derived @model)) kw)))
+  (spans->maps (get (index @model :keyword-usages) kw)))
 
 (defn find-macro-usages
   "Where the source calls macro `macro` - the JVM Var, or its fully-qualified name
@@ -923,7 +965,7 @@
   :dead as find-usages marks one - and so is the name a :refer of a macro writes,
   marked :declaration :refer for its reason."
   [macro]
-  (spans->maps (get (:macro-usages (derived @model))
+  (spans->maps (get (index @model :macro-usages)
                     (if (instance? Var macro) (jvm-var-key macro) macro))))
 
 (defn macro-deps
@@ -932,8 +974,8 @@
   expansion did. No argument: {ns-sym #{macro-qsym}}. With a namespace symbol: the
   set for that namespace."
   ([] (reduce-kv (fn [acc n mm] (assoc acc n (set (keys mm))))
-                 {} (:macro-deps (derived @model))))
-  ([ns-sym] (set (keys (get (:macro-deps (derived @model)) ns-sym)))))
+                 {} (index @model :macro-deps)))
+  ([ns-sym] (set (keys (get (index @model :macro-deps) ns-sym)))))
 
 (defn unused-locals
   "Local bindings the source wrote and nothing uses, optionally only those of
@@ -947,7 +989,7 @@
   ([] (unused-locals nil))
   ([ns-sym]
    (for [[_ infos] (group-by (juxt :source :line :column)
-                             (vals (:locals (derived @model))))
+                             (vals (index @model :locals)))
          :let  [info (first infos)]
          :when (every? (comp empty? :uses) infos)
          :when (or (nil? ns-sym) (= ns-sym (:ns info)))]
@@ -963,7 +1005,7 @@
         (comp (filter (fn [[k _]] (= ref (select-keys k (keys ref)))))
               (mapcat val)
               (map span->map))
-        (:host-usages (derived @model))))
+        (index @model :host-usages)))
 
 ;; --- namespace lints ------------------------------------------------------------
 ;;
@@ -989,9 +1031,10 @@
   (for [[k spans] m :when (some #(from-ns? ns-sym %) spans)] k))
 
 (defn- written-from
-  "Every symbol `ns-sym` wrote to reach the host - see host-ref's :written."
-  [idx ns-sym]
-  (into #{} (keep :written) (used-from (:host-usages idx) ns-sym)))
+  "Every symbol `ns-sym` wrote to reach the host - see host-ref's :written. Takes the
+  `:host-usages` index, which is the only one it reads."
+  [host-usages ns-sym]
+  (into #{} (keep :written) (used-from host-usages ns-sym)))
 
 (defn- written-as?
   "Did one of the `written` symbols spell `nm` - bare, or as the namespace part of
@@ -1006,17 +1049,17 @@
   reaches. A macro's namespace is a JVM one - usually the ClojureScript namespace's
   own name, which is what a .cljc library requiring itself for its macros relies on."
   [ns-sym]
-  (let [idx (derived @model)
+  (let [m   @model
         nss (fn [ks] (keep #(some-> (namespace %) symbol) ks))]
     (into #{}
-          (concat (nss (used-from (:usages idx) ns-sym))
-                  (nss (used-from (:keyword-usages idx) ns-sym))
-                  (nss (used-from (:macro-usages idx) ns-sym))
+          (concat (nss (used-from (index m :usages) ns-sym))
+                  (nss (used-from (index m :keyword-usages) ns-sym))
+                  (nss (used-from (index m :macro-usages) ns-sym))
                   (keep (fn [r] (case (:kind r)
                                   :goog-var (symbol (namespace (:name r)))
                                   :goog-ns  (:name r)
                                   nil))
-                        (used-from (:host-usages idx) ns-sym))))))
+                        (used-from (index m :host-usages) ns-sym))))))
 
 (defn unused-aliases
   "Aliases in `ns-sym` nothing uses: {alias target}. A ClojureScript or Closure
@@ -1029,7 +1072,7 @@
   [cenv ns-sym]
   (when-let [^Namespace n (env/find-cljs-ns cenv ns-sym)]
     (let [used     (ns-referenced-namespaces ns-sym)
-          written  (written-from (derived @model) ns-sym)
+          written  (written-from (index @model :host-usages) ns-sym)
           imported (set (keys (env/imports cenv ns-sym)))]
       (merge
        (into {} (for [[a ^Namespace target] (.getAliases n)
@@ -1050,9 +1093,9 @@
   cljs.core's implicit refers are not refers here and are never reported."
   [cenv ns-sym]
   (when-let [^Namespace n (env/find-cljs-ns cenv ns-sym)]
-    (let [idx     (derived @model)
-          used    (set (used-from (:usages idx) ns-sym))
-          written (written-from idx ns-sym)]
+    (let [m       @model
+          used    (set (used-from (index m :usages) ns-sym))
+          written (written-from (index m :host-usages) ns-sym)]
       (merge
        (into {} (for [[sym v] (.getMappings n)
                       :when (instance? Var v)
@@ -1071,7 +1114,7 @@
 (defn unused-imports
   "Classes `ns-sym` :imported and never names: {name closure-name}."
   [cenv ns-sym]
-  (let [written (written-from (derived @model) ns-sym)]
+  (let [written (written-from (index @model :host-usages) ns-sym)]
     (into {} (for [[sym target] (env/imports cenv ns-sym)
                    :when (not (written-as? written sym))]
                [sym target]))))
@@ -1089,7 +1132,7 @@
   [cenv ns-sym]
   (when-let [view (macro-view cenv ns-sym)]
     (let [used (set (keep #(some-> (namespace %) symbol)
-                          (used-from (:macro-usages (derived @model)) ns-sym)))]
+                          (used-from (index @model :macro-usages) ns-sym)))]
       (into {} (for [[a ^Namespace target] (.getAliases view)
                      :let  [t (.getName target)]
                      :when (not (used t))]
@@ -1099,7 +1142,7 @@
   "Macros `ns-sym` referred and never calls: {name macro-qsym}."
   [cenv ns-sym]
   (when-let [view (macro-view cenv ns-sym)]
-    (let [used (set (used-from (:macro-usages (derived @model)) ns-sym))]
+    (let [used (set (used-from (index @model :macro-usages) ns-sym))]
       (into {} (for [[sym v] (.getMappings view)
                      :when (instance? Var v)
                      :let  [k (jvm-var-key v)]
@@ -1286,11 +1329,25 @@
 
 (defn file-def-vars
   "The fully-qualified names of the vars file `source` has a def form for, as the
-  model has it now."
+  model has it now.
+
+  READ OFF THE FILE'S OWN FORMS rather than by walking every def in the model, which
+  is what it did and what it was asked once per file recompiled: the model it walked
+  grows with the project while the file does not.
+
+  The same answer, and the `:defs` lookup is what keeps it so: a name two files define
+  belongs to the one whose def WON - the highest fid - so a file's own def form is in
+  its answer only while `:defs` still names it as that def's file. Which is what
+  filtering the whole index by span source said."
   [source]
-  (set (for [[k e] (:defs (derived @model))
-             :when (= source (:source (:span e)))]
-         k)))
+  (let [m     @model
+        defs  (index m :defs)
+        forms (:forms m)]
+    (into #{} (for [fid     (get (:source->forms m) source)
+                    ^Span s (:defs (get forms fid))
+                    :let    [k (.entity s)]
+                    :when   (= source (:source (:span (get defs k))))]
+                k))))
 
 (defn file-def-var-snapshot
   "{qsym Var} for the vars file `source` defines, as `cenv` holds them - prune-file!'s
@@ -1303,19 +1360,25 @@
   "Remove from `cenv` each var of `prior` that no live form defines any more and
   that is still the Var `prior` saw. Warns when one is still used. Returns them."
   [cenv prior]
-  (let [idx  (derived @model)
-        gone (for [[k old] prior
-                   :when (and old
-                              (nil? (get (:defs idx) k))
-                              (identical? old (cljs-var cenv k)))]
-               k)]
-    (doseq [k gone]
-      (when-let [us (seq (remove :dead (get (:usages idx) k)))]
-        (binding [*out* *err*]
-          (println "WARN: pruning" (str k) "still referenced at"
-                   (vec (sort (for [u us] [(:source u) (:line u) (:column u)]))))))
-      (env/remove-var! cenv k))
-    (vec gone)))
+  (let [m    @model
+        ;; `:defs` and nothing else, since that is all it takes to say whether a def
+        ;; has gone. The usage index is what the warning reads, and it is forced only
+        ;; once something has actually been pruned.
+        defs (index m :defs)
+        gone (vec (for [[k old] prior
+                        :when (and old
+                                   (nil? (get defs k))
+                                   (identical? old (cljs-var cenv k)))]
+                    k))]
+    (when (seq gone)
+      (let [usages (index m :usages)]
+        (doseq [k gone]
+          (when-let [us (seq (remove :dead (get usages k)))]
+            (binding [*out* *err*]
+              (println "WARN: pruning" (str k) "still referenced at"
+                       (vec (sort (for [u us] [(:source u) (:line u) (:column u)])))))))))
+    (doseq [k gone] (env/remove-var! cenv k))
+    gone))
 
 (defn prune-file!
   "Remove from the compile environment the vars whose def form vanished from file
