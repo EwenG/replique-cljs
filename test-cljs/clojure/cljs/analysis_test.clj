@@ -413,6 +413,13 @@
           (testing "the file that expanded it, and only that one"
             (is (= #{"app/core.cljs"} (an/stale-files)))
             (is (empty? (an/changed-files))))
+          (testing "and the macro file is the one that was EDITED, which nothing
+  else here answers: changed-files is about the files this compiles, and a .clj
+  is not one - so a client with only those two lists sees a stale file and no
+  cause for it anywhere"
+            (is (= #{"stale/macros.clj"} (an/changed-macro-files)))
+            (is (= (an/changed-macro-files) (an/stale-macro-files))
+                "nothing expands this one's macros in turn, so the two agree here"))
           (let [r (an/stale-reload! cenv opts)]
             (is (= ["stale/macros.clj"] (:macro-files r)))
             (is (= ["app/core.cljs"] (:reloaded r)))
@@ -659,6 +666,50 @@
     (is (empty? (an/deleted-files)))
     (is (not (has-var? cenv 'other.lib/y)))
     (is (has-var? cenv 'deep.util/x))))
+
+(deftest test-a-require-an-edit-adds-orders-the-recompile
+  ;; The ClojureScript side of clojure.analysis's
+  ;; a-require-an-edit-adds-orders-the-reload. env/requires answers what the ns
+  ;; form said the LAST time a namespace compiled, so a require the edit has just
+  ;; introduced is in neither the compile environment nor the model - and it is
+  ;; the one whose order matters, because the var it has come for is a var that
+  ;; was not there before. The names are chosen so that the alphabet gives the
+  ;; WRONG answer: without the disk graph, a/top.cljs sorts first and the
+  ;; analyzer throws "No such var: z/added" on it.
+  (let [src  (h/write-sources! '{z.base "(ns z.base)\n(def v 1)"
+                                 a.top  "(ns a.top)\n(def w 0)"})
+        out  (h/temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})
+        opts {:out-dir out :source-paths [src]}]
+    (an/run-analysis #(do (driver/compile-namespace! cenv 'z.base opts)
+                          (driver/compile-namespace! cenv 'a.top opts)))
+    (is (empty? (an/stale-files)))
+    (touch! (io/file src "z/base.cljs") "(ns z.base)\n(def v 1)\n(def added 7)\n")
+    (touch! (io/file src "a/top.cljs")
+            "(ns a.top (:require [z.base :as z]))\n(def w z/added)\n")
+    (is (= #{"z/base.cljs" "a/top.cljs"} (an/stale-files)))
+    (let [r (an/stale-reload! cenv opts)]
+      (is (= ["z/base.cljs" "a/top.cljs"] (:reloaded r))
+          "the file that grew the require comes after the file it now requires")
+      (is (= '[z.base a.top] (mapv first (:scripts r)))
+          "and the runtime is given them in that order too"))
+    (is (empty? (an/stale-files)))
+    (testing "the new var is what the recompiled file was compiled against"
+      (is (= #{["a/top.cljs" 2 8]} (lines (an/find-usages 'z.base/added)))))))
+
+(deftest test-a-require-already-there-still-orders-the-recompile
+  ;; the control: the compile environment's own edge, which the disk graph is
+  ;; added to rather than substituted for. Same names, same wrong alphabet.
+  (let [src  (h/write-sources! '{z.base "(ns z.base)\n(def v 1)"
+                                 a.top  "(ns a.top (:require [z.base :as z]))\n(def w z/v)"})
+        out  (h/temp-dir)
+        cenv (env/compile-env {:ns 'cljs.user})
+        opts {:out-dir out :source-paths [src]}]
+    (an/run-analysis #(driver/compile-namespace! cenv 'a.top opts))
+    (touch! (io/file src "z/base.cljs") "(ns z.base)\n(def v 2)\n")
+    (touch! (io/file src "a/top.cljs")
+            "(ns a.top (:require [z.base :as z]))\n(def w (inc z/v))\n")
+    (is (= ["z/base.cljs" "a/top.cljs"] (:reloaded (an/stale-reload! cenv opts))))))
 
 (deftest test-a-dropped-tag-makes-its-users-stale
   (let [{:keys [cenv opts src]} (compile! prune-program)]

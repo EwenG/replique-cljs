@@ -1007,24 +1007,49 @@
   (into #{} (filter #(some tracked (clj-analysis/stale-files #{%})))
         (clj-analysis/stale-files seed)))
 
+(defn changed-macro-files
+  "The Clojure macro files (classpath resources, e.g. \"app/macros.clj\") this
+  compiler expanded and that the disk has moved on from since the JVM loaded them -
+  edited, as far as :macro-loaded knows.
+
+  THE OTHER HALF OF `changed-files', and kept apart from it because they are not
+  the same population and cannot be recompiled the same way. `changed-files'
+  answers about the files this compiler COMPILED, which is what `stale-files'
+  builds on and what `stale-reload!' hands to the ClojureScript compiler; these are
+  Clojure files, they are loaded on the JVM rather than compiled here, and putting
+  one in that set would hand a .clj to a driver that reads .cljs.
+
+  Answered on its own all the same, because of what a client is left with
+  otherwise. A .cljs file goes stale with nothing in it touched, and the only thing
+  that can say why is the macro file that changed - so a reload that names the
+  stale file and never names its cause is describing an effect. See
+  `replique.cljs-analysis/stale', which reports these as changed beside the
+  ClojureScript files, and `stale-macro-files', which is this plus the Clojure
+  files that expand their macros in turn - the ones that are stale rather than
+  edited."
+  []
+  (let [m       @model
+        tracked (into #{} (mapcat keys) (vals (:macro-files m)))]
+    (into #{} (for [file tracked
+                    :let [t   (get-in m [:macro-loaded file])
+                          now (mtime file)]
+                    :when (and t now (not= now t))]
+                file))))
+
 (defn stale-macro-files
   "The Clojure files (classpath resources, e.g. \"app/macros.clj\") to load again
   before anything is recompiled: the macro files some analysed file expanded that
-  changed on disk since the JVM loaded them (as far as this model knows, see
-  :macro-loaded); the Clojure files the Clojure model has as edited since it loaded
-  them; and, through its macro graph, the files that expand their macros at load
-  time - as far as they lead to a macro file an analysed file expanded. Plus any a
-  stale-reload! that threw left unloaded."
+  changed on disk since the JVM loaded them (`changed-macro-files'); the Clojure
+  files the Clojure model has as edited since it loaded them; and, through its macro
+  graph, the files that expand their macros at load time - as far as they lead to a
+  macro file an analysed file expanded. Plus any a stale-reload! that threw left
+  unloaded."
   []
   (let [m       @model
-        tracked (into #{} (mapcat keys) (vals (:macro-files m)))
-        edited  (for [file tracked
-                      :let [t   (get-in m [:macro-loaded file])
-                            now (mtime file)]
-                      :when (and t now (not= now t))]
-                  file)]
+        tracked (into #{} (mapcat keys) (vals (:macro-files m)))]
     (into (into #{} (filter mtime) (:pending-macro-files m))
-          (macro-closure (into (set edited) (clj-analysis/changed-files)) tracked))))
+          (macro-closure (into (changed-macro-files) (clj-analysis/changed-files))
+                         tracked))))
 
 (defn- cljs-var
   "The ClojureScript Var `qsym` names in `cenv`, or nil."
@@ -1201,12 +1226,132 @@
       (mark-loaded! order)
       (into (vec plain) order))))
 
+(defn- lib-names
+  "The namespace-name symbols the specs of a `:require' / `:use' /
+  `:require-macros' / `:use-macros' clause name, prefix lists expanded.
+
+  A spec is a symbol, or a sequential whose first element is a name and whose rest
+  is either options - which start with a keyword - or, when it does not, more specs
+  carrying that name as a prefix. That is the rule the ns parser itself reads them
+  by, and the reason the shapes cannot be told apart any other way: `[a b]' is the
+  prefix list a.b and `[a :as b]' is the lib a.
+
+  A STRING WHERE THE NAME WOULD BE IS NOT ONE, and that is ClojureScript's own
+  addition: `[\"react\" :as react]' requires a JavaScript module, which is not a
+  file this compiles and not a file anything here could be ordered against.
+  (See `clojure.analysis/lib-names', which is this without that case.)"
+  [specs]
+  (mapcat (fn [spec]
+            (cond
+              (symbol? spec) [spec]
+              (sequential? spec)
+              (let [[head & more] spec]
+                (when (symbol? head)
+                  (if (or (empty? more) (keyword? (first more)))
+                    [head]
+                    (map #(symbol (str head "." %)) (lib-names more)))))
+              :else nil))
+          specs))
+
+(defn- ns-declaration
+  "The `ns' form of source `source', read off the disk AS IT IS NOW - the one thing
+  about a file that is about to be recompiled that neither the model nor the compile
+  environment can answer, because everything either of them holds about it was
+  written the last time it compiled.
+
+  Read with the :cljs feature, since that is the dialect being ordered: a .cljc
+  whose requires differ by dialect is being read for what a ClojureScript compile
+  of it will do.
+
+  Nil when the file has no `ns' form, and nil when it will not read for any reason
+  whatever, which is why every last thing in here is caught. The only use of the
+  answer is to put two files being recompiled in an order, nothing is lost by not
+  having it, and a file that does not read is the compiler's to complain about a
+  moment later, in its own words and at the right place."
+  [source]
+  (try
+    (when-let [f (location-file (or (get-in @model [:locations source]) source))]
+      (with-open [r (java.io.PushbackReader. (io/reader f))]
+        (binding [*read-eval* false
+                  *default-data-reader-fn* (fn [_tag value] value)]
+          (let [opts {:read-cond :allow :features #{:cljs} :eof ::eof}]
+            (loop []
+              (let [form (read opts r)]
+                (cond
+                  (= ::eof form)                         nil
+                  (and (seq? form) (= 'ns (first form))) form
+                  :else                                  (recur))))))))
+    (catch Throwable _ nil)))
+
+(defn- ns-sources
+  "The sources namespace `n' could be compiled from: the classpath path the compiler
+  derives from the name, in each extension this side reads. No .clj: a Clojure file
+  is a macro file here, and macro files are loaded before any of this and are never
+  among the sources being ordered."
+  [n]
+  (let [base (-> (str n) (.replace \- \_) (.replace \. \/))]
+    [(str base ".cljs") (str base ".cljc")]))
+
+(defn- disk-require-graph
+  "Forward dependency graph over `sources' only, read from their `ns' forms ON DISK:
+  {source #{dep-source}} where the new source of `source' requires a namespace that
+  another file being recompiled holds. Nothing outside `sources', and no self-edges.
+
+  THE EDGE THE COMPILE ENVIRONMENT CANNOT HAVE. `env/requires' answers what the ns
+  form said the LAST time this namespace compiled, so it knows every dependency the
+  old source had and none that the edit introduces - and an edit that first reaches
+  into a file this one never required before is exactly the one whose order matters,
+  because the definition it has come for is a definition that was not there before.
+  Compiled in the wrong order it is `No such var', from the analyzer, naming the
+  alias. Switching branches does it wholesale.
+
+  A require is the declaration of that reach, it is written at the top of the new
+  file, and reading it costs one pass of the reader over a file that is about to be
+  handed to the compiler anyway.
+
+  A namespace is matched to a file the way the compiler matches one - the name, with
+  dashes to underscores and dots to slashes - and also through the model, for a file
+  whose namespace is not named after it. Neither has to find anything: a require of
+  something not being recompiled says nothing about the order of what is.
+
+  This is `clojure.analysis/file-require-graph', for the ClojureScript sources of a
+  ClojureScript reload."
+  [sources]
+  (let [m        @model
+        nodes    (set sources)
+        ns->srcs (reduce-kv (fn [acc _ fe]
+                              (if-let [n (:ns fe)]
+                                (update acc n (fnil conj #{}) (:source fe))
+                                acc))
+                            {} (:forms m))
+        srcs-of  (fn [n] (filter nodes (into (set (ns-sources n)) (get ns->srcs n))))
+        clause?  (fn [x] (and (sequential? x)
+                              (#{:require :use :require-macros :use-macros} (first x))))]
+    (reduce
+     (fn [g source]
+       (if-let [form (ns-declaration source)]
+         (let [deps (into #{} (comp (filter clause?)
+                                    (mapcat #(lib-names (rest %)))
+                                    (mapcat srcs-of)
+                                    (remove #(= source %)))
+                          (rest form))]
+           (if (seq deps) (assoc g source deps) g))
+         g))
+     {} nodes)))
+
 (defn- in-require-order
-  "`sources` ordered so that a file comes after the files it requires, as far as
-  they are among `sources` - the order a runtime should run them in."
+  "`sources' ordered so that a file comes after the files it requires, as far as
+  they are among `sources' - the order a runtime should run them in.
+
+  Two graphs, and the second is the one an edit can change: what the compile
+  environment recorded when each namespace last compiled, and what the `ns' forms on
+  disk say now - see `disk-require-graph'. A require that is new since the last
+  compile exists only in the second, and it is the one most likely to matter."
   [cenv sources]
   (let [ns-of (into {} (for [s sources] [(first (file-namespaces s)) s]))
-        deps  (fn [s] (keep ns-of (env/requires cenv (first (file-namespaces s)))))]
+        disk  (disk-require-graph sources)
+        deps  (fn [s] (into (set (keep ns-of (env/requires cenv (first (file-namespaces s)))))
+                            (get disk s)))]
     (loop [order [] placed #{} left (set sources)]
       (if (empty? left)
         order
