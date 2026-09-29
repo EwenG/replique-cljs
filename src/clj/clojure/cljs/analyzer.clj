@@ -1772,7 +1772,14 @@
                        {d (js-export-path path "default")} {})
                      (map (fn [sym] [(get rename sym sym)
                                      (js-export-path path (name sym))]))
-                     refer)})))
+                     refer)
+       ;; [written export] for every place the spec writes an export's own name:
+       ;; the :refer list, and the key of a :rename, which spells it again.
+       ;; Not the name a :rename or a :default gives it here, which is this
+       ;; namespace's name for it and not the module's. Nothing applies these;
+       ;; declared-names reads them
+       :refer-writes (vec (for [sym (concat refer (keys rename))]
+                            [sym (js-export-path path (name sym))]))})))
 
 (defn- plan-ns-require
   "One (:require ...) or (:use ...) entry naming a NAMESPACE, checked and turned
@@ -1836,7 +1843,11 @@
           ;; that a bare name stands for a qualified one.
           {:target target :as (:as opts) :macros macros
            :goog-refers (check-goog-require! spec target asked
-                                             (check-renames! (:rename opts)) macros)})
+                                             (check-renames! (:rename opts)) macros)
+           ;; the var names as the spec writes them - the :refer list, and the
+           ;; keys of a :rename - which :goog-refers has by this namespace's
+           ;; names. Nothing applies these; declared-names reads them
+           :goog-refer-writes (vec (concat asked (keys (:rename opts))))})
 
         ;; A RENAMED NAME IS CHECKED LIKE ANY OTHER REFERRED NAME - same split
         ;; into vars and macros, same message when it is neither - and then taken
@@ -1981,7 +1992,11 @@
                           (str "No such Closure class: " target
                                ". This fork ships a subset of the Closure Library,"
                                " and that name is not in it.")))
-        {:target target :as class-sym}))))
+        ;; :written is the symbol that names the class in the spec - the class
+        ;; of [goog.math Long], or the whole of goog.math.Long, whose last part
+        ;; was made above and was never read. declared-names reads it
+        {:target target :as class-sym
+         :written (if (sequential? spec) class-sym spec)}))))
 
 (defn- invert-renames
   "A :rename map as WRITTEN, {from to}, turned into the {to from} that .refer and
@@ -2032,17 +2047,48 @@
   sites. Only what the reader positioned, which is the capture rule everywhere
   else: a spec the source did not write has nothing to point at.
 
-  Only names that reach a var. The refers of a JavaScript module are its exports
-  and those of a Closure namespace are its properties; both are host references,
-  which are a question of their own with an answer of another shape.
+  AND THE HOST'S NAMES, as quadruples [host-ref written :host declaration]: the
+  exports a JavaScript module's :refer names, the properties a Closure
+  namespace's :refer names, the classes an :import names and the globals a
+  :refer-global names - each keyed the way a use of it in code is keyed, which
+  is what makes a rename that walks the uses walk these too. A :rename is
+  written twice, and both are the host's name; the name it is renamed TO is this
+  namespace's, as a :default's is, and is not recorded. What the ns form cannot
+  say where it wrote - the specifier of a JavaScript module is a string, and a
+  string carries no position - is not recorded either.
 
   clojure.cljs.analysis records these - see its :ns case."
   [plan]
-  (let [named (fn [target kind & written-seqs]
+  (let [positioned? (fn [written] (and (symbol? written) (:line (meta written))))
+        named (fn [target kind & written-seqs]
                 (for [written (apply concat written-seqs)
-                      :when (and (simple-symbol? written) (:line (meta written)))]
-                  [(symbol (name target) (name written)) written kind]))]
+                      :when (and (simple-symbol? written) (positioned? written))]
+                  [(symbol (name target) (name written)) written kind]))
+        host (fn [declaration ref written]
+               (when (positioned? written)
+                 [(assoc ref :written (with-meta written nil)) written :host declaration]))]
     (vec (concat
+          ;; the host's, first because it is the shorter list to read
+          (for [{:keys [specifier refer-writes]} (:requires plan)
+                :when specifier
+                [written export] refer-writes
+                :let [d (host :refer {:kind :js-module :specifier specifier
+                                      :export export} written)]
+                :when d]
+            d)
+          (for [{:keys [target goog-refer-writes]} (:requires plan)
+                written goog-refer-writes
+                :let [d (host :refer {:kind :goog-var
+                                      :name (symbol (name target) (name written))}
+                              written)]
+                :when d]
+            d)
+          (keep (fn [{:keys [target written]}]
+                  (host :import {:kind :goog-ns :name target} written))
+                (:imports plan))
+          (keep (fn [written]
+                  (host :refer {:kind :global :name (symbol "js" (name written))} written))
+                (:global-writes plan))
           (mapcat (fn [{:keys [target specifier alias-only refers renames rename-writes]}]
                     (when (and target (not specifier) (not alias-only))
                       (named target :var refers (vals renames) rename-writes)))
@@ -2304,7 +2350,13 @@
                             (update :excludes into excludes)
                             (update :core-renames merge renames)))
                       :refer-global
-                      (update plan :global-refers merge (plan-refer-global specs))
+                      (-> plan
+                          (update :global-refers merge (plan-refer-global specs))
+                          ;; the globals' own names as written, for declared-names:
+                          ;; :only, and the keys of a :rename
+                          (update :global-writes into
+                                  (let [opts (apply hash-map specs)]
+                                    (concat (:only opts) (keys (:rename opts))))))
                       :import
                       (update plan :imports into
                               (mapcat #(plan-import %)) specs)
@@ -2314,7 +2366,7 @@
                                            " :use, :use-macros, :refer-clojure,"
                                            " :refer-global, :import.")))))
                 {:requires [] :imports [] :macro-requires [] :excludes #{}
-                 :core-renames {} :global-refers {}}
+                 :core-renames {} :global-refers {} :global-writes []}
                 more)]
       ;; the plan is complete, so applying it starts here - and starts by undoing
       ;; the last ns form for this namespace, because a declaration replaces
@@ -3177,7 +3229,7 @@
           ;; the case, at alpha.cljs:1463 - (instance? goog.math.Long val), in a
           ;; namespace whose ns form mentions goog.object and nothing else.
           (and (goog/goog-ns? sym) (goog/known? sym))
-          (goog-ns-node env (require-goog! cenv sym))
+          (goog-ns-node env (require-goog! cenv sym) sym)
 
           ;; (:import [goog.string StringBuffer]) is an alias from the bare name to
           ;; the provide, so a bare StringBuffer is that class. Aliases are looked
@@ -3196,8 +3248,12 @@
 
           :else
           (if-let [^Namespace aliased (.lookupAlias here sym)]
+            ;; `sym` as the form, which is the name as WRITTEN and carries where:
+            ;; the namespace's own name symbol carries wherever that was first
+            ;; read, and a host usage recorded off it was put at a line of some
+            ;; other file
             (if (closure-ns? cenv (.getName aliased))
-              (goog-ns-node env (.getName aliased))
+              (goog-ns-node env (.getName aliased) sym)
               (analysis-error sym (str sym " is a namespace alias, not a value.")))
             ;; a.b - not a var, not a goog name, not an alias, so the dots are
             ;; structure rather than part of one name

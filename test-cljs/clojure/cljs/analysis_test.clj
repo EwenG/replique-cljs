@@ -388,9 +388,32 @@
     (testing "host references"
       (is (= #{["app/core.cljs" 12 9]}
              (lines (an/find-host-usages {:kind :js-module :specifier "react" :export "createElement"}))))
-      (is (= 2 (count (an/find-host-usages {:kind :js-module :specifier "react"}))))
+      (is (= 2 (count (calls (an/find-host-usages {:kind :js-module :specifier "react"})))))
       (is (= #{["app/core.cljs" 11 9]}
-             (lines (an/find-host-usages {:kind :goog-var :name 'goog.string/trimRight})))))))
+             (lines (calls (an/find-host-usages {:kind :goog-var :name 'goog.string/trimRight}))))))
+    (testing "and what the ns form writes of the host's, which is a place a rename
+              has to rewrite and is not a use: a :refer of a module's export and of
+              a Closure var, and the class an :import names"
+      (is (= #{["app/core.cljs" 5 40 :refer] ["app/core.cljs" 5 49 :refer]}
+             (into #{} (map (juxt :source :line :column :declaration))
+                   (filter :declaration (an/find-host-usages {:kind :js-module
+                                                              :specifier "react"})))))
+      (is (= #{["app/core.cljs" 4 55 :refer] ["app/core.cljs" 11 9 nil]}
+             (into #{} (map (juxt :source :line :column :declaration))
+                   (an/find-host-usages {:kind :goog-var :name 'goog.string/trimRight}))))
+      (is (= #{["app/core.cljs" 7 25 :import]}
+             (into #{} (map (juxt :source :line :column :declaration))
+                   (an/find-host-usages {:kind :goog-ns :name 'goog.string.StringBuffer})))))
+    (testing "host references by ref, for what a partial match cannot ask: every
+              var of one Closure namespace, each under the ref it is filed as"
+      (let [found (an/find-host-usages-where
+                   #(and (= :goog-var (:kind %)) (= "goog.string" (namespace (:name %)))))]
+        ;; the model is the whole process's, so other programs' uses are in it
+        (is (every? #(= "goog.string" (namespace (:name %))) (keys found)))
+        (is (= #{["app/core.cljs" 11 9]}
+               (lines (calls (mapcat (fn [[k spans]]
+                                       (when (= 'goog.string/trimRight (:name k)) spans))
+                                     found)))))))))
 
 ;; --- staleness -------------------------------------------------------------------
 

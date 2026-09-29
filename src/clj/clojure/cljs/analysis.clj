@@ -65,11 +65,12 @@
 
   Drivers: run-analysis, load-file!, retract-file!, reset-model!, stale-reload!,
   prune-file!. Queries: find-usages, definition, find-keyword-usages,
-  find-macro-usages, find-host-usages, macro-deps, ns-referenced-namespaces,
-  unused-locals, unused-aliases, unused-refers, unused-imports,
-  unused-macro-aliases, unused-macro-refers, changed-files, stale-macro-files,
-  stale-files, meta-stale-files, deleted-files, file-def-vars,
-  file-def-var-snapshot, file-forms, file-namespaces, ns-forms, snapshot."
+  find-macro-usages, find-host-usages, find-host-usages-where, macro-deps,
+  ns-referenced-namespaces, unused-locals, unused-aliases, unused-refers,
+  unused-imports, unused-macro-aliases, unused-macro-refers, changed-files,
+  stale-macro-files, stale-files, meta-stale-files, deleted-files,
+  file-def-vars, file-def-var-snapshot, file-forms, file-namespaces, ns-forms,
+  snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
   (:require [clojure.analysis :as clj-analysis]
@@ -286,21 +287,22 @@
   "What the ns form's clauses WRITE: every name a :refer, an :only or a :rename
   names, at the name as the spec writes it.
 
-  Filed with the uses - a macro's with the macro uses, a var's with the var uses -
-  so that where-is-this-name-written is one list, which is what a rename walks. And
-  marked :declaration :refer, because it is not a use: from-ns? leaves it out of
-  the unused-* lints, since a refer kept alive by its own :refer is one nothing
-  could ever report.
+  Filed with the uses - a macro's with the macro uses, a var's with the var uses,
+  a host name's with the host uses - so that where-is-this-name-written is one
+  list, which is what a rename walks. And marked :declaration :refer (or :import,
+  for the class an :import names), because it is not a use: from-ns? leaves it
+  out of the unused-* lints, since a refer kept alive by its own :refer is one
+  nothing could ever report.
 
   The analyzer puts them on the node (its declared-names), because by the time the
   ns form has been applied the written symbols are gone and only the namespace's
   state is left."
   [^OpenForm of source from-ns node]
-  (doseq [[k written kind] (:declares node)
+  (doseq [[k written kind declaration] (:declares node)
           :let [m (meta written)]]
-    (add-fact! of (if (= :macro kind) CAT-MACROUSE CAT-USAGES)
+    (add-fact! of (case kind :macro CAT-MACROUSE :host CAT-HOST CAT-USAGES)
                (span k source (:line m) (:column m) (:end-line m) (:end-column m)
-                     from-ns nil :refer))))
+                     from-ns nil (or declaration :refer)))))
 
 (defn- record-meta-deps!
   "The var's metadata the emitted code was built from - a compile-time dependency
@@ -1071,6 +1073,21 @@
         (comp (filter (fn [[k _]] (= ref (select-keys k (keys ref)))))
               (mapcat val)
               (map span->map))
+        (index @model :host-usages)))
+
+(defn find-host-usages-where
+  "Every host reference whose ref satisfies `pred`, with the places it is used:
+  {ref #{span}}, the ref in host-ref's shape, :written and all.
+
+  For the questions find-host-usages' partial match cannot ask, and they are
+  the ones a person asks about a PACKAGE: every var of one Closure namespace
+  (goog.string/trim and goog.string/format are two refs whose names share only
+  a namespace), every global under js/console (js/console and js/console.log
+  are two names), and for each place which of them it was - which the spans
+  alone do not say, since they are filed under the ref and do not carry it."
+  [pred]
+  (into {}
+        (keep (fn [[k spans]] (when (pred k) [k (spans->maps spans)])))
         (index @model :host-usages)))
 
 ;; --- namespace lints ------------------------------------------------------------
