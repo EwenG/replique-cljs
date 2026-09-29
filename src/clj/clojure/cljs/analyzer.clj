@@ -1861,7 +1861,12 @@
           (when macros
             (env/macro-ns target (into (vec (:refers macros)) (vals m-ren))))
           {:target target :as (:as opts) :also-as (when stands-for written)
-           :refers refers :renames v-ren :macros macros})))))
+           :refers refers :renames v-ren :macros macros
+           ;; the :rename keys as the spec writes them, which is a second place
+           ;; each of those names is written - :renames holds the same names as
+           ;; the :refer list spelt them. Nothing applies these; declared-names
+           ;; reads them
+           :rename-writes (vec (keys renamed))})))))
 
 (defn- plan-require
   "One (:require ...) or (:use ...) entry, whichever kind it is.
@@ -2011,7 +2016,42 @@
           renames (invert-renames renamed)]
       (check-alias! (:as opts))
       (env/macro-ns target (into refers (vals renames)))
-      {:target target :as (:as opts) :refers refers :renames renames})))
+      {:target target :as (:as opts) :refers refers :renames renames
+       :rename-writes (vec (keys renamed))})))
+
+(defn- declared-names
+  "The [key written-symbol kind] triples the clauses of an ns form write: every
+  name a :refer, an :only or the key of a :rename names, beside the key of the
+  thing it names - a ClojureScript var's qualified name, or the qualified name of
+  the JVM var a macro is.
+
+  Put on the :ns node because this is the last place the written symbols are seen.
+  What is applied is the name; what can be read back afterwards is the namespace's
+  state, which says what it refers and not where the file says so - and a :refer is
+  a place the name is written, and one a rename has to rewrite along with the call
+  sites. Only what the reader positioned, which is the capture rule everywhere
+  else: a spec the source did not write has nothing to point at.
+
+  Only names that reach a var. The refers of a JavaScript module are its exports
+  and those of a Closure namespace are its properties; both are host references,
+  which are a question of their own with an answer of another shape.
+
+  clojure.cljs.analysis records these - see its :ns case."
+  [plan]
+  (let [named (fn [target kind & written-seqs]
+                (for [written (apply concat written-seqs)
+                      :when (and (simple-symbol? written) (:line (meta written)))]
+                  [(symbol (name target) (name written)) written kind]))]
+    (vec (concat
+          (mapcat (fn [{:keys [target specifier alias-only refers renames rename-writes]}]
+                    (when (and target (not specifier) (not alias-only))
+                      (named target :var refers (vals renames) rename-writes)))
+                  (:requires plan))
+          (named 'cljs.core :var (vals (:core-renames plan)))
+          (mapcat (fn [{:keys [target refers renames rename-writes]}]
+                    (when target
+                      (named target :macro refers (vals renames) rename-writes)))
+                  (concat (keep :macros (:requires plan)) (:macro-requires plan)))))))
 
 (defn- plan-refer-clojure
   "(:refer-clojure :exclude [+ for] :rename {mapv core-mapv}) - the names this
@@ -2298,6 +2338,7 @@
       (env/set-current-ns! nsym)
       {:op :ns :form form :env env :name nsym :doc doc
        :requires (vec (sort (env/requires cenv nsym)))
+       :declares (declared-names plan)
        :children []})))
 
 (defn require-libs!

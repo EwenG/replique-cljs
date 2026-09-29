@@ -132,8 +132,10 @@
 ;; span so a fact is one object. from-ns is a namespace SYMBOL here (a
 ;; ClojureScript namespace is not something to hold on to); nil for a def. dead is
 ;; :discard or :comment for a use in code the program does not run (commit-dead!).
+;; declaration is :refer for the name an ns form's clause writes rather than a use
+;; of it (record-declares!), else nil.
 (defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns
-                 dead])
+                 dead declaration])
 
 (defn- norm-pos [x] (if (nat-int? x) (int x) -1))
 
@@ -141,15 +143,18 @@
   ([entity source line column el ec from-ns]
    (span entity source line column el ec from-ns nil))
   ([entity source line column el ec from-ns dead]
+   (span entity source line column el ec from-ns dead nil))
+  ([entity source line column el ec from-ns dead declaration]
    (->Span entity source (norm-pos line) (norm-pos column) (norm-pos el) (norm-pos ec)
-           from-ns dead)))
+           from-ns dead declaration)))
 
 (defn- span->map [s]
   (cond-> {:source (:source s) :line (:line s) :column (:column s)}
     (nat-int? (:end-line s))   (assoc :end-line (:end-line s))
     (nat-int? (:end-column s)) (assoc :end-column (:end-column s))
     (:from-ns s)               (assoc :from-ns (:from-ns s))
-    (:dead s)                  (assoc :dead (:dead s))))
+    (:dead s)                  (assoc :dead (:dead s))
+    (:declaration s)           (assoc :declaration (:declaration s))))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
@@ -275,6 +280,26 @@
     (add-fact! of CAT-USAGES (span (:name node) source (:line m) (:column m)
                                    (:end-line m) (:end-column m) from-ns))))
 
+(defn- record-declares!
+  "What the ns form's clauses WRITE: every name a :refer, an :only or a :rename
+  names, at the name as the spec writes it.
+
+  Filed with the uses - a macro's with the macro uses, a var's with the var uses -
+  so that where-is-this-name-written is one list, which is what a rename walks. And
+  marked :declaration :refer, because it is not a use: from-ns? leaves it out of
+  the unused-* lints, since a refer kept alive by its own :refer is one nothing
+  could ever report.
+
+  The analyzer puts them on the node (its declared-names), because by the time the
+  ns form has been applied the written symbols are gone and only the namespace's
+  state is left."
+  [^OpenForm of source from-ns node]
+  (doseq [[k written kind] (:declares node)
+          :let [m (meta written)]]
+    (add-fact! of (if (= :macro kind) CAT-MACROUSE CAT-USAGES)
+               (span k source (:line m) (:column m) (:end-line m) (:end-column m)
+                     from-ns nil :refer))))
+
 (defn- record-meta-deps!
   "The var's metadata the emitted code was built from - a compile-time dependency
   on the file that defines the var, which a run-time lookup does not undo.
@@ -371,6 +396,8 @@
                   (.put def-names (:form v) true)
                   (doseq [c (ast/children n) :when (not (identical? c v))]
                     (visit c)))
+
+                :ns (record-declares! of source ns n)
 
                 :var (do (record-usage! of source ns n)
                          (record-meta-deps! of n))
@@ -857,11 +884,18 @@
 (defn find-usages
   "Usage sites recorded for a var - its fully-qualified name symbol, or the
   ClojureScript Var itself. A set of {:from-ns :source :line :column :end-line
-  :end-column [:dead]}.
+  :end-column [:dead] [:declaration]}.
 
   Code the program does not run is included: a use in a #_ carries :dead :discard,
   one in a (comment ...) :dead :comment. It is resolved rather than compiled - see
-  commit-dead! - so it can name something the compiler would not have."
+  commit-dead! - so it can name something the compiler would not have.
+
+  The ns form's own mention is included too, carrying :declaration :refer - the
+  name as a :refer, an :only or a :rename writes it. It is not a use of the var and
+  does not count as one (from-ns?), but it is a place the name is written and one a
+  rename has to rewrite. See record-declares!; clojure.analysis says the same of the
+  other compiler. An :import is not among them: what a ClojureScript one names is a
+  Closure namespace, which is a host reference - see find-host-usages."
   [var-or-sym]
   (spans->maps (get (:usages (derived @model)) (->var-key var-or-sym))))
 
@@ -886,7 +920,8 @@
   dependency (macro-deps) and not a use. Uses of the same name as a VALUE -
   cljs.core/str passed to map rather than called - are the ClojureScript var's,
   and find-usages has them. A call in a #_ or a (comment ...) is here too, marked
-  :dead as find-usages marks one."
+  :dead as find-usages marks one - and so is the name a :refer of a macro writes,
+  marked :declaration :refer for its reason."
   [macro]
   (spans->maps (get (:macro-usages (derived @model))
                     (if (instance? Var macro) (jvm-var-key macro) macro))))
@@ -941,9 +976,12 @@
 (defn- from-ns?
   "Is `s` a use from `ns-sym`, as the unused-* lints count one? A use in a #_ is
   not: the code is gone. A use in a (comment ...) is: a rich comment block is code
-  meant to be run at the REPL - clojure.analysis/counts-as-use?."
+  meant to be run at the REPL - clojure.analysis/counts-as-use?.
+
+  Neither is a DECLARATION: what a :refer writes is the very thing these lints ask
+  about, so counting it would answer \"is this refer used\" with the refer itself."
   [ns-sym ^Span s]
-  (and (= ns-sym (.from-ns s)) (not= :discard (.dead s))))
+  (and (= ns-sym (.from-ns s)) (not= :discard (.dead s)) (nil? (.declaration s))))
 
 (defn- used-from
   "The keys of index `m` with at least one span from `ns-sym`."

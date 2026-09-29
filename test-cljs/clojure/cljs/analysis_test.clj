@@ -60,6 +60,13 @@
 
 (defn- lines [spans] (into #{} (map (juxt :source :line :column)) spans))
 
+(defn- calls
+  "`spans' without the ones an ns form's clause wrote - the call sites alone. What
+  a :refer names is in find-usages beside them, and a test about where a name is
+  CALLED has to say which of the two it means."
+  [spans]
+  (remove :declaration spans))
+
 (deftest test-usages-across-files-and-definitions
   (compile! program)
   (testing "every place u/double is WRITTEN, and nowhere a macro wrote it"
@@ -76,13 +83,60 @@
   (testing "a deftype defines its type, and a use of it is a usage"
     (is (= ["deep/util.cljs" 3 10] ((juxt :source :line :column)
                                    (an/definition 'deep.util/Box))))
-    (is (= #{["app/core.cljs" 7 19]} (lines (an/find-usages 'deep.util/Box)))))
+    (is (= #{["app/core.cljs" 7 19]} (lines (calls (an/find-usages 'deep.util/Box))))))
   (testing "a local var used in its own file"
     (is (= #{["app/core.cljs" 5 37]} (lines (an/find-usages 'app.core/a)))))
   (testing "Var or symbol"
     (let [v (.findInternedVar (env/find-cljs-ns (:cenv (compile! program)) 'deep.util)
                               'double)]
       (is (= (an/find-usages 'deep.util/double) (an/find-usages v))))))
+
+(def ^:private declares-program
+  '{deep.util "(ns deep.util)
+(def twice (fn* ([x] x)))
+(def thrice (fn* ([x] x)))
+(def renamed (fn* ([x] x)))
+(def double (fn* ([x] x)))"
+
+    app.core "(ns app.core
+  (:require [deep.util :as u :refer [twice thrice renamed]
+                       :rename {renamed local-name}])
+  (:require-macros [clojure.cljs.analysis-test :refer [calls-double]]))
+(def a (twice 1))
+(def b (calls-double 2))"})
+
+(deftest test-what-the-ns-form-writes-is-a-place
+  (let [{:keys [cenv]} (compile! declares-program)
+        declared (fn [spans]
+                   (into #{} (comp (filter :declaration)
+                                   (map (juxt :line :column :declaration)))
+                         spans))]
+    (testing "a :refer is where the name is written without being used - what
+    makes the short name mean that var, and what a rename has to rewrite along
+    with the call sites - so it is in the list, marked"
+      (is (= #{[2 38 :refer]} (declared (an/find-usages 'deep.util/twice))))
+      (is (= #{["app/core.cljs" 5 9]}
+             (lines (calls (an/find-usages 'deep.util/twice))))))
+    (testing "a name referred and never called has the one place and no other"
+      (is (= #{[2 44 :refer]} (declared (an/find-usages 'deep.util/thrice))))
+      (is (empty? (calls (an/find-usages 'deep.util/thrice)))))
+    (testing "a :rename writes the name twice - in the :refer and as the key it
+    replaces - and both have to be rewritten together"
+      (is (= #{[2 51 :refer] [3 33 :refer]}
+             (declared (an/find-usages 'deep.util/renamed)))))
+    (testing "a macro's :refer is the same fact about a macro, and goes where its
+    calls go"
+      (is (= #{[4 56 :refer]}
+             (declared (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double))))
+      (is (= #{["app/core.cljs" 6 9]}
+             (lines (calls (an/find-macro-usages
+                            'clojure.cljs.analysis-test/calls-double))))))
+    (testing "and none of them is a USE, so the lints that ask what a namespace
+    does not need still answer - a refer kept alive by its own :refer would be a
+    refer nothing could ever report"
+      (is (= '{thrice deep.util/thrice local-name deep.util/renamed}
+             (an/unused-refers cenv 'app.core)))
+      (is (= {} (an/unused-macro-refers cenv 'app.core))))))
 
 (deftest test-files-and-namespaces
   (compile! program)
@@ -254,9 +308,9 @@
   (testing "a call the source wrote"
     (is (= #{{:source "app/core.cljs" :line 4 :column 9 :end-line 4 :end-column 21
               :from-ns 'app.core}}
-           (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double)))
+           (set (calls (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double)))))
     (is (= #{["app/core.cljs" 5 9]}
-           (lines (an/find-macro-usages #'twice-double)))))
+           (lines (calls (an/find-macro-usages #'twice-double))))))
   (testing "a macro and a function of one name are two things"
     (is (= #{["app/core.cljs" 6 9]} (lines (an/find-macro-usages 'cljs.core/str))))
     (is (= #{["app/core.cljs" 7 13]} (lines (an/find-usages 'cljs.core/str))))))
@@ -270,7 +324,7 @@
                   cljs.core/str]))
     (is (contains? (an/macro-deps) 'app.core)))
   (testing "not a use, where nobody wrote the call"
-    (is (= 1 (count (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double))))))
+    (is (= 1 (count (calls (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double)))))))
 
 (deftest test-reloading-replaces-macro-facts
   (let [{:keys [cenv opts src]} (compile! macros-program)
@@ -811,7 +865,7 @@
     (testing "a use in a #_ and in a comment is found, marked as dead"
       (is (= #{[4 :discard] [7 :comment]} (dead (an/find-usages 'deep.util/dbl))))
       (is (= #{["app/core.cljs" 4 4] ["app/core.cljs" 7 4]}
-             (lines (an/find-usages 'deep.util/dbl)))
+             (lines (calls (an/find-usages 'deep.util/dbl))))
           "and not the #_ in f, nor the let in the comment: their dbl is a local")
       (is (every? #(= 'app.core (:from-ns %)) (an/find-usages 'deep.util/dbl))))
     (testing "resolved at the end of the file: a def after the comment is found"
