@@ -988,3 +988,78 @@
     (doseq [source (keys (:source->forms m))]
       (is (= (walked source) (an/file-def-vars source)) source))
     (is (= #{} (an/file-def-vars "nobody/here.cljs")))))
+
+;; --- what the compiler says it has defined ---------------------------------
+
+(defn- defining!
+  "Run `thunk` with clojure.analysis/*defined* collecting, and answer the events
+  it reported, in order."
+  [thunk]
+  (let [seen (atom [])]
+    (binding [clj-analysis/*defined* #(swap! seen conj %)] (thunk))
+    @seen))
+
+(defn- defined-nss
+  "The namespaces `events` say were recompiled, cljs.core left out - it is compiled
+  once on the way up and is nobody's project."
+  [events]
+  (into [] (comp (filter #(and (= :define (:op %)) (nil? (:var %))))
+                 (map :ns)
+                 (remove #{'cljs.core}))
+        events))
+
+(deftest test-a-compiled-file-says-its-namespace-was-replaced
+  (let [src    (h/write-sources! program)
+        out    (h/temp-dir)
+        cenv   (env/compile-env {:ns 'cljs.user})
+        opts   {:out-dir out :source-paths [src]}
+        events (defining! #(an/run-analysis
+                            (fn [] (driver/compile-namespace! cenv 'app.core opts))))]
+    (testing "one event per namespace compiled, in the order they compiled -
+              a dependency before what requires it"
+      (is (= '[deep.util app.core] (defined-nss events))))
+    (testing "the unit is the namespace and the event says which file it was"
+      (is (= [{:dialect :cljs :op :define :ns 'app.core :source "app/core.cljs"}]
+             (filter #(= 'app.core (:ns %)) events))))
+    (testing "and nothing is said about a namespace that was already held"
+      (is (empty? (defined-nss
+                    (defining! #(an/run-analysis
+                                 (fn [] (driver/compile-namespace! cenv 'app.core opts))))))))))
+
+(deftest test-a-def-typed-at-a-prompt-is-reported
+  (let [{:keys [cenv]} (compile! program)
+        events (defining! #(repl/compile-form cenv '(def typed 1)))]
+    (testing "the case no file and no model can answer: a form typed at a prompt is
+              compiled inside no file, and it defines a var all the same"
+      (is (= [{:dialect :cljs :op :define :ns 'cljs.user :var 'cljs.user/typed}]
+             events)))
+    (testing "every def of the input, however deep - one input can be a do"
+      (is (= '[cljs.user/x cljs.user/y]
+             (mapv :var (defining! #(repl/compile-form cenv '(do (def x 1) (def y 2))))))))
+    (testing "and an input that defines nothing says nothing"
+      (is (empty? (defining! #(repl/compile-form cenv '(+ 1 1))))))
+    (testing "the model holds none of it, which is what makes it a model of the
+              code rather than of the session"
+      (is (not (contains? (an/analysed-files) "cljs/user.cljs"))))))
+
+(deftest test-a-reload-says-what-it-took-away
+  (let [{:keys [cenv opts src]} (compile! prune-program)]
+    (touch! (io/file src "deep/util.cljs")
+            "(ns deep.util)\n(def keep 1)\n(def ^boolean flag? true)\n")
+    (let [err    (java.io.StringWriter.)
+          events (defining! #(binding [*err* err]
+                               (an/stale-reload! cenv opts :prune true)))]
+      (testing "the file that was recompiled is said to have been"
+        (is (= '[deep.util] (defined-nss events))))
+      (testing "and the def it no longer has is said to have gone - a definition
+                taken away by something nobody typed"
+        (is (= [{:dialect :cljs :op :remove :ns 'deep.util :var 'deep.util/gone}]
+               (filterv #(= :remove (:op %)) events))))
+      (testing "and it is said after it has gone, not before"
+        (is (not (has-var? cenv 'deep.util/gone)))))))
+
+(deftest test-nothing-is-reported-where-nothing-is-listening
+  (is (nil? clj-analysis/*defined*) "and the default is to be listening nowhere")
+  (let [{:keys [cenv]} (compile! program)]
+    (is (some? (repl/compile-form cenv '(def quiet 1))))
+    (is (= #{"app/core.cljs" "deep/util.cljs"} (an/analysed-files)))))

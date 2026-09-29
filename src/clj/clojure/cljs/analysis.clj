@@ -207,9 +207,11 @@
 ;; other - so a form's facts always land in the frame of the file it belongs to -
 ;; and whose facts go nowhere. `forms` is the stack of open forms, `buffer` the
 ;; finished ones, `counter` the next begin-order rank. `dead` is the file's dead code,
-;; kept until the file ends and resolved then in `cenv` - see commit-dead!.
+;; kept until the file ends and resolved then in `cenv` - see commit-dead!. `ns-sym`
+;; is the namespace the file declares, which nothing in the model is keyed by and
+;; which end-file says was recompiled - see defined!.
 (deftype FileFrame [source location mtime ignored ^ArrayList forms ^ArrayList buffer
-                    ^longs counter cenv ^ArrayList dead])
+                    ^longs counter cenv ^ArrayList dead nsym])
 
 ;; --- where a file is, and when it changed ------------------------------------
 
@@ -699,6 +701,58 @@
                      (span k (.source ^FileFrame (peek-list files)) (:line m) (:column m)
                            (:end-line m) (:end-column m) ns)))))))
 
+(defn- defined!
+  "Tell clojure.analysis/*defined* about `event`, if anything is listening.
+
+  THAT VAR AND NOT ONE OF OUR OWN, for `told!'s reason and one more besides. A
+  reload of this compiler loads Clojure macro files on the JVM, which define
+  Clojure vars and say so through that var, and half of what a ClojureScript
+  reload replaces is therefore reported from the other side - so a watcher that
+  bound two vars would see half of one reload in each. One stream, in the order
+  things happen, with :dialect saying which side an event came from.
+
+  See clojure.analysis/*defined* for the shape of the maps."
+  [event]
+  (when-let [f clj-analysis/*defined*] (f event))
+  nil)
+
+(defn defined-by!
+  "Say what `node` - one analysed top-level form - defines.
+
+  FOR A FORM THAT IS INSIDE NO FILE, which is the one thing the sink below cannot
+  answer for: a `defn' typed at a prompt compiles under no file frame, so nothing
+  is recorded and there is nothing for `end-file' to report. It is also exactly
+  what somebody fixing one function does, so it is the case the hooks this feeds
+  exist for as much as a whole file is. clojure.cljs.repl/compile-form calls this;
+  a file goes through the sink and is reported once, whole.
+
+  Cheap where nobody is listening, which is why the walk is inside the test: an
+  AST walk per REPL input costs nothing next to having compiled it, and it still
+  should not happen for nothing.
+
+  A :def and a :deftype each hold the var they define as a :var child, which is
+  where the name is - `record-facts!' reads it the same way and says why."
+  [node]
+  (when clj-analysis/*defined*
+    (letfn [(visit [n]
+              (case (:op n)
+                (:def :deftype)
+                (when-let [k (:name (:var n))]
+                  (defined! {:dialect :cljs :op :define
+                             :ns (symbol (namespace k)) :var k}))
+                nil)
+              (run! visit (ast/children n)))]
+      (visit node)))
+  nil)
+
+(defn removed!
+  "Say that `qsym` has been taken away - clojure.cljs.repl's remove-var, which is a
+  removal nothing else here reports: it names one var, needs no model, and takes it
+  out of `cenv` and out of the runtime both. A reload's removals are `prune-vars!'s."
+  [qsym]
+  (defined! {:dialect :cljs :op :remove :ns (symbol (namespace qsym)) :var qsym})
+  nil)
+
 ;; One per run-analysis. `files` is the stack of files being compiled; it is touched
 ;; only by the thread the compilation runs on, which is the thread that bound it.
 (deftype AnalysisSink [^ArrayList files reader]
@@ -706,7 +760,8 @@
   (reader-sink [_] reader)
   (begin-file [_ cenv ns-sym source location]
     (.add files (FileFrame. source location (mtime location) (= 'cljs.core ns-sym)
-                            (ArrayList.) (ArrayList.) (long-array 1) cenv (ArrayList.)))
+                            (ArrayList.) (ArrayList.) (long-array 1) cenv (ArrayList.)
+                            ns-sym))
     nil)
   (begin-form [_]
     (when-let [^FileFrame fr (peek-list files)]
@@ -739,7 +794,18 @@
       (pop-list! files)
       (when-not (.ignored fr)
         (commit-dead! fr)
-        (commit-frame! fr)))
+        (commit-frame! fr))
+      ;; AND THE FILE'S CODE HAS BEEN REPLACED, which is a fact about the program
+      ;; rather than about the model - so it is said for cljs.core's frame too,
+      ;; whose facts go nowhere.
+      ;;
+      ;; THE UNIT IS THE NAMESPACE because the unit of a compile IS the namespace:
+      ;; the module is rewritten whole and every function in it is a new object,
+      ;; whether or not a single def in it reads any differently than it did. Which
+      ;; is what watching a namespace's definitions for a change gets wrong, and
+      ;; gets wrong in the direction of saying that nothing happened. A def typed
+      ;; at a prompt is the other unit and is `defined-by!'s.
+      (defined! {:dialect :cljs :op :define :ns (.nsym fr) :source (.source fr)}))
     nil)
   (abort-file [_ _source]
     ;; its open forms go with it: they are on the frame, not beside it
@@ -1404,6 +1470,12 @@
               (println "WARN: pruning" (str k) "still referenced at"
                        (vec (sort (for [u us] [(:source u) (:line u) (:column u)])))))))))
     (doseq [k gone] (env/remove-var! cenv k))
+    ;; AFTER the removal and not before it: what this says is that the name has
+    ;; gone, and it has not gone until it is gone. A reload is the one thing that
+    ;; takes a definition away without anybody having typed anything, so it is the
+    ;; one that has to say so - see clojure.analysis/*defined*.
+    (doseq [k gone]
+      (defined! {:dialect :cljs :op :remove :ns (symbol (namespace k)) :var k}))
     gone))
 
 (defn prune-file!

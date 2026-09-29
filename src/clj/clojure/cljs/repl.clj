@@ -423,6 +423,12 @@
            map?  (boolean (and text (:out-dir opts) (:line m)))
            label (str base ".cljs")
            node  (cond-> node map? (si/source-info (assoc m :file label)))
+           ;; WHAT THIS INPUT DEFINED, which is the half of that question no file
+           ;; and no model can answer: a form typed here is compiled inside no
+           ;; file, so the sink has no frame to file it under and records nothing -
+           ;; and redefining one function at a prompt is exactly what somebody
+           ;; fixing one function does. See clojure.cljs.analysis/defined-by!.
+           _     (analysis/defined-by! node)
            body  (emitter/emit-top-lines node emitter/return-value)
            reqs  (env/requires cenv nsym)
            ;; The prologue below spells a goog require as an await $CLJS.require,
@@ -727,11 +733,16 @@
   [cenv runtime opts args]
   (let [qsym (unquoted (first args))
         _    (env/remove-var! cenv qsym)
-        ns-sym (symbol (namespace qsym))]
-    (ship! runtime
-           [(emitter/script
-             (into (emitter/ns-prologue ns-sym)
-                   [(emitter/delete-var ns-sym (symbol (name qsym)))]))])))
+        ns-sym (symbol (namespace qsym))
+        r    (ship! runtime
+                    [(emitter/script
+                      (into (emitter/ns-prologue ns-sym)
+                            [(emitter/delete-var ns-sym (symbol (name qsym)))]))])]
+    ;; SAID ONCE BOTH HALVES ARE DONE, since both halves are what makes it gone:
+    ;; a var that stopped resolving here and still answers there has not been
+    ;; removed from the program anybody is running.
+    (when-not (= :error (:status r)) (analysis/removed! qsym))
+    r))
 
 (defn- pages-text
   [pages]
