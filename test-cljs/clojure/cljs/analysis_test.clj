@@ -779,3 +779,56 @@
       (is (seq (an/file-forms "app/core.cljs")))
       (repl/eval-form cenv rt (list 'load-file (str (io/file src "deep/util.cljs"))) opts)
       (is (empty? (an/file-forms "deep/util.cljs"))))))
+
+;; --- code the program does not run: #_ and (comment ...) ------------------------
+
+(def ^:private dead-program
+  '{deep.util "(ns deep.util)
+(def dbl (fn* ([x] (js* \"~{} * 2\" x))))"
+    other.lib "(ns other.lib)
+(def z 3)"
+    app.core  "(ns app.core
+  (:require [deep.util :as u :refer [dbl]] [other.lib :as ol])
+  (:require-macros [clojure.cljs.analysis-test :refer [calls-double]]))
+#_(u/dbl 1)
+(defn f [dbl] #_(dbl 2) dbl)
+(comment
+  (u/dbl 3)
+  (let [dbl 4] (dbl))
+  (calls-double (later))
+  (str 1)
+  (map str [1])
+  (defn ghost [] 1)
+  (quote (later))
+  #_(ol/z)
+  :in-comment)
+#_::ol/k
+(defn later [] 1)"})
+
+(deftest test-dead-code-is-resolved-for-find-usages
+  (let [{:keys [cenv]} (compile! dead-program)
+        dead (fn [spans] (into #{} (keep #(when (:dead %) [(:line %) (:dead %)])) spans))]
+    (testing "a use in a #_ and in a comment is found, marked as dead"
+      (is (= #{[4 :discard] [7 :comment]} (dead (an/find-usages 'deep.util/dbl))))
+      (is (= #{["app/core.cljs" 4 4] ["app/core.cljs" 7 4]}
+             (lines (an/find-usages 'deep.util/dbl)))
+          "and not the #_ in f, nor the let in the comment: their dbl is a local")
+      (is (every? #(= 'app.core (:from-ns %)) (an/find-usages 'deep.util/dbl))))
+    (testing "resolved at the end of the file: a def after the comment is found"
+      (is (= #{[9 :comment]} (dead (an/find-usages 'app.core/later)))))
+    (testing "a macro in a head, a var anywhere else - the analyzer's order"
+      (is (= #{[9 :comment]}
+             (dead (an/find-macro-usages 'clojure.cljs.analysis-test/calls-double))))
+      (is (= #{[10 :comment]} (dead (an/find-macro-usages 'cljs.core/str))))
+      (is (= #{[11 :comment]} (dead (an/find-usages 'cljs.core/str)))))
+    (testing "nothing in it is defined"
+      (is (nil? (an/definition 'app.core/ghost))))
+    (testing "the comment call itself is live"
+      (is (= #{} (dead (an/find-macro-usages 'cljs.core/comment))))
+      (is (= 1 (count (an/find-macro-usages 'cljs.core/comment)))))
+    (testing "a keyword in a #_ or a comment is dead too"
+      (is (= #{[16 :discard]} (dead (an/find-keyword-usages :other.lib/k))))
+      (is (= #{[15 :comment]} (dead (an/find-keyword-usages :in-comment)))))
+    (testing "a use in a comment keeps a require; one in a #_ does not"
+      (is (= '{ol other.lib} (an/unused-aliases cenv 'app.core)))
+      (is (= {} (an/unused-macro-refers cenv 'app.core))))))

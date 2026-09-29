@@ -97,8 +97,9 @@
   namespace drives compilations (load-file!) and so has to require this one, and a
   require back would be a cycle.
 
-    begin-file  `source` is the file's label (source-label), the key the model files
-                it under; `location` is where it was actually found, a File or URL
+    begin-file  `cenv` is the environment the file compiles in; `source` is the
+                file's label (source-label), the key the model files it under;
+                `location` is where it was actually found, a File or URL
     begin-form  before a form is read, so whatever reading it reports lands in it
     form-start  the form's own position, once it has been read
     analyzed    the form's AST
@@ -108,7 +109,7 @@
     reader-sink the clojure.lang.IAnalysisSink the reader reports to while it
                 reads a form of this file, or nil - see
                 clojure.cljs.reader/*analysis-sink*"
-  (begin-file [sink ns-sym source location])
+  (begin-file [sink cenv ns-sym source location])
   (begin-form [sink])
   (form-start [sink line column])
   (analyzed [sink node])
@@ -437,10 +438,10 @@
   "(f), bracketed as one file for the sink when there is one: end-file if it
   returned, abort-file if it threw - so a file that failed half way contributes
   nothing, which is the same rule env/compiled! follows below."
-  [ns-sym src f]
+  [cenv ns-sym src f]
   (if-let [sink *sink*]
     (let [label (source-label ns-sym src)
-          _     (begin-file sink ns-sym label src)
+          _     (begin-file sink cenv ns-sym label src)
           r     (try (f)
                      (catch Throwable t
                        (abort-file sink label)
@@ -466,7 +467,7 @@
         state   (reduce #(ensure! cenv opts %1 %2)
                         (update state :visiting conj ns-sym)
                         deps)
-        {:keys [written mapped script]} (sunk-file ns-sym src
+        {:keys [written mapped script]} (sunk-file cenv ns-sym src
                                                    #(compile-source! cenv opts src ns-sym))
         ;; RECORDED AFTER IT WORKED, which is the whole of what `ensure!' asks
         ;; about a dependency next time. A file that threw half way through

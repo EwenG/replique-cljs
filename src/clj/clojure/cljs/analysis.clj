@@ -40,6 +40,11 @@
   the AST cannot hold - a call is gone before a node is built - and come from a
   hook in clojure.cljs.macroexpand (*on-expand*), which run-analysis binds.
 
+  CODE THE PROGRAM DOES NOT RUN - a #_, a (comment ...) - is not compiled, so it
+  has no AST; it is resolved instead, by clojure.analysis's walk, and its uses are
+  recorded marked :dead, for find-usages. The unused-* lints count a use in a
+  comment and not one in a #_ (see commit-dead! and from-ns?).
+
   DISK ONLY. Nothing typed at a REPL reaches the model - the REPL does not go
   through the driver's file loop - so it stays in step with what is on disk.
 
@@ -125,20 +130,26 @@
 ;; A usage/def span, as clojure.analysis has it: primitive coordinates, an absent
 ;; end stored as -1, and `entity` - the var key the span is about - carried on the
 ;; span so a fact is one object. from-ns is a namespace SYMBOL here (a
-;; ClojureScript namespace is not something to hold on to); nil for a def.
-(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns])
+;; ClojureScript namespace is not something to hold on to); nil for a def. dead is
+;; :discard or :comment for a use in code the program does not run (commit-dead!).
+(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns
+                 dead])
 
 (defn- norm-pos [x] (if (nat-int? x) (int x) -1))
 
-(defn- span [entity source line column el ec from-ns]
-  (->Span entity source (norm-pos line) (norm-pos column) (norm-pos el) (norm-pos ec)
-          from-ns))
+(defn- span
+  ([entity source line column el ec from-ns]
+   (span entity source line column el ec from-ns nil))
+  ([entity source line column el ec from-ns dead]
+   (->Span entity source (norm-pos line) (norm-pos column) (norm-pos el) (norm-pos ec)
+           from-ns dead)))
 
 (defn- span->map [s]
   (cond-> {:source (:source s) :line (:line s) :column (:column s)}
     (nat-int? (:end-line s))   (assoc :end-line (:end-line s))
     (nat-int? (:end-column s)) (assoc :end-column (:end-column s))
-    (:from-ns s)               (assoc :from-ns (:from-ns s))))
+    (:from-ns s)               (assoc :from-ns (:from-ns s))
+    (:dead s)                  (assoc :dead (:dead s))))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
@@ -190,9 +201,10 @@
 ;; A file being compiled. `ignored` is cljs.core's frame, which is pushed like any
 ;; other - so a form's facts always land in the frame of the file it belongs to -
 ;; and whose facts go nowhere. `forms` is the stack of open forms, `buffer` the
-;; finished ones, `counter` the next begin-order rank.
+;; finished ones, `counter` the next begin-order rank. `dead` is the file's dead code,
+;; kept until the file ends and resolved then in `cenv` - see commit-dead!.
 (deftype FileFrame [source location mtime ignored ^ArrayList forms ^ArrayList buffer
-                    ^longs counter])
+                    ^longs counter cenv ^ArrayList dead])
 
 ;; --- where a file is, and when it changed ------------------------------------
 
@@ -496,6 +508,98 @@
                 ;; after the form, so an (ns ...) files under the ns it made
                 :ns env/*current-ns*))))
 
+;; --- dead code: #_ and (comment ...) -------------------------------------------
+
+;; clojure.analysis's dead code, for the same reason and by the same walk
+;; (clojure.analysis/walk-dead-code): the form a #_ discards, which the reader hands
+;; the reader sink (deadForm), and the form of a (comment ...), which on-expand
+;; sees. Neither is compiled; each symbol written in them is resolved, at the end of
+;; the file, the way the analyzer would resolve it - a ClojureScript var, or a macro
+;; - and recorded as a use marked :dead. No defs, no locals, no macro edges, no
+;; metadata dependencies: nothing that makes a file stale or orders a reload.
+
+(defn- close-dead!
+  "Open form `of` of frame `fr` has ended: give the dead code written in it the
+  locals its live code bound, which are complete only now - a #_ is read before
+  the form around it is compiled - and mark dead the keywords the reader reported
+  inside it (clojure.analysis/mark-dead!). The reader's other reports, syntax-quote
+  references, are not kept here at all."
+  [^FileFrame fr ^OpenForm of]
+  (let [^ArrayList dead (.dead fr)
+        outer (delay (clj-analysis/locals-at (aget ^objects (.cats of) CAT-LOCALS)))
+        spans (ArrayList.)]
+    (dotimes [i (.size dead)]
+      (let [d (.get dead i)]
+        (when (identical? of (:of d))
+          (when-let [sp (:span d)] (.add spans [(:kind d) sp]))
+          (.set dead i (-> d (dissoc :of) (assoc :outer @outer))))))
+    (when-not (.isEmpty spans)
+      (clj-analysis/mark-dead! (aget ^objects (.cats of) CAT-KEYWORDS) (vec spans))))
+  nil)
+
+(defn- dead-resolvers
+  "The walk's :target and :op in `cenv`, for the namespace env/*current-ns* names
+  when they are called.
+
+  A head prefers a macro and anything else a var, which is the analyzer's order:
+  (str x) is a call of the macro, and str passed to map is the function. The core
+  macros are named as clojure.core's for the walk, which knows the binding forms by
+  those names."
+  [cenv]
+  (let [macro (fn [sym] (mx/macro-var cenv {} sym))
+        core  (:core-macros cenv)]
+    {:target (fn [sym head?]
+               (if head?
+                 (or (macro sym) (env/resolve-var cenv sym))
+                 (or (env/resolve-var cenv sym) (macro sym))))
+     :op     (fn [sym]
+               (when-let [^Var m (macro sym)]
+                 (let [n (.getName (.ns m))]
+                   (if (or (= core n) (= 'clojure.core n))
+                     (symbol "clojure.core" (str (.sym m)))
+                     (jvm-var-key m)))))}))
+
+(defn- commit-dead!
+  "Resolve the dead code of file frame `fr` - it has compiled to the end, so what
+  it defines and requires is there - and add what it names to the frame's buffer,
+  as one more form: ClojureScript vars as :usages, macros as :macro-usages. A form
+  that cannot be walked is skipped: it is the program's to be wrong, never the
+  compile's."
+  [^FileFrame fr]
+  (let [^ArrayList dead (.dead fr)]
+    (when-not (.isEmpty dead)
+      (let [source (.source fr)
+            cenv   (.cenv fr)
+            uses   (ArrayList.)
+            macros (ArrayList.)]
+        (doseq [{:keys [form kind ns outer]} dead]
+          (binding [env/*current-ns* ns]
+            (let [emit (fn [^Var v sym]
+                         (let [m (meta sym)]
+                           (when (:column m)
+                             (if (.isMacro v)
+                               (.add macros (span (jvm-var-key v) source (:line m) (:column m)
+                                                  (:end-line m) (:end-column m) ns kind))
+                               (when-let [k (var-key v)]
+                                 (.add uses (span k source (:line m) (:column m)
+                                                  (:end-line m) (:end-column m) ns kind)))))))]
+              (try
+                (clj-analysis/walk-dead-code (clj-analysis/dead-body form kind)
+                                             (assoc (dead-resolvers cenv)
+                                                    :outer outer :emit emit))
+                (catch Exception _ nil)))))
+        (when-not (and (.isEmpty uses) (.isEmpty macros))
+          (let [^longs c (.counter fr)
+                rank     (aget c 0)
+                ^Span s1 (first (concat uses macros))]
+            (aset c 0 (inc rank))
+            (.add ^ArrayList (.buffer fr)
+                  (cond-> {:seq rank :source source :line (.line s1) :column (.column s1)
+                           :ns nil}
+                    (not (.isEmpty uses))   (assoc :usages (vec uses))
+                    (not (.isEmpty macros)) (assoc :macro-usages (vec macros)))))))))
+  nil)
+
 ;; --- the sink -----------------------------------------------------------------
 
 ;; What the reader reports to while it reads a form of an analysed file. It is a
@@ -518,6 +622,14 @@
   (localUsage [_ _ _ _ _ _ _ _])
   (classUsage [_ _ _ _ _ _ _ _])
   (macroExpansion [_ _ _ _ _ _ _ _ _])
+  (deadForm [_ form kind _ _ line column el ec]
+    ;; a #_ - LispReader does not report one in a branch not taken
+    (when-let [^FileFrame fr (peek-list files)]
+      (when-not (.ignored fr)
+        (.add ^ArrayList (.dead fr)
+              {:form form :kind kind :ns env/*current-ns* :of (peek-list (.forms fr))
+               :span (when (and (nat-int? line) (nat-int? el)) [line column el ec])})))
+    nil)
   (keywordUsage [_ kw _ _ line column el ec]
     ;; the branch of a reader conditional this platform does not take is read with
     ;; *suppress-read* on - it is another platform's code, not this program's. A #_
@@ -527,15 +639,33 @@
                  (span kw (.source ^FileFrame (peek-list files)) line column el ec
                        env/*current-ns*)))))
 
+(defn- comment-macro?
+  "Is macro `v` a (comment ...) - cljs.core's, or clojure.core's in a .cljc read as
+  Clojure's by a :require-macros?"
+  [^Var v]
+  (and (= "comment" (str (.sym v)))
+       (contains? '#{cljs.core clojure.core} (.getName (.ns v)))))
+
 (defn- on-expand
   "The macroexpand hook for one run: every expansion inside an open form is an edge
   from the namespace being compiled to the macro, and a call the source wrote -
-  its symbol carries the reader's position - is a use of the macro too."
+  its symbol carries the reader's position - is a use of the macro too. A
+  (comment ...) is also dead code (commit-dead!): its body is never compiled, and
+  this is the only sight of it anything gets."
   [^ArrayList files]
-  (fn [^Var v op]
+  (fn [^Var v op form]
     (when-let [of (open-form files)]
       (let [k  (jvm-var-key v)
             ns env/*current-ns*]
+        (when (comment-macro? v)
+          (.add ^ArrayList (.dead ^FileFrame (peek-list files))
+                {:form form :kind :comment :ns ns :of of
+                 ;; from the end of the comment symbol, a live call, to the end of
+                 ;; the form
+                 :span (let [h (written-at op) m (meta form)]
+                         (when (and (:end-line h) (:end-column h)
+                                    (:end-line m) (:end-column m))
+                           [(:end-line h) (:end-column h) (:end-line m) (:end-column m)]))}))
         (add-fact! of CAT-MACRODEP [ns k (:file (meta v))])
         (when-let [m (written-at op)]
           (add-fact! of CAT-MACROUSE
@@ -547,9 +677,9 @@
 (deftype AnalysisSink [^ArrayList files reader]
   driver/CompileSink
   (reader-sink [_] reader)
-  (begin-file [_ ns-sym source location]
+  (begin-file [_ cenv ns-sym source location]
     (.add files (FileFrame. source location (mtime location) (= 'cljs.core ns-sym)
-                            (ArrayList.) (ArrayList.) (long-array 1)))
+                            (ArrayList.) (ArrayList.) (long-array 1) cenv (ArrayList.)))
     nil)
   (begin-form [_]
     (when-let [^FileFrame fr (peek-list files)]
@@ -573,6 +703,7 @@
       (when-let [of (peek-list (.forms fr))]
         (pop-list! (.forms fr))
         (when-not (.ignored fr)
+          (close-dead! fr of)
           (when-let [fe (freeze-form of (.source fr))]
             (.add ^ArrayList (.buffer fr) fe)))))
     nil)
@@ -580,6 +711,7 @@
     (when-let [^FileFrame fr (peek-list files)]
       (pop-list! files)
       (when-not (.ignored fr)
+        (commit-dead! fr)
         (commit-frame! fr)))
     nil)
   (abort-file [_ _source]
@@ -725,7 +857,11 @@
 (defn find-usages
   "Usage sites recorded for a var - its fully-qualified name symbol, or the
   ClojureScript Var itself. A set of {:from-ns :source :line :column :end-line
-  :end-column}."
+  :end-column [:dead]}.
+
+  Code the program does not run is included: a use in a #_ carries :dead :discard,
+  one in a (comment ...) :dead :comment. It is resolved rather than compiled - see
+  commit-dead! - so it can name something the compiler would not have."
   [var-or-sym]
   (spans->maps (get (:usages (derived @model)) (->var-key var-or-sym))))
 
@@ -749,7 +885,8 @@
   Only calls the source WROTE: a macro called by another macro's expansion is a
   dependency (macro-deps) and not a use. Uses of the same name as a VALUE -
   cljs.core/str passed to map rather than called - are the ClojureScript var's,
-  and find-usages has them."
+  and find-usages has them. A call in a #_ or a (comment ...) is here too, marked
+  :dead as find-usages marks one."
   [macro]
   (spans->maps (get (:macro-usages (derived @model))
                     (if (instance? Var macro) (jvm-var-key macro) macro))))
@@ -801,7 +938,12 @@
 ;; there; what its code USES comes from the model. Both are about the last compile:
 ;; a file edited since is answered as it was.
 
-(defn- from-ns? [ns-sym ^Span s] (= ns-sym (.from-ns s)))
+(defn- from-ns?
+  "Is `s` a use from `ns-sym`, as the unused-* lints count one? A use in a #_ is
+  not: the code is gone. A use in a (comment ...) is: a rich comment block is code
+  meant to be run at the REPL - clojure.analysis/counts-as-use?."
+  [ns-sym ^Span s]
+  (and (= ns-sym (.from-ns s)) (not= :discard (.dead s))))
 
 (defn- used-from
   "The keys of index `m` with at least one span from `ns-sym`."
@@ -1130,7 +1272,7 @@
                               (identical? old (cljs-var cenv k)))]
                k)]
     (doseq [k gone]
-      (when-let [us (seq (get (:usages idx) k))]
+      (when-let [us (seq (remove :dead (get (:usages idx) k)))]
         (binding [*out* *err*]
           (println "WARN: pruning" (str k) "still referenced at"
                    (vec (sort (for [u us] [(:source u) (:line u) (:column u)]))))))

@@ -311,10 +311,11 @@
          :shadow.build/ns->mod (shadow-ns->mod)}))
 
 (def ^:dynamic *on-expand*
-  "nil, or a function of the macro Var and the symbol that named it, called just
-  before each macro this namespace expands. clojure.cljs.analysis binds it: every
-  expansion is a compile-time dependency of the form being compiled on the macro,
-  and a call whose symbol the source wrote is a use of it.
+  "nil, or a function of the macro Var, the symbol that named it and the form,
+  called just before each macro this namespace expands. clojure.cljs.analysis binds
+  it: every expansion is a compile-time dependency of the form being compiled on the
+  macro, a call whose symbol the source wrote is a use of it, and the form of a
+  (comment ...) is the only sight anything gets of its body.
 
   A hook here and not a node in the AST, because the AST has nothing left to hold
   it by: the call is replaced by its expansion before any node is built."
@@ -351,7 +352,7 @@
         (symbol? op)
         (if-let [v (macro-var cenv env op)]
           (do
-            (when-let [f *on-expand*] (f v op))
+            (when-let [f *on-expand*] (f v op form))
             ;; the one place *cenv* is bound. A macro's parameters are &form and
             ;; &env, so a macro that has to resolve a ClojureScript symbol -
             ;; defprotocol and its family, which turn one into a property name -
