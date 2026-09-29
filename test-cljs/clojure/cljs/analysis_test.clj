@@ -1012,6 +1012,49 @@
       (is (= (walked source) (an/file-def-vars source)) source))
     (is (= #{} (an/file-def-vars "nobody/here.cljs")))))
 
+;; --- protocols ------------------------------------------------------------------
+
+(def ^:private protocol-program
+  '{deep.util "(ns deep.util)
+(defprotocol Shape
+  (area [s]))"
+
+    app.core "(ns app.core
+  (:require [deep.util :as u :refer [Shape area]]))
+(defrecord Square [n]
+  Shape
+  (area [_] (* n n)))
+(deftype Dot []
+  u/Shape
+  (area [_] 0))
+(extend-type string
+  Shape
+  (area [_] 1))
+(def a (area (Dot.)))"})
+
+(deftest test-implementing-a-protocol-is-a-use-of-it
+  (compile! protocol-program)
+  (testing "every form that implements it, however it names it"
+    (is (= #{["app/core.cljs" 4 3] ["app/core.cljs" 7 3] ["app/core.cljs" 10 3]}
+           (lines (calls (an/find-usages 'deep.util/Shape))))))
+  (testing "beside what the ns form wrote, which is the other kind of place"
+    (is (= #{["app/core.cljs" 2 38]}
+           (lines (filter :declaration (an/find-usages 'deep.util/Shape))))))
+  (testing "each recorded from the namespace that implements it"
+    (is (every? #(= 'app.core (:from-ns %)) (an/find-usages 'deep.util/Shape))))
+  (testing "a span covers the name as written, alias and all"
+    (is (some #(= {:source "app/core.cljs" :line 7 :column 3 :end-line 7 :end-column 10
+                   :from-ns 'app.core} %)
+              (an/find-usages 'deep.util/Shape))))
+  (testing "a method answers its call sites and not the bodies that implement it"
+    (is (= #{["app/core.cljs" 12 9]}
+           (lines (calls (an/find-usages 'deep.util/area))))))
+  (testing "and a protocol a MACRO named is nobody's place to be taken to"
+    ;; defrecord extends a dozen of cljs.core's own, and not one of them is
+    ;; written in this file - see clojure.cljs.macroexpand/*on-protocol-impl*
+    (is (empty? (an/find-usages 'cljs.core/IRecord)))
+    (is (empty? (an/find-usages 'cljs.core/ILookup)))))
+
 ;; --- what the compiler says it has defined ---------------------------------
 
 (defn- defining!

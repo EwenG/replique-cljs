@@ -1652,6 +1652,12 @@
                 (not (core/-> p meta :deprecation-nowarn)))
           (ana/warning :protocol-deprecated env {:protocol p}))
         (core/when (:protocol-symbol var)
+          ;; WHERE THE PROTOCOL WAS WRITTEN, said from here because here is the
+          ;; only place that knows: by the time this has returned, the name is a
+          ;; munged property and the symbol is gone. See
+          ;; clojure.cljs.macroexpand/*on-protocol-impl*.
+          (core/when-let [f mx/*on-protocol-impl*]
+            (f (:name var) p))
           ;; ADAPTED (M5): cljs.analyzer keeps every namespace's defs in one map
           ;; under [::ana/namespaces ns :defs sym], so it records an
           ;; implementation by assoc-ing into it. Our symbol table is a

@@ -321,6 +321,33 @@
   it by: the call is replaced by its expansion before any node is built."
   nil)
 
+(def ^:dynamic *on-protocol-impl*
+  "nil, or a function of the protocol's qualified name and the symbol that named
+  it, called for each protocol a `deftype', `defrecord', `reify', `specify!' or
+  `extend-type' implements - from cljs.core/update-protocol-var, which is where
+  every one of those forms resolves the protocol it was given.
+  clojure.cljs.analysis binds it: naming a protocol in an implementation is a use
+  of it, and that is how where-is-this-protocol-implemented is answered.
+
+  A hook here and not a node in the AST, for *on-expand*'s reason in its sharpest
+  form. A ClojureScript protocol is not a var at run time but a munged property
+  name, so implementing one compiles to
+
+      (set! (.. Square -prototype -up$cutil$Shape) true)
+
+  and the protocol's name is not in that form at all - it has become four
+  characters of a property. Nothing the analyzer is handed remembers that the
+  source wrote `Shape' there, and nothing could: the only moment the written
+  symbol and the var it resolves to are both in hand is the moment the macro
+  resolves it, which is this one.
+
+  The written symbol is passed rather than a position because a protocol a MACRO
+  names carries no reader position - `defrecord' extends fourteen of cljs.core's
+  own - and what has no position was not written anywhere a person can be taken
+  to. The analysis side drops those, the same way it drops a macro call nobody
+  wrote."
+  nil)
+
 (defn macroexpand-1
   "Expand `form` once in `env`. Returns the form unchanged when there is nothing
   to expand - identical?, so callers can test for a fixed point.

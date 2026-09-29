@@ -38,7 +38,10 @@
   every keyword it reads, auto-resolved ones (::x, ::alias/x) fully qualified in
   the ClojureScript namespace being compiled. Macro expansions are the other fact
   the AST cannot hold - a call is gone before a node is built - and come from a
-  hook in clojure.cljs.macroexpand (*on-expand*), which run-analysis binds.
+  hook in clojure.cljs.macroexpand (*on-expand*), which run-analysis binds. A
+  protocol named in an implementation is the third: it has become a munged
+  property name before the analyzer sees anything, and comes from the hook beside
+  it (*on-protocol-impl*) - see on-protocol-impl.
 
   CODE THE PROGRAM DOES NOT RUN - a #_, a (comment ...) - is not compiled, so it
   has no AST; it is resolved instead, by clojure.analysis's walk, and its uses are
@@ -703,6 +706,37 @@
                      (span k (.source ^FileFrame (peek-list files)) (:line m) (:column m)
                            (:end-line m) (:end-column m) ns)))))))
 
+(defn- on-protocol-impl
+  "The protocol hook for one run: naming a protocol in a `deftype', a `defrecord',
+  a `reify', a `specify!' or an `extend-type' is a use of it, recorded where the
+  source wrote it.
+
+  WHICH MAKES WHO-IMPLEMENTS-THIS THE SAME QUESTION AS WHERE-IS-THIS-USED, asked
+  with one op and answered with one list. It is how Clojure answers it too, and by
+  accident rather than design: a protocol there generates an interface, a `deftype'
+  names that interface by the time the compiler sees it, and the place lands among
+  the interface's usages. ClojureScript generates no interface - see
+  clojure.cljs.macroexpand/*on-protocol-impl* for what it generates instead - so the
+  same answer has to be put together on purpose.
+
+  ONLY WHAT SOMEBODY WROTE. A protocol with no reader position was named by a
+  macro, not in the file: `defrecord' extends fourteen of cljs.core's own, and a
+  place nobody can be taken to is not a place. `on-expand' turns a macro call away
+  by the same test.
+
+  Not a method's implementations, which this is not and does not become: a method
+  answers its call sites, because a type need not implement every method it could
+  and the two questions part company there."
+  [^ArrayList files]
+  (fn [qsym written]
+    (when-let [of (open-form files)]
+      (when-let [m (written-at written)]
+        (add-fact! of CAT-USAGES
+                   (span qsym (.source ^FileFrame (peek-list files))
+                         (:line m) (:column m) (:end-line m) (:end-column m)
+                         env/*current-ns*))))
+    nil))
+
 (defn- defined!
   "Tell clojure.analysis/*defined* about `event`, if anything is listening.
 
@@ -834,8 +868,9 @@
   :reload / :reload-all, or load-file!."
   [thunk]
   (let [files (ArrayList.)]
-    (binding [driver/*sink*     (->AnalysisSink files (->ReaderSink files))
-              mx/*on-expand* (on-expand files)]
+    (binding [driver/*sink*          (->AnalysisSink files (->ReaderSink files))
+              mx/*on-expand*         (on-expand files)
+              mx/*on-protocol-impl*  (on-protocol-impl files)]
       (thunk))))
 
 (defn load-file!
