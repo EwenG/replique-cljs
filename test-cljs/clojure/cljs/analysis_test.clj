@@ -721,6 +721,65 @@
     (is (not (has-var? cenv 'other.lib/y)))
     (is (has-var? cenv 'deep.util/x))))
 
+(deftest test-a-deleted-namespace-is-compiled-again-when-its-file-comes-back
+  ;; A BRANCH SWITCHED AWAY FROM AND BACK, which is what makes this worth a test:
+  ;; retracting the file and pruning its vars is not the whole of dropping it. The
+  ;; namespace stayed in the compile environment marked compiled, and the driver
+  ;; reads that mark to decide it has nothing to do (driver/held?) - so the file
+  ;; coming back was compiled by nobody, and app.core's use of a definition it had
+  ;; grown while it was away failed on a var that did not exist.
+  (let [{:keys [cenv opts src]}
+        (compile! '{other.lib "(ns other.lib)\n(def y 2)"
+                    app.core  "(ns app.core (:require [other.lib :as o]))\n(def a o/y)"})
+        lib  (io/file src "other/lib.cljs")
+        core (io/file src "app/core.cljs")]
+    (.delete lib)
+    (touch! core "(ns app.core)\n(def a 1)")
+    (an/stale-reload! cenv opts :prune true)
+    (testing "the environment stops holding it as a namespace it compiled"
+      (is (not (env/compiled? cenv 'other.lib)))
+      (is (not (env/declared? cenv 'other.lib))))
+    (touch! lib "(ns other.lib)\n(def y 2)\n(def z 3)")
+    (touch! core "(ns app.core (:require [other.lib :as o]))\n(def a o/z)")
+    (let [r (an/stale-reload! cenv opts :prune true)]
+      (testing "the returning file is compiled as the dependency it is, which is
+        why it is not in :reloaded - nothing found it stale, app.core required it"
+        (is (= ["app/core.cljs"] (:reloaded r)))))
+    (is (has-var? cenv 'other.lib/z))
+    (is (contains? (an/analysed-files) "other/lib.cljs"))))
+
+(deftest test-a-deleted-file-whose-macro-file-changed-is-not-stale
+  ;; The two are ONE EVENT - a checkout that takes a .cljs away and changes a .clj
+  ;; it expands a macro from - and the macro paths of stale-files name files the
+  ;; model holds rather than asking the disk. So the gone file arrived in the set
+  ;; to recompile, and was handed to the driver as the empty path its retracted
+  ;; location spells: "No such file: ", naming nothing.
+  (let [cp   (h/temp-dir)
+        mf   (io/file cp "switched" "macros.clj")
+        base "(ns switched.macros)\n(defmacro two [] %s)\n"
+        _    (.mkdirs (.getParentFile mf))
+        _    (touch! mf (format base "2"))]
+    (with-classpath-dir cp
+      (fn []
+        (try
+          (let [{:keys [cenv opts src]}
+                (compile! '{other.lib "(ns other.lib
+  (:require-macros [switched.macros :refer [two]]))
+(def y (two))"
+                            app.core  "(ns app.core (:require [other.lib :as o]))
+(def a o/y)"})]
+            (.delete (io/file src "other/lib.cljs"))
+            (touch! mf (format base "3"))
+            (is (= #{"other/lib.cljs"} (an/deleted-files)))
+            (is (empty? (an/stale-files))
+                "it expands a macro of a file that changed, and there is nothing
+                to recompile it from")
+            (let [r (an/stale-reload! cenv opts :prune true)]
+              (is (= ["other/lib.cljs"] (:deleted r)))
+              (is (= [] (:reloaded r)))))
+          (finally (clj-analysis/reset-model!)
+                   (remove-ns 'switched.macros)))))))
+
 (deftest test-a-require-an-edit-adds-orders-the-recompile
   ;; The ClojureScript side of clojure.analysis's
   ;; a-require-an-edit-adds-orders-the-reload. env/requires answers what the ns

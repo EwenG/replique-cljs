@@ -1225,10 +1225,15 @@
   (clojure.analysis/stale-files): a file whose code expanded the old version holds
   it until it is loaded again too. Only the files on the way to one in `tracked`,
   a macro file some analysed file expanded, are kept - the rest are the Clojure
-  side's to reload. Without a Clojure model this is `seed`."
+  side's to reload. Without a Clojure model this is `seed`.
+
+  The Clojure files that are gone are asked for once and handed to every call, since
+  this asks the same question once per file it tests and each asking costs the
+  classpath a lookup per analysed file (clojure.analysis/stale-files)."
   [seed tracked]
-  (into #{} (filter #(some tracked (clj-analysis/stale-files #{%})))
-        (clj-analysis/stale-files seed)))
+  (let [gone (clj-analysis/deleted-files)]
+    (into #{} (filter #(some tracked (clj-analysis/stale-files #{%} gone)))
+          (clj-analysis/stale-files seed gone))))
 
 (defn changed-macro-files
   "The Clojure macro files (classpath resources, e.g. \"app/macros.clj\") this
@@ -1293,28 +1298,6 @@
                     :when (some (fn [[q k v]] (not= v (cur q k))) (:var-meta-deps fe))]
                 (:source fe)))))
 
-(defn stale-files
-  "The analysed files to recompile: those edited since they were compiled
-  (changed-files); those that expanded a version of a macro file other than the
-  one on disk now; those that expanded a macro from a file stale-macro-files will
-  load again, which an edit to another Clojure file can put there; and any a
-  stale-reload! that threw left uncompiled. Given `cenv`, also meta-stale-files.
-
-  No cascade among ClojureScript files past that metadata: a var a file uses is
-  looked up at run time, so editing the var's file leaves its users' code right."
-  ([]
-   (let [m      @model
-         reload (stale-macro-files)]
-     (-> (changed-files)
-         (into (keys (changed-macro-files* m)))
-         (into (for [[source files] (:macro-files m)
-                     :when (some reload (keys files))]
-                 source))
-         ;; one deleted since has nothing to recompile it from
-         (into (filter #(mtime (get-in m [:locations %]))) (:pending-sources m)))))
-  ([cenv]
-   (into (stale-files) (meta-stale-files cenv))))
-
 (defn deleted-files
   "Analysed files that were compiled from a file on disk and whose file is gone -
   deleted, renamed, or left behind by a branch switch. changed-files skips them:
@@ -1324,6 +1307,49 @@
     (into #{} (for [[source t] (:file-mtime m)
                     :when (and t (nil? (mtime (get-in m [:locations source]))))]
                 source))))
+
+(defn- stale-files*
+  "stale-files, given `gone` - the files the disk no longer has. Taken as an
+  argument and not asked for here, because both arities below need it and asking
+  the disk about every analysed file is a thing to do once."
+  [gone]
+  (let [m      @model
+        reload (stale-macro-files)]
+    (into #{} (remove gone)
+          (-> (changed-files)
+              (into (keys (changed-macro-files* m)))
+              (into (for [[source files] (:macro-files m)
+                          :when (some reload (keys files))]
+                      source))
+              ;; one deleted since has nothing to recompile it from
+              (into (filter #(mtime (get-in m [:locations %]))) (:pending-sources m))))))
+
+(defn stale-files
+  "The analysed files to recompile: those edited since they were compiled
+  (changed-files); those that expanded a version of a macro file other than the
+  one on disk now; those that expanded a macro from a file stale-macro-files will
+  load again, which an edit to another Clojure file can put there; and any a
+  stale-reload! that threw left uncompiled. Given `cenv`, also meta-stale-files.
+
+  No cascade among ClojureScript files past that metadata: a var a file uses is
+  looked up at run time, so editing the var's file leaves its users' code right.
+
+  AND NEVER A FILE THAT IS GONE. changed-files asks the disk and so skips one by
+  itself; the macro paths and meta-stale-files name files the model holds and ask
+  the disk about nothing, so a file deleted by a branch switch that also changed a
+  macro file it expanded arrived here as a file to compile - and was handed to the
+  driver as the empty path its retracted location spells. What has no file to be
+  read is deleted-files, which is a different answer and a different thing to do
+  about it.
+
+  `gone` is deleted-files, for a caller that has already asked. Asking costs one
+  classpath lookup per analysed file, and a caller that wants both answers - what
+  to compile and what to drop - would otherwise pay for that walk twice and be
+  free to get two answers from two moments of the disk."
+  ([] (stale-files* (deleted-files)))
+  ([cenv] (stale-files cenv (deleted-files)))
+  ([cenv gone]
+   (into (stale-files* gone) (remove gone) (meta-stale-files cenv))))
 
 ;; --- prune ----------------------------------------------------------------------
 
@@ -1609,7 +1635,9 @@
   (stale-files, given `cenv`) under the sink, in require order - and then, in more
   rounds, the files compiled against metadata that recompiling changed
   (meta-stale-files). Files deleted from disk are retracted from the model first
-  (deleted-files). Returns
+  (deleted-files), and with :prune their namespaces stop being ones this
+  environment compiled (env/forget-ns!), so that one whose file comes back is
+  compiled again rather than held as the empty shell pruning leaves. Returns
 
     :macro-files  the Clojure files loaded again
     :reloaded     the files recompiled, in order
@@ -1636,9 +1664,12 @@
   not done stays pending, and is stale again next time; a var not pruned then is
   not pruned later, though, since its def has left the model."
   [cenv opts & {:keys [prune]}]
-  (let [mfiles  (stale-macro-files)
-        sources (in-require-order cenv (stale-files cenv))
-        deleted (sort (deleted-files))
+  ;; The one reading of the disk both answers come from: what is gone is what is
+  ;; dropped, and it is also what must not be in what is compiled.
+  (let [gone    (deleted-files)
+        mfiles  (stale-macro-files)
+        sources (in-require-order cenv (stale-files cenv gone))
+        deleted (sort gone)
         ;; The whole of what this is about to do, before any of it has cost
         ;; anything: the macro files it will load on the JVM, the files it will
         ;; recompile, and the files it is dropping. Which is the half nobody can
@@ -1652,9 +1683,26 @@
         mfiles  (reload-macro-files! mfiles prune)
         pruned  (atom [])
         _       (doseq [s deleted]
-                  (let [prior (when prune (file-def-var-snapshot cenv s))]
+                  ;; Read before the retraction, which is what knows them.
+                  (let [nss   (file-namespaces s)
+                        prior (when prune (file-def-var-snapshot cenv s))]
                     (retract-file! s)
-                    (when prune (swap! pruned into (prune-vars! cenv prior)))))
+                    (when prune
+                      (swap! pruned into (prune-vars! cenv prior))
+                      ;; AND THE NAMESPACE STOPS BEING ONE THIS ENVIRONMENT
+                      ;; COMPILED - env/forget-ns!, which is what
+                      ;; clojure.analysis's forget-lib! is on the jvm. Without it
+                      ;; the vars go and the namespace stays, marked compiled,
+                      ;; and the driver never compiles that namespace again
+                      ;; because it is sure it already has: the file coming back
+                      ;; - a branch switched away from and back - leaves every
+                      ;; use of it unresolvable.
+                      ;;
+                      ;; Only where no live form still holds the namespace: two
+                      ;; files can share one, and the one still there declares
+                      ;; it.
+                      (doseq [n nss :when (empty? (ns-forms n))]
+                        (env/forget-ns! cenv n)))))
         compile (fn [s]
                   (let [prior (when prune (file-def-var-snapshot cenv s))
                         r     (load-file! cenv (str (location-file

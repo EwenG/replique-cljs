@@ -485,9 +485,12 @@
   directory every time a runtime is started. A caller who needs the MODULE has to
   ask the directory as well, and the driver does.
 
-  Nothing clears it. `clear-ns-declaration!' unmakes what an ns form established
-  because a re-analysed ns form REPLACES it; this records that a compilation
-  happened, which no later compilation makes untrue."
+  NOTHING BUT `forget-ns!' CLEARS IT, and that is for a file that is gone rather
+  than for one that was compiled again. `clear-ns-declaration!' unmakes what an ns
+  form established, because a re-analysed ns form REPLACES it; this records that a
+  compilation happened, which no later compilation makes untrue - and which a file
+  deleted from the disk does make untrue, since what it says is that this
+  environment holds a namespace read out of a file that is no longer there."
   [^CompileEnv cenv ns-sym]
   (boolean (some-> (find-cljs-ns cenv ns-sym) meta ::compiled)))
 
@@ -531,6 +534,40 @@
     (alter-meta! ns dissoc ::requires ::excludes ::global-refers ::imports
                  ::js-requires ::js-aliases ::js-refers ::goog-refers)
     ns-sym))
+
+(defn forget-ns!
+  "Unmake `ns-sym` as a namespace this environment compiled: everything its ns form
+  established (clear-ns-declaration!), and the two marks that say it was ever
+  declared or compiled here.
+
+  FOR A SOURCE FILE THAT IS GONE, and it is the ClojureScript half of
+  clojure.analysis's `forget-lib!'. Retracting a deleted file from the analysis
+  model and pruning its vars leaves the namespace behind as a shell - nothing in it
+  and still marked compiled - and `clojure.cljs.driver/held?' reads that mark: a
+  namespace nothing can ever compile again, because the driver is sure it already
+  has. A branch switch that takes a file away and gives it back is where that
+  bites, and what it costs is every use of the returning namespace.
+
+  The vars are somebody else's to take away: clojure.cljs.analysis prunes them, and
+  it is the one that knows which of them a def form somebody wrote put there. What
+  is left here is an empty namespace object, which is what a namespace nothing has
+  declared has always been.
+
+  ::declared GOES WITH ::compiled, and that is the point of clearing it rather than
+  a tidiness. While the file is away, a file that still requires this namespace is
+  then refused BY NAME - the driver asks the source paths, finds nothing, and asks
+  `declared?' before deciding that a namespace with no file is one the REPL made.
+  Left declared, the require is quietly satisfied by a namespace with nothing in
+  it, and the failure moves to wherever one of its vars is used - a place that says
+  nothing about the file that is missing.
+
+  Asking creates nothing: a namespace this environment has never heard of is
+  already forgotten."
+  [^CompileEnv cenv ns-sym]
+  (when (find-cljs-ns cenv ns-sym)
+    (clear-ns-declaration! cenv ns-sym)
+    (alter-meta! (cljs-ns cenv ns-sym) dissoc ::declared ::compiled))
+  ns-sym)
 
 (defn excluded?
   "Is `sym` excluded from the core namespace in `ns-sym`? (:refer-clojure :exclude).
