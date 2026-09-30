@@ -127,6 +127,8 @@
 ;;                                          ClojureScript vars - cljs.core/str is both
 ;;   :macro-deps     {ns-sym {macro-qsym #{fid}}}
 ;;   :host-usages    {host-ref #{span}}   host-ref is a map - see host-ref
+;;   :ns-usages      {lib #{span-map}}    where each ns form requires lib, read out of
+;;                                        the :ns-specs facts (see find-namespace-usages)
 (def ^:private empty-model
   {:forms {} :source->forms {} :locations {} :file-mtime {} :macro-files {}
    :macro-loaded {} :pending-macro-files #{} :pending-sources #{} :next-fid 0})
@@ -1048,7 +1050,7 @@
 ;; model K times.
 (defonce ^:private index-caches
   (into {} (for [k [:usages :defs :locals :keyword-usages :macro-usages :macro-deps
-                    :host-usages]]
+                    :host-usages :ns-usages]]
              [k (atom {:forms nil :value nil})])))
 
 (defn- sorted-fids
@@ -1121,6 +1123,27 @@
                         idx (:macro-deps fe)))
               (transient {}) forms)))
 
+(defn- build-ns-usages
+  "{lib #{span}} - where each live ns form writes a library in a :require, a :use,
+  a :require-macros or a :use-macros, read out of the form's :ns-specs facts: a
+  symbol for a namespace, a string for an npm module. clojure.analysis/
+  build-ns-usages, over this model's facts; a library written with no position is
+  left out."
+  [forms]
+  (persistent!
+   (reduce-kv (fn [idx _ fe]
+                (reduce (fn [idx {:keys [ns requires]}]
+                          (reduce (fn [idx {:keys [lib at clause]}]
+                                    (if at
+                                      (assoc! idx lib (conj (get idx lib #{})
+                                                            (assoc at :source (:source fe)
+                                                                   :from-ns ns
+                                                                   :declaration clause)))
+                                      idx))
+                                  idx requires))
+                        idx (:ns-specs fe)))
+              (transient {}) forms)))
+
 (def ^:private index-keys
   "The indexes `derived` is all of, which is what `snapshot` shows."
   [:usages :defs :locals :keyword-usages :macro-usages :macro-deps :host-usages])
@@ -1141,7 +1164,8 @@
          :host-usages    (build-spans forms :host-usages)
          :defs           (build-defs forms)
          :locals         (build-locals forms)
-         :macro-deps     (build-macro-deps forms))))))
+         :macro-deps     (build-macro-deps forms)
+         :ns-usages      (build-ns-usages forms))))))
 
 (defn- derived
   "Every by-entity index for model value `m` as one map - what `snapshot` shows, and
@@ -1190,6 +1214,17 @@
   fully qualified, so ::x in app.core is found as :app.core/x."
   [^Keyword kw]
   (spans->maps (get (index @model :keyword-usages) kw)))
+
+(defn find-namespace-usages
+  "Where the namespace named `ns-sym` is required - a set of {:from-ns :source :line
+  :column :end-line :end-column :declaration}, the library as an ns form writes it
+  and :declaration the clause that writes it, as
+  clojure.analysis/find-namespace-usages answers. Its vars and keywords are asked
+  about with find-usages and find-keyword-usages. A Closure namespace is answered
+  its requires here and nothing else: where it is used as a value, and where its
+  vars are, are host references (find-host-usages)."
+  [ns-sym]
+  (get (index @model :ns-usages) ns-sym))
 
 (defn find-macro-usages
   "Where the source calls macro `macro` - the JVM Var, or its fully-qualified name
