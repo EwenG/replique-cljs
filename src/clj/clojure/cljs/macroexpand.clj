@@ -321,6 +321,14 @@
   it by: the call is replaced by its expansion before any node is built."
   nil)
 
+(def ^:dynamic *on-destructured-keyword*
+  "nil, or a function of a keyword and the symbol a :keys destructuring wrote it
+  as - {:keys [id]} names :id by the local id - called from cljs.core/destructure
+  as it builds the keyword. clojure.cljs.analysis binds it: that is a use of the
+  keyword, where the local is written, and the expansion keeps no trace of which
+  symbol it was built from. *on-protocol-impl*'s reason, for a keyword."
+  nil)
+
 (def ^:dynamic *on-protocol-impl*
   "nil, or a function of the protocol's qualified name and the symbol that named
   it, called for each protocol a `deftype', `defrecord', `reify', `specify!' or

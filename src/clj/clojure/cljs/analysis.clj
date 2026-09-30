@@ -144,9 +144,11 @@
 ;; of it (record-declares!), :declare for a def that only declares its name
 ;; (`declare'), else nil. written and var-form are clojure.analysis's: the symbol a
 ;; use was spelled by where it is not the var's own name unqualified, and true for
-;; a use through the `var' special form.
+;; a use through the `var' special form. role is clojure.analysis's too: :defmethod
+;; for the multimethod a defmethod adds to, :destructuring for a keyword a :keys
+;; writes as the local it binds.
 (defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns
-                 dead declaration written var-form])
+                 dead declaration written var-form role])
 
 (defn- norm-pos [x] (if (nat-int? x) (int x) -1))
 
@@ -158,8 +160,10 @@
   ([entity source line column el ec from-ns dead declaration]
    (span entity source line column el ec from-ns dead declaration nil nil))
   ([entity source line column el ec from-ns dead declaration written var-form]
+   (span entity source line column el ec from-ns dead declaration written var-form nil))
+  ([entity source line column el ec from-ns dead declaration written var-form role]
    (->Span entity source (norm-pos line) (norm-pos column) (norm-pos el) (norm-pos ec)
-           from-ns dead declaration written (when var-form true))))
+           from-ns dead declaration written (when var-form true) role)))
 
 (defn- written-as
   "clojure.analysis/written-as: the spelling worth keeping, nil for the var's own
@@ -177,7 +181,8 @@
     (:dead s)                  (assoc :dead (:dead s))
     (:declaration s)           (assoc :declaration (:declaration s))
     (:written s)               (assoc :written (:written s))
-    (:var-form s)              (assoc :var-form true)))
+    (:var-form s)              (assoc :var-form true)
+    (:role s)                  (assoc :role (:role s))))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
@@ -326,7 +331,10 @@
      (when-let [m (written-at form)]
        (add-fact! of CAT-USAGES (span (:name node) source (:line m) (:column m)
                                       (:end-line m) (:end-column m) from-ns nil nil
-                                      (written-as (:name node) form) var-form?))))))
+                                      (written-as (:name node) form) var-form?
+                                      ;; cljs.core/defmethod marks the multimethod
+                                      (when (:clojure.analysis/defmethod (meta form))
+                                        :defmethod)))))))
 
 (defn- record-invoke!
   "A call of a var the source wrote: the :invoke node's :fn is a :var whose symbol
@@ -692,7 +700,9 @@
                                (when-let [k (var-key v)]
                                  (.add uses (span k source (:line m) (:column m)
                                                   (:end-line m) (:end-column m) ns kind
-                                                  nil (written-as k sym) nil)))))))]
+                                                  nil (written-as k sym) nil
+                                                  (when (:clojure.analysis/defmethod m)
+                                                    :defmethod))))))))]
               (try
                 (clj-analysis/walk-dead-code (clj-analysis/dead-body form kind)
                                              (assoc (dead-resolvers cenv)
@@ -811,6 +821,21 @@
                    (span qsym (.source ^FileFrame (peek-list files))
                          (:line m) (:column m) (:end-line m) (:end-column m)
                          env/*current-ns*))))
+    nil))
+
+(defn- on-destructured-keyword
+  "The destructuring hook for one run (clojure.cljs.macroexpand/
+  *on-destructured-keyword*): {:keys [id]} is a use of :id the source spells id,
+  recorded where the local is written and marked :destructuring - clojure.analysis's
+  destructuredKeyword, for the other compiler. Only a symbol the reader read."
+  [^ArrayList files]
+  (fn [kw written]
+    (when-let [of (open-form files)]
+      (when-let [m (written-at written)]
+        (add-fact! of CAT-KEYWORDS
+                   (span kw (.source ^FileFrame (peek-list files))
+                         (:line m) (:column m) (:end-line m) (:end-column m)
+                         env/*current-ns* nil nil nil nil :destructuring))))
     nil))
 
 (defn- warned-at
@@ -1005,6 +1030,7 @@
     (binding [driver/*sink*          (->AnalysisSink files (->ReaderSink files))
               mx/*on-expand*         (on-expand files)
               mx/*on-protocol-impl*  (on-protocol-impl files)
+              mx/*on-destructured-keyword* (on-destructured-keyword files)
               ana/*on-warning*       (on-warning files)]
       (thunk))))
 
@@ -1270,6 +1296,38 @@
          :when (every? (comp empty? :uses) infos)
          :when (or (nil? ns-sym) (= ns-sym (:ns info)))]
      (dissoc info :uses))))
+
+(defn find-local-usages
+  "Where the local written at `line`:`column` of file `source` is - its binding,
+  marked :declaration :binding, and every use of it - or nil where no local is
+  written there. clojure.analysis/find-local-usages, and by site for its reason:
+  a variadic defn binds its parameters once per function it expands to, and the
+  programmer wrote one local."
+  [source line column]
+  (let [m      @model
+        forms  (keep #(get-in m [:forms %]) (get-in m [:source->forms source]))
+        defs   (mapcat :locals forms)
+        uses   (mapcat :local-uses forms)
+        covers (fn [s]
+                 (let [l (:line s) c (:column s)
+                       el (if (nat-int? (:end-line s)) (:end-line s) l)
+                       ec (if (nat-int? (:end-column s)) (:end-column s) c)]
+                   (and (not (neg? (compare [line column] [l c])))
+                        (not (pos? (compare [line column] [el ec]))))))
+        hit    (into #{} (comp (filter covers) (map :binding)) (concat defs uses))
+        site   (juxt :line :column)
+        sites  (into #{} (comp (filter #(hit (:binding %))) (map site)) defs)
+        bound  (into hit (comp (filter #(sites (site %))) (map :binding)) defs)
+        place  (fn [l] (cond-> {:source (:source l) :line (:line l) :column (:column l)
+                                :from-ns (:lns l)}
+                         (nat-int? (:end-line l))   (assoc :end-line (:end-line l))
+                         (nat-int? (:end-column l)) (assoc :end-column (:end-column l))))]
+    (when (seq bound)
+      (into (into #{} (comp (filter #(bound (:binding %)))
+                            (map #(assoc (place %) :declaration :binding)))
+                  defs)
+            (comp (filter #(bound (:binding %))) (map place))
+            uses))))
 
 (defn find-host-usages
   "Where the source refers to the host thing `ref` describes: a map in host-ref's

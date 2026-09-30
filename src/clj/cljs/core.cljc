@@ -686,7 +686,13 @@
                                                                 (if (core/keyword? mk)
                                                                   (core/let [mkns (namespace mk)
                                                                         mkn (name mk)]
-                                                                    (core/cond (= mkn "keys") (assoc transforms mk #(keyword (core/or mkns (namespace %)) (name %)))
+                                                                    (core/cond (= mkn "keys") (assoc transforms mk #(core/let [k (keyword (core/or mkns (namespace %)) (name %))]
+                                                                                                        ;; ADAPTED: the keyword is a use, told to
+                                                                                                        ;; clojure.cljs.macroexpand/
+                                                                                                        ;; *on-destructured-keyword*
+                                                                                                        (core/when-let [f mx/*on-destructured-keyword*]
+                                                                                                          (f k %))
+                                                                                                        k))
                                                                                (= mkn "syms") (assoc transforms mk #(core/list `quote (symbol (core/or mkns (namespace %)) (name %))))
                                                                                (= mkn "strs") (assoc transforms mk core/str)
                                                                                :else transforms))
@@ -3110,7 +3116,10 @@
 (core/defmacro defmethod
   "Creates and installs a new method of multimethod associated with dispatch-value. "
   [multifn dispatch-val & fn-tail]
-  `(-add-method ~(with-meta multifn {:tag 'cljs.core/MultiFn}) ~dispatch-val (fn ~@fn-tail)))
+  ;; ADAPTED: vary-meta, as clojure.core/defmethod - the reader's position makes
+  ;; the name a place clojure.cljs.analysis records, and the mark says what kind
+  `(-add-method ~(vary-meta multifn assoc :tag 'cljs.core/MultiFn :clojure.analysis/defmethod true)
+                ~dispatch-val (fn ~@fn-tail)))
 
 (core/defmacro time
   "Evaluates expr and prints the time it took. Returns the value of expr."
