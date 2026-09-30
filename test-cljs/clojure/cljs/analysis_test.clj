@@ -195,14 +195,16 @@
 (defn h [m] (let [{:keys [k]} m] k))
 (defn t [] (try 1 (catch :default e 2)))
 (def s (fn self [] (self)))
-(defn h2 [m] (let [{:keys [k2]} m [v2] m] 1))"})
+(defn h2 [m] (let [{:keys [k2]} m [v2] m] 1))
+(def lone (fn lonely [] 1))"})
 
 (defn- unused-names [] (into #{} (map (juxt :name :line)) (an/unused-locals)))
 
 (deftest test-unused-locals
   (compile! locals-program)
   (testing "every binding nothing reads - and not the field b, which is what the
-  type is rather than a local its code has to read"
+  type is rather than a local its code has to read - nor the name lonely, which
+  an fn gives itself so that it can call itself"
     (is (= '#{[y 2] [unused 2] [more 3] [this 4] [e 6] [k2 8] [v2 8]}
            (unused-names))))
   (testing "a destructured name is a binding the source wrote"

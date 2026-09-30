@@ -192,20 +192,23 @@
 (defrecord Invoke [entity source ^int line ^int column ^int end-line ^int end-column from-ns
                    ^int argc])
 
-;; field is true for the binding of a deftype or defrecord field: what the type
-;; is, not a local its code has to read - see unused-locals.
+;; kind is :field for the binding of a deftype or defrecord field, what the type
+;; is and not a local its code has to read, and :fn for the name an fn* gives
+;; itself, which is there so that the fn can call itself and not for anything to
+;; read - see unused-locals. nil for any other binding.
 (defrecord LocalSpan [binding source ^int line ^int column ^int end-line ^int end-column lns lname
-                      field])
+                      kind])
 
 (defn- local->map
   "A LocalSpan as the plain map the :locals index holds - clojure.analysis's
-  shape, :name omitted for a use, :field for a field."
+  shape, :name omitted for a use, :field for a field, :fn-name for an fn's name."
   [l]
   (cond-> {:source (:source l) :line (:line l) :column (:column l) :ns (:lns l)}
     (nat-int? (:end-line l))   (assoc :end-line (:end-line l))
     (nat-int? (:end-column l)) (assoc :end-column (:end-column l))
     (:lname l)                 (assoc :name (:lname l))
-    (:field l)                 (assoc :field true)))
+    (= :field (:kind l))       (assoc :field true)
+    (= :fn (:kind l))          (assoc :fn-name true)))
 
 (defn- jvm-var-key
   "A macro's model key: the fully-qualified name of the JVM var it is."
@@ -405,7 +408,7 @@
                  (->LocalSpan [source (:js-name node)] source
                               (norm-pos (:line m)) (norm-pos (:column m))
                               (norm-pos (:end-line m)) (norm-pos (:end-column m))
-                              ns (:name node) (when (= :field (:local node)) true))))))
+                              ns (:name node) (#{:field :fn} (:local node)))))))
 
 (defn- record-local-use! [^OpenForm of source ns js-name m]
   (when m
@@ -1286,13 +1289,16 @@
   written there is.
 
   A deftype or defrecord field is never one: it is what the type is, and a field
-  nothing reads is still a field every instance has."
+  nothing reads is still a field every instance has. Nor is the name an fn gives
+  itself - (fn step [x] ...) - which clj-kondo does not report either, and which a
+  macro often writes as the name of the var it defines: hx's defnc expands to
+  (def C (fn C [props] ...)), where the one symbol the source wrote is both."
   ([] (unused-locals nil))
   ([ns-sym]
    (for [[_ infos] (group-by (juxt :source :line :column)
                              (vals (index @model :locals)))
          :let  [info (first infos)]
-         :when (not-any? :field infos)
+         :when (not-any? #(or (:field %) (:fn-name %)) infos)
          :when (every? (comp empty? :uses) infos)
          :when (or (nil? ns-sym) (= ns-sym (:ns info)))]
      (dissoc info :uses))))
