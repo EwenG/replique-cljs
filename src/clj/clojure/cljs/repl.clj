@@ -810,6 +810,20 @@
            :js-stacktrace stack)
     result))
 
+(defn- evaluate-form
+  "eval-form and broadcast-form, which differ only in `send`: how a compiled form
+  reaches the runtime."
+  [send cenv runtime form opts text]
+  (let [special (and (seq? form) (seq form) (get specials (first form)))]
+    (try
+      (symbolicated
+       opts
+       (if special
+         (special cenv runtime opts (rest form))
+         (send runtime (compile-form cenv form text opts))))
+      (catch Exception e
+        {:status :error :phase :compile :value (root-message e)}))))
+
 (defn eval-form
   "Compile `form` and evaluate it in `runtime`, or run it here if it is one of the
   REPL specials above.
@@ -829,15 +843,26 @@
   ([cenv runtime form] (eval-form cenv runtime form nil nil))
   ([cenv runtime form opts] (eval-form cenv runtime form opts nil))
   ([cenv runtime form opts text]
-   (let [special (and (seq? form) (seq form) (get specials (first form)))]
-     (try
-       (symbolicated
-        opts
-        (if special
-          (special cenv runtime opts (rest form))
-          (-evaluate runtime (compile-form cenv form text opts))))
-       (catch Exception e
-         {:status :error :phase :compile :value (root-message e)})))))
+   (evaluate-form -evaluate cenv runtime form opts text)))
+
+(defn broadcast-form
+  "eval-form, except that a compiled form goes to every connected runtime rather
+  than to the one evaluation targets - the fan-out a load gets, for a form that is
+  not a load.
+
+  WHAT ASKS FOR THIS IS NOT A USER AT A PROMPT, who wants one value and gets it
+  from eval-form. It is a program reacting to a reload: a hook that re-renders
+  after new code arrived has to re-render every page the code arrived in, and
+  ship! sent it to all of them. The answer is still the target's, for the reason
+  IJsRuntimes gives - and the others' failures are the runtime's to report.
+
+  A special is run as eval-form runs it: the loads already broadcast, and the
+  rest act on this side of the wire. A runtime that is only ever one runtime
+  answers as eval-form would."
+  ([cenv runtime form] (broadcast-form cenv runtime form nil nil))
+  ([cenv runtime form opts] (broadcast-form cenv runtime form opts nil))
+  ([cenv runtime form opts text]
+   (evaluate-form broadcast! cenv runtime form opts text)))
 
 (defn eval-src
   "Every form of `src`, evaluated in order: the result of each. What a test uses,

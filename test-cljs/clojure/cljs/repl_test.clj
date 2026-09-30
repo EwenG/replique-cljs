@@ -859,6 +859,25 @@
     (is (= :error (:status r)))
     (is (str/includes? (:value r) "IJsDeadline") (:value r))))
 
+(deftest test-a-broadcast-form-reaches-every-page-and-an-evaluated-one-only-one
+  ;; What a render hook is for: the reload went to every page, so the redraw has
+  ;; to as well - while a form typed at the prompt still has one answer.
+  (let [sent (atom [])
+        rt   (reify
+               repl/IJsRuntime
+               (-evaluate [_ _] (swap! sent conj :one) {:status :success :value "1"})
+               repl/IJsRuntimes
+               (-evaluate-all [_ _] (swap! sent conj :all) {:status :success :value "2"})
+               (-pages [_] [])
+               (-select-page! [_ _] false))]
+    (is (= "2" (:value (repl/broadcast-form (cenv 'broadcast.a) rt '(+ 1 2)))))
+    (is (= "1" (:value (repl/eval-form (cenv 'broadcast.b) rt '(+ 1 2)))))
+    (is (= [:all :one] @sent))))
+
+(deftest test-a-broadcast-form-on-a-single-runtime-is-an-evaluation
+  (let [rt (reify repl/IJsRuntime (-evaluate [_ _] {:status :success :value "3"}))]
+    (is (= "3" (:value (repl/broadcast-form (cenv 'broadcast.c) rt '(+ 1 2)))))))
+
 ;; --- starting on a namespace ------------------------------------------------
 
 (h/deftest-when h/node? test-a-repl-started-on-a-namespace-has-it-loaded
