@@ -2380,14 +2380,20 @@
                         :cljs (js/Error.
                                 (core/str "Invalid protocol, " psym
                                   " defines method " mname " with arity 0"))))))
+             ;; ADAPTED (M5): the dispatch function's parameters are the macro's, not
+             ;; the source's, so they lose the reader's position - a signature
+             ;; declares what a method takes and binds nothing anybody reads, and
+             ;; with its position a parameter the dispatch passes on would be
+             ;; recorded as a local the source wrote and never used.
+             unwritten (core/fn [sym]
+                         (vary-meta sym dissoc :line :column :end-line :end-column))
              sig->syms (core/fn [sig]
-                         (core/if-not (every? core/symbol? sig)
-                           (mapv (core/fn [arg]
-                                   (core/cond
-                                     (core/symbol? arg) arg
-                                     (core/and (map? arg) (core/some? (:as arg))) (:as arg)
-                                     :else (gensym))) sig)
-                           sig))
+                         (mapv (core/fn [arg]
+                                 (core/cond
+                                   (core/symbol? arg) (unwritten arg)
+                                   (core/and (map? arg) (core/some? (:as arg))) (unwritten (:as arg))
+                                   :else (gensym)))
+                               sig))
 ;; ADAPTED (M5): the dispatch, which is §5.4's whole argument and the hottest
              ;; expression in any ClojureScript program.
              ;;

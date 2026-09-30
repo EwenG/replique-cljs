@@ -105,7 +105,7 @@
     analyzed    the form's AST
     end-form    after the form, or after the read that found eof
     end-file    the file compiled to the end
-    abort-file  it threw; nothing it produced may be kept
+    abort-file  it threw `error`; nothing it produced may be kept
     reader-sink the clojure.lang.IAnalysisSink the reader reports to while it
                 reads a form of this file, or nil - see
                 clojure.cljs.reader/*analysis-sink*"
@@ -115,7 +115,7 @@
   (analyzed [sink node])
   (end-form [sink])
   (end-file [sink source])
-  (abort-file [sink source])
+  (abort-file [sink source error])
   (reader-sink [sink]))
 
 (def ^:dynamic *sink*
@@ -444,7 +444,7 @@
           _     (begin-file sink cenv ns-sym label src)
           r     (try (f)
                      (catch Throwable t
-                       (abort-file sink label)
+                       (abort-file sink label t)
                        (throw t)))]
       (end-file sink label)
       r)

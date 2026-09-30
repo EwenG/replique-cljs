@@ -75,7 +75,7 @@
     (is (every? #(= 'app.core (:from-ns %)) (an/find-usages 'deep.util/double))))
   (testing "a span covers the symbol as written"
     (is (some #(= {:source "app/core.cljs" :line 4 :column 9 :end-line 4 :end-column 17
-                   :from-ns 'app.core} %)
+                   :from-ns 'app.core :written 'u/double} %)
               (an/find-usages 'deep.util/double))))
   (testing "the definition is the name in the def"
     (is (= ["deep/util.cljs" 2 6] ((juxt :source :line :column)
@@ -201,8 +201,10 @@
 
 (deftest test-unused-locals
   (compile! locals-program)
-  (is (= '#{[y 2] [unused 2] [more 3] [b 4] [this 4] [e 6] [k2 8] [v2 8]}
-         (unused-names)))
+  (testing "every binding nothing reads - and not the field b, which is what the
+  type is rather than a local its code has to read"
+    (is (= '#{[y 2] [unused 2] [more 3] [this 4] [e 6] [k2 8] [v2 8]}
+           (unused-names))))
   (testing "a destructured name is a binding the source wrote"
     (is (some #(= '[k2 8 28] ((juxt :name :line :column) %)) (an/unused-locals))))
   (testing "a site carries its name, namespace and span"
@@ -280,7 +282,7 @@
         sink  (reify clojure.lang.IAnalysisSink
                 (beginFile [_ _]) (endFile [_ _]) (beginForm [_ _ _ _])
                 (formStart [_ _ _]) (endForm [_])
-                (varUsage [_ _ _ _ _ _ _ _]) (varDef [_ _ _ _ _ _ _])
+                (varUsage [_ _ _ _ _ _ _ _ _ _]) (varDef [_ _ _ _ _ _ _ _])
                 (localDef [_ _ _ _ _ _ _ _ _]) (localUsage [_ _ _ _ _ _ _ _])
                 (classUsage [_ _ _ _ _ _ _ _]) (macroExpansion [_ _ _ _ _ _ _ _ _])
                 (keywordUsage [_ kw _ _ _ _ _ _] (swap! heard conj kw)))]
@@ -1129,3 +1131,40 @@
   (let [{:keys [cenv]} (compile! program)]
     (is (some? (repl/compile-form cenv '(def quiet 1))))
     (is (= #{"app/core.cljs" "deep/util.cljs"} (an/analysed-files)))))
+
+;; --- what a lint is made of ----------------------------------------------------
+
+(deftest test-a-call-is-recorded-with-how-many-arguments-it-was-given
+  (compile! '{app.core "(ns app.core)
+(defn f [x] x)
+(defn g [y] (f 1 2) (-> y (f 3)) (map f [y]))"})
+  (is (= [['app.core/f 2 3 13] ['app.core/f 2 3 27] ['cljs.core/map 2 3 34]]
+         (mapv (juxt :var :argc :line :column)
+               (:invokes (an/file-facts "app/core.cljs"))))))
+
+(deftest test-what-the-analyzer-warned-about-is-a-fact-of-the-form
+  (binding [*err* (java.io.StringWriter.)]
+    (compile! '{app.core "(ns app.core)
+(defn f [] (Date/now))"}))
+  (is (= [[:undeclared-ns 2 13]]
+         (mapv (juxt :kind :line :column) (:warnings (an/file-facts "app/core.cljs"))))))
+
+(deftest test-a-file-that-fails-says-where-and-why-until-it-compiles
+  (let [{:keys [cenv opts src]} (compile! program)
+        f (io/file src "app/core.cljs")]
+    (is (nil? (an/file-failure "app/core.cljs")))
+    (spit f "(ns app.core (:require [deep.util :as u]))\n(def a (u/double 1))\n(def z nope)\n")
+    (is (thrown? Exception (an/load-file! cenv (str f) opts)))
+    (let [failure (an/file-failure "app/core.cljs")]
+      (is (= 3 (:line failure)))
+      (is (str/includes? (:message failure) "nope"))
+      (is (= (.lastModified f) (:mtime failure))))
+    (spit f "(ns app.core (:require [deep.util :as u]))\n(def a (u/double 1))\n")
+    (an/load-file! cenv (str f) opts)
+    (is (nil? (an/file-failure "app/core.cljs")))))
+
+(deftest test-the-model-says-when-it-has-changed
+  (let [before (an/version)]
+    (is (identical? before (an/version)))
+    (compile! program)
+    (is (not (identical? before (an/version))))))

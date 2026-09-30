@@ -73,10 +73,11 @@
   unused-imports, unused-macro-aliases, unused-macro-refers, changed-files,
   stale-macro-files, stale-files, meta-stale-files, deleted-files,
   file-def-vars, file-def-var-snapshot, file-forms, file-namespaces, ns-forms,
-  snapshot."
+  file-facts, file-mtime, file-failure, version, snapshot."
       :author "replique-cljs"}
     clojure.cljs.analysis
   (:require [clojure.analysis :as clj-analysis]
+            [clojure.cljs.analyzer :as ana]
             [clojure.cljs.ast :as ast]
             [clojure.cljs.driver :as driver]
             [clojure.cljs.emitter :as emitter]
@@ -92,7 +93,8 @@
 ;;   :forms          {fid {:ns :source :line :column + one key per non-empty fact
 ;;                         category: :usages :defs :locals :local-uses
 ;;                         :keyword-usages :macro-usages :macro-deps
-;;                         :host-usages :var-meta-deps}}
+;;                         :host-usages :var-meta-deps :invokes :warnings
+;;                         :ns-specs}}
 ;;                   :var-meta-deps is [qsym key value]: a var's metadata the
 ;;                   compile of the form read (see record-meta-deps!)
 ;;   :source->forms  {source #{fid}}
@@ -137,9 +139,12 @@
 ;; ClojureScript namespace is not something to hold on to); nil for a def. dead is
 ;; :discard or :comment for a use in code the program does not run (commit-dead!).
 ;; declaration is :refer for the name an ns form's clause writes rather than a use
-;; of it (record-declares!), else nil.
+;; of it (record-declares!), :declare for a def that only declares its name
+;; (`declare'), else nil. written and var-form are clojure.analysis's: the symbol a
+;; use was spelled by where it is not the var's own name unqualified, and true for
+;; a use through the `var' special form.
 (defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns
-                 dead declaration])
+                 dead declaration written var-form])
 
 (defn- norm-pos [x] (if (nat-int? x) (int x) -1))
 
@@ -149,8 +154,18 @@
   ([entity source line column el ec from-ns dead]
    (span entity source line column el ec from-ns dead nil))
   ([entity source line column el ec from-ns dead declaration]
+   (span entity source line column el ec from-ns dead declaration nil nil))
+  ([entity source line column el ec from-ns dead declaration written var-form]
    (->Span entity source (norm-pos line) (norm-pos column) (norm-pos el) (norm-pos ec)
-           from-ns dead declaration)))
+           from-ns dead declaration written (when var-form true))))
+
+(defn- written-as
+  "clojure.analysis/written-as: the spelling worth keeping, nil for the var's own
+  name unqualified."
+  [k written]
+  (when (and (symbol? written)
+             (or (namespace written) (not= (name written) (name k))))
+    (with-meta written nil)))
 
 (defn- span->map [s]
   (cond-> {:source (:source s) :line (:line s) :column (:column s)}
@@ -158,21 +173,32 @@
     (nat-int? (:end-column s)) (assoc :end-column (:end-column s))
     (:from-ns s)               (assoc :from-ns (:from-ns s))
     (:dead s)                  (assoc :dead (:dead s))
-    (:declaration s)           (assoc :declaration (:declaration s))))
+    (:declaration s)           (assoc :declaration (:declaration s))
+    (:written s)               (assoc :written (:written s))
+    (:var-form s)              (assoc :var-form true)))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
 
-(defrecord LocalSpan [binding source ^int line ^int column ^int end-line ^int end-column lns lname])
+;; A call the source wrote of a var, and how many arguments it was given -
+;; clojure.analysis's Invoke, from the :invoke node rather than from the compiler.
+(defrecord Invoke [entity source ^int line ^int column ^int end-line ^int end-column from-ns
+                   ^int argc])
+
+;; field is true for the binding of a deftype or defrecord field: what the type
+;; is, not a local its code has to read - see unused-locals.
+(defrecord LocalSpan [binding source ^int line ^int column ^int end-line ^int end-column lns lname
+                      field])
 
 (defn- local->map
   "A LocalSpan as the plain map the :locals index holds - clojure.analysis's
-  shape, :name omitted for a use."
+  shape, :name omitted for a use, :field for a field."
   [l]
   (cond-> {:source (:source l) :line (:line l) :column (:column l) :ns (:lns l)}
     (nat-int? (:end-line l))   (assoc :end-line (:end-line l))
     (nat-int? (:end-column l)) (assoc :end-column (:end-column l))
-    (:lname l)                 (assoc :name (:lname l))))
+    (:lname l)                 (assoc :name (:lname l))
+    (:field l)                 (assoc :field true)))
 
 (defn- jvm-var-key
   "A macro's model key: the fully-qualified name of the JVM var it is."
@@ -197,11 +223,14 @@
 (def ^:private ^:const CAT-MACRODEP 6)
 (def ^:private ^:const CAT-HOST     7)
 (def ^:private ^:const CAT-METADEP  8)
-(def ^:private ^:const N-CATS       9)
+(def ^:private ^:const CAT-INVOKES  9)
+(def ^:private ^:const CAT-WARNINGS 10)
+(def ^:private ^:const CAT-NSSPECS  11)
+(def ^:private ^:const N-CATS       12)
 
 (def ^:private cat-keys
   [:usages :defs :locals :local-uses :keyword-usages :macro-usages :macro-deps
-   :host-usages :var-meta-deps])
+   :host-usages :var-meta-deps :invokes :warnings :ns-specs])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -274,17 +303,43 @@
   (let [m (meta form)]
     (if (:line m) m (:clojure.cljs.macroexpand/written m))))
 
-(defn- record-def! [^OpenForm of source var-node]
+(defn- record-def!
+  "A def, marked :declare where the name is only declared - `declare' expands to a
+  def of a name marked :declared, and the mark is on the name as it is written."
+  [^OpenForm of source var-node]
   (let [^longs pos (.pos of)
-        m (or (written-at (:form var-node))
+        form (:form var-node)
+        m (or (written-at form)
               {:line (aget pos 0) :column (aget pos 1)})]
     (add-fact! of CAT-DEFS (span (:name var-node) source (:line m) (:column m)
-                                 (:end-line m) (:end-column m) nil))))
+                                 (:end-line m) (:end-column m) nil nil
+                                 (when (:declared (meta form)) :declare)))))
 
-(defn- record-usage! [^OpenForm of source from-ns node]
-  (when-let [m (written-at (:form node))]
-    (add-fact! of CAT-USAGES (span (:name node) source (:line m) (:column m)
-                                   (:end-line m) (:end-column m) from-ns))))
+(defn- record-usage!
+  "A use of a var, with the symbol it was spelled by (written-as) and whether it
+  went through the `var' special form."
+  ([of source from-ns node] (record-usage! of source from-ns node false))
+  ([^OpenForm of source from-ns node var-form?]
+   (let [form (:form node)]
+     (when-let [m (written-at form)]
+       (add-fact! of CAT-USAGES (span (:name node) source (:line m) (:column m)
+                                      (:end-line m) (:end-column m) from-ns nil nil
+                                      (written-as (:name node) form) var-form?))))))
+
+(defn- record-invoke!
+  "A call of a var the source wrote: the :invoke node's :fn is a :var whose symbol
+  carries the reader's position. At the call - the list as written - where the
+  reader gave it a position, and at the symbol otherwise; after macroexpansion, so
+  (-> x (f 1)) is a call of f with two arguments where (f 1) is written."
+  [^OpenForm of source from-ns node]
+  (let [f (:fn node)]
+    (when (= :var (:op f))
+      (when-let [sym (written-at (:form f))]
+        (let [m (let [l (meta (:form node))] (if (:line l) l sym))]
+          (add-fact! of CAT-INVOKES
+                     (->Invoke (:name f) source (norm-pos (:line m)) (norm-pos (:column m))
+                               (norm-pos (:end-line m)) (norm-pos (:end-column m))
+                               from-ns (int (count (:args node))))))))))
 
 (defn- record-declares!
   "What the ns form's clauses WRITE: every name a :refer, an :only or a :rename
@@ -340,7 +395,7 @@
                  (->LocalSpan [source (:js-name node)] source
                               (norm-pos (:line m)) (norm-pos (:column m))
                               (norm-pos (:end-line m)) (norm-pos (:end-column m))
-                              ns (:name node))))))
+                              ns (:name node) (when (= :field (:local node)) true))))))
 
 (defn- record-local-use! [^OpenForm of source ns js-name m]
   (when m
@@ -348,7 +403,7 @@
                (->LocalSpan [source js-name] source
                             (norm-pos (:line m)) (norm-pos (:column m))
                             (norm-pos (:end-line m)) (norm-pos (:end-column m))
-                            ns nil))))
+                            ns nil nil))))
 
 (defn- host-ref
   "What a reference to the host names, as a map, or nil for a node that is not one.
@@ -404,10 +459,26 @@
                   (doseq [c (ast/children n) :when (not (identical? c v))]
                     (visit c)))
 
-                :ns (record-declares! of source ns n)
+                :ns (do (record-declares! of source ns n)
+                        ;; the clauses as written, positioned: the namespace's
+                        ;; state says what is unused, and not where it is written
+                        (add-fact! of CAT-NSSPECS
+                                   (assoc (clj-analysis/ns-specs (:form n)) :ns (:name n))))
+
+                :invoke (do (record-invoke! of source ns n)
+                            (run! visit (ast/children n)))
 
                 :var (do (record-usage! of source ns n)
                          (record-meta-deps! of n))
+
+                ;; (var x), #'x: a use of x that names the var rather than taking
+                ;; its value - which is what makes it legal of a private one
+                :the-var
+                (let [v (:var n)]
+                  (record-usage! of source ns v true)
+                  (record-meta-deps! of v)
+                  (doseq [c (ast/children n) :when (not (identical? c v))]
+                    (visit c)))
 
                 :binding
                 (do (when-not (.containsKey def-names (:form n))
@@ -486,6 +557,8 @@
                (-> m
                    (assoc-in [:locations source] (.location fr))
                    (assoc-in [:file-mtime source] (.mtime fr))
+                   ;; it compiled to the end, so whatever failed before is behind it
+                   (update :failures dissoc source)
                    (assoc-in [:macro-files source] mfiles)
                    (update :pending-sources disj source)
                    ;; the files seen for the first time: merge keeps a baseline
@@ -616,7 +689,8 @@
                                                   (:end-line m) (:end-column m) ns kind))
                                (when-let [k (var-key v)]
                                  (.add uses (span k source (:line m) (:column m)
-                                                  (:end-line m) (:end-column m) ns kind)))))))]
+                                                  (:end-line m) (:end-column m) ns kind
+                                                  nil (written-as k sym) nil)))))))]
               (try
                 (clj-analysis/walk-dead-code (clj-analysis/dead-body form kind)
                                              (assoc (dead-resolvers cenv)
@@ -650,8 +724,8 @@
   (beginForm [_ _ _ _])
   (formStart [_ _ _])
   (endForm [_])
-  (varUsage [_ _ _ _ _ _ _ _])
-  (varDef [_ _ _ _ _ _ _])
+  (varUsage [_ _ _ _ _ _ _ _ _ _])
+  (varDef [_ _ _ _ _ _ _ _])
   (localDef [_ _ _ _ _ _ _ _ _])
   (localUsage [_ _ _ _ _ _ _ _])
   (classUsage [_ _ _ _ _ _ _ _])
@@ -737,6 +811,30 @@
                          env/*current-ns*))))
     nil))
 
+(defn- warned-at
+  "Where a warning about `info` was written: the first thing in it the reader read,
+  or nil. A warning says what it is about in its own terms - {:sym foo}, {:form
+  (recur ...)}, {:protocol IFoo} - and what the reader read carries its position."
+  [info]
+  (some (fn [v] (let [m (written-at v)] (when (:line m) m))) (vals info)))
+
+(defn- on-warning
+  "The warning hook for one run (clojure.cljs.analyzer/*on-warning*): a warning is a
+  fact of the form being compiled, at what it is about where that can be told, and
+  at the form otherwise."
+  [^ArrayList files]
+  (fn [type info]
+    (when-let [^OpenForm of (open-form files)]
+      (let [^longs pos (.pos of)
+            m (or (warned-at info) {:line (aget pos 0) :column (aget pos 1)})]
+        (add-fact! of CAT-WARNINGS
+                   (cond-> {:kind type :info info
+                            :source (.source ^FileFrame (peek-list files))
+                            :line (:line m) :column (:column m) :ns env/*current-ns*}
+                     (:end-line m) (assoc :end-line (:end-line m))
+                     (:end-column m) (assoc :end-column (:end-column m))))))
+    nil))
+
 (defn- defined!
   "Tell clojure.analysis/*defined* about `event`, if anything is listening.
 
@@ -791,6 +889,37 @@
 
 ;; One per run-analysis. `files` is the stack of files being compiled; it is touched
 ;; only by the thread the compilation runs on, which is the thread that bound it.
+(defn- failed-at
+  "Where `t` says the compile failed, as {:line :column}, or nil: the first of its
+  causes whose data names a line, or holds a :form the reader positioned -
+  analysis-error hands over the form it refuses."
+  [^Throwable t]
+  (some (fn [^Throwable c]
+          (let [d (ex-data c)]
+            (cond (:line d) (select-keys d [:line :column])
+                  (:line (written-at (:form d))) (select-keys (written-at (:form d))
+                                                              [:line :column :end-line
+                                                               :end-column]))))
+        (take-while some? (iterate #(.getCause ^Throwable %) t))))
+
+(defn- root-message
+  "The message of the deepest cause of `t` that has one."
+  [^Throwable t]
+  (or (last (keep #(.getMessage ^Throwable %)
+                  (take-while some? (iterate #(.getCause ^Throwable %) t))))
+      (.getName (class t))))
+
+(defn- record-failure!
+  "The compile of the file `fr` is threw `t`: remember it against the version of the
+  file that failed, until the file next compiles to the end - see file-failure. At
+  the form being compiled when nothing more precise is known."
+  [^FileFrame fr ^Throwable t]
+  (let [^OpenForm of (peek-list (.forms fr))
+        pos (or (failed-at t)
+                (when of {:line (aget ^longs (.pos of) 0) :column (aget ^longs (.pos of) 1)}))]
+    (swap! model assoc-in [:failures (.source fr)]
+           (merge {:mtime (mtime (.location fr)) :message (root-message t)} pos))))
+
 (deftype AnalysisSink [^ArrayList files reader]
   driver/CompileSink
   (reader-sink [_] reader)
@@ -843,9 +972,12 @@
       ;; at a prompt is the other unit and is `defined-by!'s.
       (defined! {:dialect :cljs :op :define :ns (.nsym fr) :source (.source fr)}))
     nil)
-  (abort-file [_ _source]
+  (abort-file [_ _source error]
     ;; its open forms go with it: they are on the frame, not beside it
     (when-not (.isEmpty files)
+      (let [^FileFrame fr (peek-list files)]
+        (when-not (.ignored fr)
+          (record-failure! fr error)))
       (pop-list! files))
     nil))
 
@@ -870,7 +1002,8 @@
   (let [files (ArrayList.)]
     (binding [driver/*sink*          (->AnalysisSink files (->ReaderSink files))
               mx/*on-expand*         (on-expand files)
-              mx/*on-protocol-impl*  (on-protocol-impl files)]
+              mx/*on-protocol-impl*  (on-protocol-impl files)
+              ana/*on-warning*       (on-warning files)]
       (thunk))))
 
 (defn load-file!
@@ -888,6 +1021,7 @@
   (swap! model (fn [m] (-> (reduce retract-form m (get-in m [:source->forms source]))
                            (update :locations dissoc source)
                            (update :file-mtime dissoc source)
+                           (update :failures dissoc source)
                            (update :macro-files dissoc source)
                            (update :pending-sources disj source))))
   nil)
@@ -1088,12 +1222,16 @@
   variadic defn's parameters are bound by each function it expands to - and a
   binding the macro never reads is not the programmer's to remove while another
   one at the same place is read. So a site is unused only when every binding
-  written there is."
+  written there is.
+
+  A deftype or defrecord field is never one: it is what the type is, and a field
+  nothing reads is still a field every instance has."
   ([] (unused-locals nil))
   ([ns-sym]
    (for [[_ infos] (group-by (juxt :source :line :column)
                              (vals (index @model :locals)))
          :let  [info (first infos)]
+         :when (not-any? :field infos)
          :when (every? (comp empty? :uses) infos)
          :when (or (nil? ns-sym) (= ns-sym (:ns info)))]
      (dissoc info :uses))))
@@ -1266,6 +1404,65 @@
                      :let  [k (jvm-var-key v)]
                      :when (not (used k))]
                  [sym k])))))
+
+(defn file-facts
+  "What the model holds of file `source`, as it was when it was last compiled -
+  clojure.analysis/file-facts, in the same shape:
+
+    {:mtime    the file's mtime when its compile began: the version these are about
+     :usages   [{:var qsym ...span}]  var uses, and macro calls marked :macro true;
+                                       :written and :var-form as clojure.analysis
+     :defs     [{:var qsym ...span}]  in the order the forms define them, a
+                                       `declare' marked :declaration :declare
+     :invokes  [{:var qsym :argc n ...span}]
+     :warnings [{:kind :info ...span}]  what the analyzer warned about, :info its data
+     :forms    [{:line :column :ns}]
+     :ns-specs [{:ns sym :requires [...] :imports [...]}]  clojure.analysis/ns-specs
+                                       of each ns form}
+
+  Nothing here is a verdict: whether a call has the wrong arity, or a use names a var
+  that has gone, is a question about the compile environment as it is now, and the
+  caller's to ask."
+  [source]
+  (let [m     @model
+        forms (map #(get-in m [:forms %]) (sort (get-in m [:source->forms source])))
+        fact  (fn [s] (assoc (span->map s) :var (:entity s)))]
+    {:mtime    (get-in m [:file-mtime source])
+     :usages   (into [] (concat (sequence (comp (mapcat :usages) (map fact)) forms)
+                                (sequence (comp (mapcat :macro-usages) (map fact)
+                                                (map #(assoc % :macro true)))
+                                          forms)))
+     :defs     (into [] (comp (mapcat :defs) (map fact)) forms)
+     :invokes  (into [] (comp (mapcat :invokes)
+                              (map (fn [i] (assoc (span->map i) :var (:entity i)
+                                                  :argc (:argc i)))))
+                     forms)
+     :warnings (into [] (mapcat :warnings) forms)
+     :forms    (mapv #(select-keys % [:line :column :ns]) forms)
+     :ns-specs (into [] (mapcat :ns-specs) forms)}))
+
+(defn version
+  "An opaque token for the model as it is now: `identical?' to one taken earlier
+  exactly when nothing has been analysed, retracted or failed since. What a tool
+  compares around an evaluation to know whether what it showed from the model is
+  still what the model says."
+  []
+  @model)
+
+(defn file-mtime
+  "The mtime of file `source` when its last compile began - the version of it the
+  model is about - or nil for a file the model does not hold, or one that is not a
+  file."
+  [source]
+  (get-in @model [:file-mtime source]))
+
+(defn file-failure
+  "How the last compile of file `source` failed, or nil when it compiled to the end:
+  {:mtime :line :column :message} - clojure.analysis/file-failure. :mtime is the
+  version on disk that does not compile, which is not the one the rest of the model
+  is about: a file that fails keeps the facts of its last compile that did not."
+  [source]
+  (get-in @model [:failures source]))
 
 (defn file-forms
   "The fids currently attributed to file `source`."

@@ -3500,15 +3500,26 @@
   was written. Rebind to a map of false to silence a form."
   {})
 
+(def ^:dynamic *on-warning*
+  "Called with the `type` and the `info` of every warning `warning` reports, or nil.
+
+  clojure.cljs.analysis binds it, and files the warning under the form being
+  compiled - so it is a fact of that form, retracted with it, and a lint an editor
+  can show where it was written. The printing below goes on regardless: this is who
+  else is told, not a replacement for telling the developer."
+  nil)
+
 (defn warning
   "Report a compile-time warning of `type` about `info`.
 
   cljs.analyzer formats each type into a sentence through a multimethod and sends
   it to a handler chain. Until there is something to hand warnings to, this prints
   the type and the data - which is strictly more information than a formatted
-  message, and is the shape a real handler would receive anyway."
+  message, and is the shape a real handler would receive anyway. And tells
+  `*on-warning*`, which is the handler there is."
   [type env info]
   (when (get *cljs-warnings* type true)
+    (when-let [f *on-warning*] (f type info))
     (binding [*out* *err*]
       (println (str "WARNING: " (name type) " " (pr-str info)
                     " in " env/*current-ns*)))))

@@ -241,3 +241,16 @@
 ;; built its dispatch around cljs.core's property and its implementations around
 ;; yours. Qualified with the current namespace instead. See the macro.
 "  (core/let [p (:name (ana/resolve-var (dissoc &env :locals) psym))"
+
+;; defprotocol: the dispatch function's parameters lose the reader's position.
+;; They are the macro's, built from the signature the source wrote, and with the
+;; position they were recorded as locals the source bound and never read - an
+;; unused binding on every protocol signature. Every parameter is now rebuilt,
+;; not only a signature that destructures. See the macro.
+"                         (core/if-not (every? core/symbol? sig)"
+"                           (mapv (core/fn [arg]"
+"                                   (core/cond"
+"                                     (core/symbol? arg) arg"
+"                                     (core/and (map? arg) (core/some? (:as arg))) (:as arg)"
+"                                     :else (gensym))) sig)"
+"                           sig))"
