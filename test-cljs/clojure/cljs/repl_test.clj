@@ -819,6 +819,23 @@
   (values 'idle.core "(js/setTimeout (fn [] (js/console.log \"said while idle\")) 200)")
   (is (waited-for "said while idle") (str program-out)))
 
+(h/deftest-when h/node? test-what-the-program-notifies-reaches-who-asked-to-be-told
+  ;; The third thing a runtime can do besides answering and printing, and it goes
+  ;; to a listener of its own rather than to the output: what it says is for
+  ;; whoever asked the runtime to say it - an editor watching an atom.
+  (let [out (h/temp-dir)
+        heard (promise)]
+    (try
+      (with-open [rt (repl/node-runtime {:dir out :out program-out
+                                         :on-notify #(deliver heard %)})]
+        (is (= "true" (:value (repl/evaluate-within
+                               rt "(async function(){ return $CLJS.notify('{:changed [3]}'); })()"
+                               15000))))
+        (is (= "{:changed [3]}" (deref heard 5000 ::nothing)))
+        (testing "and none of it is printed"
+          (is (not (str/includes? (str program-out) ":changed")))))
+      (finally (h/delete-tree! out)))))
+
 (h/deftest-when h/node? test-a-caller-that-gives-up-says-which-way-it-gave-up
   ;; The distinction IJsDeadline exists for, and the two sentences are different
   ;; facts: the first call's script is running in the runtime, the second's never

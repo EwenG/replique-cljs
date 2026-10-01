@@ -560,13 +560,17 @@
   for it is the output. Symbolicated on the way (repl/uncaught-text) - the maps are
   in the directory this server serves, so the frames can be read back as
   ClojureScript exactly as a caught error's are."
-  [state ^File dir ^Writer out conn text]
+  [state ^File dir ^Writer out on-notify conn text]
   (let [{:keys [type content]} (edn/read-string text)]
     (case type
       :result   (when-let [^CompletableFuture p (get (:pending @state) conn)]
                   (.complete p (edn/read-string content)))
       :print    (on-print! out content)
       :uncaught (on-print! out (repl/uncaught-text dir content))
+      ;; and what a page says unasked, from any page as a print is: see
+      ;; runtime.js's notify
+      :notify   (when on-notify
+                  (try (on-notify (str content)) (catch Throwable _ nil)))
       nil)))
 
 ;; --- serving the output directory, continued -------------------------------
@@ -670,6 +674,8 @@
                this namespace's docstring gives
     :out       where what the page prints is written, default *out*.  What it
                prints, and not what it logs: its console is its own
+    :on-notify called with what a page notifies, a string - see runtime.js's
+               notify. Nothing by default, and what is notified is dropped
 
   Closeable, and closing it stops both servers and unblocks any evaluation still
   waiting on the page.
@@ -689,7 +695,7 @@
   answers with what to do about it. That is Replique's behaviour and it is the
   right one for a REPL you started before you opened the page."
   ([] (browser-runtime nil))
-  ([{:keys [dir port ws-port out] :or {port 0 ws-port 0 out *out*}}]
+  ([{:keys [dir port ws-port out on-notify] :or {port 0 ws-port 0 out *out*}}]
    (let [^File own (when-not dir (temp-dir))
          ^File dir (write-runtime! (or dir own))
          srv       (atom {:session nil
@@ -709,7 +715,7 @@
                     {:port     ws-port
                      :token    token
                      :on-open  (fn [conn req] (start-session! srv conn req))
-                     :on-text  (fn [conn text] (on-text! srv dir out conn text))
+                     :on-text  (fn [conn text] (on-text! srv dir out on-notify conn text))
                      :on-close (fn [conn _] (close-session! srv conn))})
          ;; A VIRTUAL THREAD PER REQUEST. Less load-bearing than it was - the
          ;; twenty-second held poll it was chosen for is gone - but still right for

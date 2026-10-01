@@ -942,6 +942,9 @@
              default, and at R1 the output directory the modules go in
     :out     where the runtime's own output is copied, default *out*
     :timeout ms to wait for node to dial back, default 15000
+    :on-notify called with what the program notifies, a string, on the thread
+             that reads the socket - see runtime.js's notify. Nothing by
+             default, and what is notified is then dropped
 
   Closeable, and closing it closes the socket, which is how the node process
   learns the session is over.
@@ -950,7 +953,7 @@
   having asked only one. A REPL is that shape anyway; a caller that wants two must
   serialize them."
   ([] (node-runtime nil))
-  ([{:keys [dir out timeout] :or {out *out* timeout 15000}}]
+  ([{:keys [dir out timeout on-notify] :or {out *out* timeout 15000}}]
    ;; a directory we made is ours to remove; one we were handed is not
    (let [^File own (when-not dir (temp-dir))
          ^File dir (write-runtime! (or dir own))
@@ -1031,6 +1034,11 @@
                         (case (:type msg)
                           :print    (note! (str (:content msg)))
                           :uncaught (note! (uncaught-text dir (:content msg)))
+                          ;; never allowed to end the reader, whatever the
+                          ;; listener does
+                          :notify   (when on-notify
+                                      (try (on-notify (str (:content msg)))
+                                           (catch Throwable _ nil)))
                           :result   (.put answers
                                           (try (edn/read-string (:content msg))
                                                (catch Exception e

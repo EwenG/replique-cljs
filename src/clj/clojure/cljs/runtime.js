@@ -441,3 +441,21 @@ export async function evaluate(src) {
 
 $CLJS.print = print;
 $CLJS.evaluate = evaluate;
+
+// --- saying something unasked -------------------------------------------------
+//
+// A runtime answers what it is asked, and prints; this is the third thing it
+// can do, which is tell the JVM something nobody asked for at that moment - an
+// atom an editor watches was swapped. What the string means is the business of
+// whoever sends it and whoever the JVM hands it to, and nothing here reads it.
+//
+// The transport is what knows how to reach the JVM, so it is the transport that
+// installs sendNotify; until one has, or where none ever will, this says false
+// and nothing is sent.
+export function notify(content) {
+  const send = $CLJS.sendNotify;
+  if (typeof send !== "function") return false;
+  try { send(content); return true; } catch (_) { return false; }
+}
+
+$CLJS.notify = notify;

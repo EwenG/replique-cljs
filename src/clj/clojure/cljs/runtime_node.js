@@ -10,7 +10,7 @@
 // The wire, one line each way:
 //
 //   JVM -> here   a JSON string literal holding the script to evaluate
-//   here -> JVM   an EDN map, {:type :result/:print/:uncaught :content "..."}
+//   here -> JVM   an EDN map, {:type :result/:print/:uncaught/:notify :content "..."}
 //
 // Neither side parses its own hard format. The JVM writes JSON, which node reads
 // with JSON.parse; node writes EDN, which the JVM reads with clojure.edn. Both
@@ -58,6 +58,9 @@ function send(s) {
     return false;
   }
 }
+
+// What the program says unasked - see runtime_browser.js, which says the same.
+globalThis.$CLJS.sendNotify = (content) => send(message("notify", String(content)));
 
 // --- printing ---------------------------------------------------------------
 //

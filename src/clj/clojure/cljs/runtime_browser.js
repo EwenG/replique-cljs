@@ -7,7 +7,7 @@
 //
 // The wire:
 //
-//   here -> JVM   an EDN map, {:type :result/:print/:uncaught :content "..."}
+//   here -> JVM   an EDN map, {:type :result/:print/:uncaught/:notify :content "..."}
 //   JVM -> here   the script to evaluate, as the frame's text, and nothing else
 //
 // Neither side parses its own hard format: the JVM reads EDN with clojure.edn and
@@ -58,6 +58,11 @@ function send(s) {
     if (socket && socket.readyState === 1) socket.send(s);
   } catch (e) { /* gone */ }
 }
+
+// What the program says unasked, for whoever on the JVM wants to be told - a
+// watch on an atom, saying it changed. See runtime.js's notify, which is what
+// code calls and which reaches here.
+globalThis.$CLJS.sendNotify = (content) => send(message("notify", String(content)));
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
