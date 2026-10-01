@@ -236,11 +236,14 @@
 (def ^:private ^:const CAT-INVOKES  9)
 (def ^:private ^:const CAT-WARNINGS 10)
 (def ^:private ^:const CAT-NSSPECS  11)
-(def ^:private ^:const N-CATS       12)
+;; WHAT THE TEXT SPELLS, from the reader: the namespace part of every qualified
+;; symbol it reads - see clojure.lang.IAnalysisSink/qualifierUsage.
+(def ^:private ^:const CAT-QUALIFIERS 12)
+(def ^:private ^:const N-CATS       13)
 
 (def ^:private cat-keys
   [:usages :defs :locals :local-uses :keyword-usages :macro-usages :macro-deps
-   :host-usages :var-meta-deps :invokes :warnings :ns-specs])
+   :host-usages :var-meta-deps :invokes :warnings :ns-specs :qualifiers])
 
 ;; A form being compiled. `pos` is [line column], corrected by form-start once the
 ;; form has been read; `cats` holds one ArrayList per fact category, made on first use.
@@ -399,11 +402,20 @@
 ;; inside one name scope), so [source js-name] names exactly one binding, and a
 ;; use carries the js-name of the binding it resolved to.
 
-(defn- record-local! [^OpenForm of source ns node]
+(defn- record-local!
+  "A binding the source wrote, as a binding.
+
+  NOT A REIFY'S CAPTURE OF ONE. cljs.core/reify makes a field of every local in
+  scope and writes the field vector with the very symbols the source bound those
+  locals with, so each capture lands on a binding that is already recorded - the
+  programmer's - and recording it again would say two things are bound where one
+  is. The analyzer marks a capture :captures (its field-bindings), and the local
+  it captures keeps the site to itself."
+  [^OpenForm of source ns node]
   (let [sym (:form node)]
     ;; a symbol the source wrote - not a macro's gensym, and not the try form a
     ;; catch's own binding hangs off
-    (when-let [m (and (symbol? sym) (written-at sym))]
+    (when-let [m (and (symbol? sym) (nil? (:captures node)) (written-at sym))]
       (add-fact! of CAT-LOCALS
                  (->LocalSpan [source (:js-name node)] source
                               (norm-pos (:line m)) (norm-pos (:column m))
@@ -642,8 +654,8 @@
   "Open form `of` of frame `fr` has ended: give the dead code written in it the
   locals its live code bound, which are complete only now - a #_ is read before
   the form around it is compiled - and mark dead the keywords the reader reported
-  inside it (clojure.analysis/mark-dead!). The reader's other reports, syntax-quote
-  references, are not kept here at all."
+  inside it (clojure.analysis/mark-dead!), and the qualifiers it reported with them.
+  The reader's other reports, syntax-quote references, are not kept here at all."
   [^FileFrame fr ^OpenForm of]
   (let [^ArrayList dead (.dead fr)
         outer (delay (clj-analysis/locals-at (aget ^objects (.cats of) CAT-LOCALS)))
@@ -654,7 +666,9 @@
           (when-let [sp (:span d)] (.add spans [(:kind d) sp]))
           (.set dead i (-> d (dissoc :of) (assoc :outer @outer))))))
     (when-not (.isEmpty spans)
-      (clj-analysis/mark-dead! (aget ^objects (.cats of) CAT-KEYWORDS) (vec spans))))
+      (let [spans (vec spans)]
+        (clj-analysis/mark-dead! (aget ^objects (.cats of) CAT-KEYWORDS) spans)
+        (clj-analysis/mark-dead! (aget ^objects (.cats of) CAT-QUALIFIERS) spans))))
   nil)
 
 (defn- dead-resolvers
@@ -760,6 +774,13 @@
     (when-let [of (and (not (RT/suppressRead)) (open-form files))]
       (add-fact! of CAT-KEYWORDS
                  (span kw (.source ^FileFrame (peek-list files)) line column el ec
+                       env/*current-ns*))))
+  (qualifierUsage [_ qualifier _ _ line column el ec]
+    ;; the namespace part of a qualified symbol, which is the only record of an
+    ;; alias a macro ate or re-spelled - keywordUsage's lines, for its reasons
+    (when-let [of (and (not (RT/suppressRead)) (open-form files))]
+      (add-fact! of CAT-QUALIFIERS
+                 (span qualifier (.source ^FileFrame (peek-list files)) line column el ec
                        env/*current-ns*)))))
 
 (defn- comment-macro?
@@ -1079,7 +1100,7 @@
 ;; model K times.
 (defonce ^:private index-caches
   (into {} (for [k [:usages :defs :locals :keyword-usages :macro-usages :macro-deps
-                    :host-usages :ns-usages]]
+                    :host-usages :ns-usages :qualifiers]]
              [k (atom {:forms nil :value nil})])))
 
 (defn- sorted-fids
@@ -1191,6 +1212,7 @@
          :keyword-usages (build-spans forms :keyword-usages)
          :macro-usages   (build-spans forms :macro-usages)
          :host-usages    (build-spans forms :host-usages)
+         :qualifiers     (build-spans forms :qualifiers)
          :defs           (build-defs forms)
          :locals         (build-locals forms)
          :macro-deps     (build-macro-deps forms)
@@ -1292,7 +1314,16 @@
   nothing reads is still a field every instance has. Nor is the name an fn gives
   itself - (fn step [x] ...) - which clj-kondo does not report either, and which a
   macro often writes as the name of the var it defines: hx's defnc expands to
-  (def C (fn C [props] ...)), where the one symbol the source wrote is both."
+  (def C (fn C [props] ...)), where the one symbol the source wrote is both.
+
+  A REIFY IS NOT A DEFTYPE FOR THIS, although it compiles to one. Its fields are
+  the locals around it, captured wholesale and named where the source bound them,
+  and a capture is neither a binding nor a use: the binding is the local's, and
+  reading the bare name inside a method body is reading that local. The analyzer
+  says which field is which (field-bindings' :captures), record-local! leaves the
+  capture out, and analyze-symbol files the body's reads under the local - so a
+  local the reify reads is used, and one nothing reads is reported however many
+  reifys stand between it and the end of its scope."
   ([] (unused-locals nil))
   ([ns-sym]
    (for [[_ infos] (group-by (juxt :source :line :column)
@@ -1419,46 +1450,103 @@
 (defn unused-aliases
   "Aliases in `ns-sym` nothing uses: {alias target}. A ClojureScript or Closure
   namespace alias is unused when nothing from its target namespace is referenced
-  (ns-referenced-namespaces); a JavaScript module's alias when the source never
-  writes it. The target is the namespace symbol, or the module's specifier - or
-  [specifier path] for one that named a path into the module.
+  (ns-referenced-namespaces) AND the source nowhere writes the alias itself; a
+  JavaScript module's alias when the source never writes it. The target is the
+  namespace symbol, or the module's specifier - or [specifier path] for one that
+  named a path into the module.
+
+  THE SECOND QUESTION IS THE READER'S, and it is asked because the first cannot
+  always be answered: a macro that consumes a qualified symbol at expansion time
+  emits nothing naming the target, and one that rebuilds the body it was given -
+  core.async's `go' - hands back `cljs.string/f' where the source wrote `s/f'. The
+  alias is written either way and the file stops reading without it. It is the union
+  of the two and not the spelling alone, because `::s/k' reaches the model as the
+  keyword it auto-resolves to and never as the alias token. See
+  clojure.lang.IAnalysisSink/qualifierUsage.
 
   The aliases an :import made are unused-imports', not these."
   [cenv ns-sym]
   (when-let [^Namespace n (env/find-cljs-ns cenv ns-sym)]
     (let [used     (ns-referenced-namespaces ns-sym)
+          spelt    (set (used-from (index @model :qualifiers) ns-sym))
           written  (written-from (index @model :host-usages) ns-sym)
           imported (set (keys (env/imports cenv ns-sym)))]
       (merge
        (into {} (for [[a ^Namespace target] (.getAliases n)
                       :let  [t (.getName target)]
                       :when (not (imported a))
-                      :when (not (used t))]
+                      :when (not (used t))
+                      :when (not (spelt a))]
                   [a t]))
        (into {} (for [[a [specifier path]] (env/js-aliases cenv ns-sym)
-                      :when (not (written-as? written a))]
+                      :when (not (written-as? written a))
+                      :when (not (spelt a))]
                   [a (if path [specifier path] specifier)]))))))
 
+(defn- macro-view
+  "`ns-sym`'s view of the JVM, where :require-macros put its aliases and refers -
+  found, never created."
+  ^Namespace [cenv ns-sym]
+  (.find ^clojure.lang.NamespaceWorld (:macro-world cenv) ns-sym))
+
+(defn- referred-macros
+  "The macros `ns-sym`'s ns form brought in by name: {name macro-qsym}, whichever
+  clause did it - a :refer in a :require-macros, a :refer-macros, or the plain
+  :refer of a :require that the compiler inferred a macro for."
+  [cenv ns-sym]
+  (when-let [view (macro-view cenv ns-sym)]
+    (into {} (for [[sym v] (.getMappings view)
+                   :when (instance? Var v)]
+               [sym (jvm-var-key v)]))))
+
 (defn unused-refers
-  "Names `ns-sym` referred and never uses: {name target}. A ClojureScript var
-  referred in counts as used when the var is used from `ns-sym` by any name, as
-  clojure.analysis/unused-refers has it; a name drawn out of a JavaScript module or
-  a Closure namespace only when the source writes that name. The target is the
-  var's qualified name, a Closure name, or a JS module's [specifier export].
-  cljs.core's implicit refers are not refers here and are never reported."
+  "Names `ns-sym` referred and never uses: {name target}. The target is the var's
+  qualified name, a macro's, a Closure name, or a JS module's [specifier export].
+  cljs.core's implicit refers are not refers here and are never reported.
+
+  BY HOW THE NAME IS SPELLED, as clojure.analysis/unused-refers has it, because
+  that is what a refer is: `(:require [a.b :as x :refer [f]])' and then only ever
+  `x/f' is a refer nothing needs, and taking it out changes nothing. So a use
+  counts for the refer only where the source wrote the short name - :written nil,
+  which is the span's way of saying the var's own name unqualified, or the local
+  name a :rename gave it. A name drawn out of a JavaScript module or a Closure
+  namespace counts the same way, by the spelling the source wrote.
+
+  The exception is a protocol, which cannot be spelled at all: implementing one in
+  a `deftype' or a `reify' is recorded where the protocol was named and with no
+  spelling on it (on-protocol-impl), so implementing it counts however it was
+  written. clojure.analysis has the same exception for the same reason.
+
+  A NAME MAY BE A VAR, A MACRO, OR BOTH, which is where this parts company with
+  Clojure's: a ClojureScript namespace and the macro namespace behind it are two
+  universes, and a plain :refer reaches into both - the compiler infers macros for
+  a `:require', so (:require [hx.react :refer [defnc]]) refers a macro and nothing
+  else. A name is unused when every universe that holds it says so. Not when one
+  of them does: where a library has a macro and a var of the same name, calling the
+  macro leaves the var unused, and the refer is doing its job."
   [cenv ns-sym]
   (when-let [^Namespace n (env/find-cljs-ns cenv ns-sym)]
-    (let [m       @model
-          used    (set (used-from (index m :usages) ns-sym))
-          written (written-from (index m :host-usages) ns-sym)]
+    (let [m          @model
+          uses       (index m :usages)
+          macro-used (set (used-from (index m :macro-usages) ns-sym))
+          written    (written-from (index m :host-usages) ns-sym)
+          spelt?     (fn [local ^Span s]
+                       (let [w (.written s)] (or (nil? w) (= w local))))
+          var-used?  (fn [local k]
+                       (boolean (some #(and (from-ns? ns-sym %) (spelt? local %))
+                                      (get uses k))))
+          macros     (or (referred-macros cenv ns-sym) {})
+          vars       (into {} (for [[sym v] (.getMappings n)
+                                    :when (instance? Var v)
+                                    :let  [home (.getName (.ns ^Var v))]
+                                    :when (not (#{ns-sym 'cljs.core} home))]
+                                [sym (var-key v)]))]
       (merge
-       (into {} (for [[sym v] (.getMappings n)
-                      :when (instance? Var v)
-                      :let  [home (.getName (.ns ^Var v))]
-                      :when (not (#{ns-sym 'cljs.core} home))
-                      :let  [k (var-key v)]
-                      :when (not (used k))]
-                  [sym k]))
+       (into {} (for [sym  (distinct (concat (keys vars) (keys macros)))
+                      :let [k (get vars sym) mk (get macros sym)]
+                      :when (and (or (nil? k) (not (var-used? sym k)))
+                                 (or (nil? mk) (not (macro-used mk))))]
+                  [sym (or k mk)]))
        (into {} (for [[sym target] (env/goog-refers cenv ns-sym)
                       :when (not (written sym))]
                   [sym target]))
@@ -1474,12 +1562,6 @@
                    :when (not (written-as? written sym))]
                [sym target]))))
 
-(defn- macro-view
-  "`ns-sym`'s view of the JVM, where :require-macros put its aliases and refers -
-  found, never created."
-  ^Namespace [cenv ns-sym]
-  (.find ^clojure.lang.NamespaceWorld (:macro-world cenv) ns-sym))
-
 (defn unused-macro-aliases
   "Macro-namespace aliases in `ns-sym` through which no macro is called:
   {alias jvm-ns}. As with unused-aliases, used means a macro of the target
@@ -1494,15 +1576,13 @@
                  [a t])))))
 
 (defn unused-macro-refers
-  "Macros `ns-sym` referred and never calls: {name macro-qsym}."
+  "Macros `ns-sym` referred and never calls: {name macro-qsym}. The macro half of
+  unused-refers, which a :require-macros clause is answered out of; a macro call
+  carries no spelling, so this is by the macro and not by how it was named."
   [cenv ns-sym]
-  (when-let [view (macro-view cenv ns-sym)]
+  (when-let [refs (referred-macros cenv ns-sym)]
     (let [used (set (used-from (index @model :macro-usages) ns-sym))]
-      (into {} (for [[sym v] (.getMappings view)
-                     :when (instance? Var v)
-                     :let  [k (jvm-var-key v)]
-                     :when (not (used k))]
-                 [sym k])))))
+      (into {} (remove (comp used val)) refs))))
 
 (defn file-facts
   "What the model holds of file `source`, as it was when it was last compiled -

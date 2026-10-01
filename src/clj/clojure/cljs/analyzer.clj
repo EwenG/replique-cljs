@@ -902,18 +902,34 @@
   host-name is lossy where munge is not, so foo-bar and foo_bar are one property.
   Two fields differing only there are refused here rather than allowed to become
   one silently - the second would overwrite the first, which is exactly the bug
-  clojure.cljs.names exists to have fixed for vars."
-  [env fields]
+  clojure.cljs.names exists to have fixed for vars.
+
+  :captures IS A FIELD THAT IS SOMEBODY ELSE'S LOCAL. An ANONYMOUS? type is one
+  cljs.core/reify generated, and reify makes a field of EVERY local in scope: the
+  field vector is (keys (:locals &env)), written with the symbols the source wrote
+  at the places it bound them. So such a field is not a field the programmer
+  declared - it is the capture of a local that is still right there in `env`, named
+  twice over - and :captures is that local's :js-name, which is what the field is a
+  stand-in for. clojure.cljs.analysis reads it to keep the local and its capture one
+  thing: the binding is the local's, and reading the field inside a method body is
+  reading the local. See analyze-symbol and clojure.cljs.analysis/unused-locals.
+
+  A field of an ordinary deftype is never one, even where its name shadows a local:
+  (let [x 1] (deftype T [x] ...)) declares a field that the source wrote and that
+  has nothing to do with the x around it."
+  [env fields anonymous?]
   (let [bs (mapv (fn [sym]
                    (when-not (simple-symbol? sym)
                      (throw (ex-info (str "Bad field name: " (pr-str sym))
                                      {:field sym})))
-                   {:op :binding :name sym :js-name (names/local-name sym)
-                    :field (names/field-name sym)
-                    :mutable? (boolean (or (:mutable (meta sym))
-                                           (:unsynchronized-mutable (meta sym))
-                                           (:volatile-mutable (meta sym))))
-                    :local :field :form sym :env env :children []})
+                   (cond-> {:op :binding :name sym :js-name (names/local-name sym)
+                            :field (names/field-name sym)
+                            :mutable? (boolean (or (:mutable (meta sym))
+                                                   (:unsynchronized-mutable (meta sym))
+                                                   (:volatile-mutable (meta sym))))
+                            :local :field :form sym :env env :children []}
+                     (and anonymous? (get-in env [:locals sym]))
+                     (assoc :captures (get-in env [:locals sym :js-name]))))
                  fields)]
     (doseq [[js group] (group-by :field bs)
             :when (> (count group) 1)]
@@ -990,7 +1006,8 @@
               ^Namespace ns (env/cljs-ns cenv)
               ^Var v  (.intern ns tsym)
               bs     (field-bindings env (into (vec fields)
-                                               (when record? record-fields)))
+                                               (when record? record-fields))
+                                     (boolean (:anonymous (meta tsym))))
               env'   (-> (not-tail env)
                          (dissoc :top-level?)
                          (update :locals into
@@ -3146,10 +3163,14 @@
       ;; written, so clojure.cljs.analysis can count it as a use of the field.
       ;; Under keys of their own rather than :line, for macroexpand/host-sugar's
       ;; reason: a :line here would be a position source maps read.
+      ;;
+      ;; Of the LOCAL the field captures, where it captures one: a reify body
+      ;; reading a surrounding local reads it through a field nobody wrote, and the
+      ;; use belongs to the local the source did write (field-bindings' :captures).
       (analyze cenv env
                (cond-> (list '. (:self b) (symbol (str "-" (:name b))))
                  (:line (meta sym))
-                 (with-meta {::field-of (:js-name b)
+                 (with-meta {::field-of (or (:captures b) (:js-name b))
                              :clojure.cljs.macroexpand/written
                              (select-keys (meta sym) [:line :column :end-line :end-column])})))
       (local-node env sym b))
