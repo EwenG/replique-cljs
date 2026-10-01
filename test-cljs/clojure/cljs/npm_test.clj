@@ -27,6 +27,7 @@
             [clojure.cljs.output :as output]
             [clojure.cljs.repl :as repl]
             [clojure.cljs.test-harness :as h]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.string :as str]
@@ -395,9 +396,12 @@
                               "" (map #(str "console.log(await $CLJS.evaluate("
                                             (pr-str %) "));\n")
                                       scripts))))
-            (is (= ["{:status :success :value \"nil\"}"
-                    "{:status :success :value \"\\\"hello a|B|c!\\\"\"}"]
-                   (str/split-lines (node drive)))))))
+            ;; read rather than compared as text: a result says what it was
+            ;; printed under as well, which is not what this is about
+            (is (= [{:status :success :value "nil"}
+                    {:status :success :value "\"hello a|B|c!\""}]
+                   (map #(select-keys (edn/read-string %) [:status :value])
+                        (str/split-lines (node drive))))))))
       (finally (h/delete-tree! out)))))
 
 (h/deftest-when h/node? test-a-repl-session-requires-a-package

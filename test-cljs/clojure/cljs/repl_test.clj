@@ -131,6 +131,19 @@
                   (js* \"0/0\") (js* \"-0\") (js* \"[1, 2]\") (js* \"({code: 1})\")
                   :kw [1 2] {:a 1}"))))
 
+(h/deftest-when h/node? test-a-result-says-what-it-was-printed-under
+  ;; read AFTER the script ran, so the form that set! one of them answers with what
+  ;; it set - and a later form is printed under it, by cljs.core's own printer
+  (let [eval! (fn [src] (repl/eval-src (with-core 'params.core) *runtime* src))]
+    (try
+      (let [[set-r range-r] (eval! "(set! *print-length* 2) (range 5)")]
+        (is (= {:print-length 2 :print-level nil :print-meta false} (:params set-r)))
+        (is (= "(0 1 ...)" (:value range-r)))
+        (is (= {:print-length 2 :print-level nil :print-meta false} (:params range-r))))
+      (let [[r] (eval! "(set! *print-meta* true)")]
+        (is (= true (:print-meta (:params r)))))
+      (finally (eval! "(set! *print-length* nil) (set! *print-meta* false)")))))
+
 (h/deftest-when h/node? test-a-runtime-error-comes-back-as-one
   (let [[r] (repl/eval-src (cenv 'err.core) *runtime*
                            "(throw (js* \"new Error(\\\"boom\\\")\"))")]
@@ -824,7 +837,8 @@
 
 (h/deftest-when h/node? test-a-bounded-call-that-fits-is-an-ordinary-evaluation
   (is (= {:status :success :value "99"}
-         (repl/evaluate-within *runtime* "(async function(){ return 99; })()" 15000))))
+         (select-keys (repl/evaluate-within *runtime* "(async function(){ return 99; })()" 15000)
+                      [:status :value]))))
 
 (deftest test-a-runtime-that-cannot-be-asked-to-give-up-says-so
   ;; Rather than a JVM-side timer around -evaluate, which would bound the wait and
@@ -841,7 +855,8 @@
   ;; fan-out one. Put the other way round, node would have to answer a refusal to
   ;; a question it can answer perfectly well.
   (is (= {:status :success :value "99"}
-         (repl/evaluate-all-within *runtime* "(async function(){ return 99; })()" 15000))))
+         (select-keys (repl/evaluate-all-within *runtime* "(async function(){ return 99; })()" 15000)
+                      [:status :value]))))
 
 (deftest test-a-runtime-that-can-spread-a-script-but-not-give-up-is-refused-as-well
   ;; The near miss evaluate-all-within is written against: this runtime CAN reach

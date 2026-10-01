@@ -360,7 +360,31 @@ const $eval = eval;
 // one line.
 function resultEdn(status, value, stacktrace) {
   return "{:status :" + status + " :value " + JSON.stringify(value) +
-    (stacktrace ? " :stacktrace " + JSON.stringify(stacktrace) : "") + "}";
+    (stacktrace ? " :stacktrace " + JSON.stringify(stacktrace) : "") +
+    paramsEdn() + "}";
+}
+
+// The printing the value went through, as cljs.core's vars hold it AFTER the
+// script ran - so a form that set! one of them is answered with what it set,
+// rather than with what was in force before it.
+//
+// HERE AND NOT IN THE FORM, for rememberError's reason turned around: the printer
+// is this module's, and the values it printed under are properties of cljs.core's
+// namespace object, read the way pr_str is above - munged by hand, looked up per
+// call, and nothing at all where cljs.core is not loaded yet, which is no printing
+// to describe. A REPL keeps them so that a page that reloads, and starts again
+// with cljs.core's defaults, can be given back the ones the developer chose.
+//
+// Only what EDN can read back: a count that is not a whole number is no count.
+function paramsEdn() {
+  try {
+    const core = $CLJS.namespaces.get("cljs.core");
+    if (!core) return "";
+    const count = (x) => Number.isInteger(x) ? String(x) : "nil";
+    return " :params {:print-length " + count(core.$STAR$print_length$STAR$) +
+      " :print-level " + count(core.$STAR$print_level$STAR$) +
+      " :print-meta " + String(truth_(core.$STAR$print_meta$STAR$)) + "}";
+  } catch (_) { return ""; }
 }
 
 // cljs.core/*e, which is the one piece of REPL history the compiled form cannot
