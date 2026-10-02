@@ -259,6 +259,9 @@
                     [tag (with-meta @v {:sym sym})])))
           syms)))
 
+;; What `user-data-readers' read, until something says it is to be read again.
+(def ^:private data-readers-read (atom nil))
+
 (def user-data-readers
   "Every tag a data_readers.cljc on the classpath registers, as {tag f}, where f is
   the JVM function that reads it, carrying the symbol that names it under :sym.
@@ -267,10 +270,22 @@
   language. Both are read at compile time; only these have a runtime half, because
   #js and #queue hand back a marker and a form rather than a value.
 
-  Memoized on the classpath, as cljs.analyzer's load-data-readers is: the files do
-  not change while a JVM runs, and scanning every jar for each form read would be
-  the reader's dominant cost."
-  (memoize user-data-readers*))
+  Read once and kept, as cljs.analyzer's load-data-readers is: scanning every jar
+  for each form read would be the reader's dominant cost. Kept until
+  `forget-data-readers!', which is what a library added to the running process
+  asks for - the one way the files change while a JVM runs."
+  (fn []
+    (or @data-readers-read
+        (reset! data-readers-read (user-data-readers*)))))
+
+(defn forget-data-readers!
+  "Read the data_readers.cljc files again the next time a tag is asked for.
+
+  For whoever has just put something on the classpath - replique, adding a
+  library to a running process. A library is where those files come from, so
+  the tags it brings are not known until they are read again."
+  []
+  (reset! data-readers-read nil))
 
 (def ^:dynamic *host-data-readers*
   "Tags the thing DRIVING this reader adds, on top of the language's and the

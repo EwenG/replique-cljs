@@ -431,6 +431,23 @@
                       (catch Exception e (.getMessage e))))
           content))))
 
+(deftest test-the-tags-are-read-again-once-forgotten
+  ;; Read once and kept, because scanning every jar per form read is not a cost
+  ;; to pay - and a library added to a running process is the one way the files
+  ;; change while it runs, which is what forget-data-readers! is for.
+  (let [read @#'reader/data-readers-read
+        was @read]
+    (try
+      (reader/forget-data-readers!)
+      (with-data-readers-file "{my/up clojure.string/upper-case}"
+        (is (contains? (reader/user-data-readers) 'my/up)))
+      (testing "kept, though the file that said so is gone"
+        (is (contains? (reader/user-data-readers) 'my/up)))
+      (reader/forget-data-readers!)
+      (testing "and read again once forgotten"
+        (is (not (contains? (reader/user-data-readers) 'my/up))))
+      (finally (reset! read was)))))
+
 (deftest test-a-host-tag-is-read-only-where-the-host-added-it
   ;; The tags of the thing DRIVING the reader, which is neither the language's nor
   ;; the program's: a REPL host whose client says things in band - Replique's
