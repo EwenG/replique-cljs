@@ -509,6 +509,39 @@
           (is (empty? (an/stale-files)))
           (is (empty? (an/stale-macro-files))))))))
 
+(deftest test-what-is-vouched-for-is-taken-as-compiled
+  (let [cp  (h/temp-dir)
+        mf  (io/file cp "vouched" "macros.clj")
+        mtext "(ns vouched.macros)\n(defmacro answer [] 1)\n"
+        _   (.mkdirs (.getParentFile mf))
+        _   (touch! mf mtext)]
+    (with-classpath-dir cp
+      (fn []
+        (let [{:keys [src]}
+              (compile! '{deep.util "(ns deep.util)\n(def z 3)"
+                          app.core  "(ns app.core
+  (:require [deep.util])
+  (:require-macros [vouched.macros :refer [answer]]))
+(def a (answer))"})
+              util (io/file src "deep/util.cljs")
+              core (io/file src "app/core.cljs")
+              utext (slurp util)]
+          (testing "the same content written again is another mtime, and so a change"
+            (touch! util utext)
+            (touch! core (str (slurp core) "\n(def b 2)\n"))
+            (touch! mf mtext)
+            (is (= #{"deep/util.cljs" "app/core.cljs"} (an/changed-files)))
+            (is (= #{"vouched/macros.clj"} (an/changed-macro-files))))
+          (testing "rebaseline! takes the files it is told are the same, and no other"
+            (let [same #{(.getCanonicalPath util) (.getCanonicalPath mf)}]
+              (is (= #{"deep/util.cljs" "vouched/macros.clj"}
+                     (an/rebaseline! (fn [^java.io.File f _]
+                                       (contains? same (.getCanonicalPath f)))))))
+            (is (= #{"app/core.cljs"} (an/changed-files)))
+            (is (empty? (an/changed-macro-files)))
+            (testing "and the macro file no longer makes its expander stale"
+              (is (= #{"app/core.cljs"} (an/stale-files))))))))))
+
 (deftest test-a-compile-against-an-unloaded-macro-edit-stays-stale
   ;; a branch switch changes the macro file; a file is recompiled (a require
   ;; :reload) before anything loads the macro file again, so it expands the old

@@ -1688,6 +1688,48 @@
   []
   (set (for [[source fids] (:source->forms @model) :when (seq fids)] source)))
 
+(defn rebaseline!
+  "Take the file now on disk as the version compiled - or, for a macro file, as the
+  version loaded and expanded - wherever `same?` vouches for it, and answer the
+  sources and macro resources it did so for. clojure.analysis/rebaseline!, whose
+  docstring has the argument: an mtime is a fact about the copy of a file, and a
+  directory swapped for another checkout gives every file another one.
+
+  `same?` is called with the File and the baseline mtime, and answers whether what
+  is in the file is what that baseline was the mtime of. Asked of each baseline on
+  its own - a compiled file's, the JVM's loaded version of a macro file, and the
+  version each compiled file expanded - since the three can be three versions: a
+  file that expanded a macro file's old version before it was loaded again is
+  stale, and stays stale."
+  [same?]
+  (let [m     @model
+        now   (fn [loc] (when-let [f (location-file loc)]
+                          (when (.isFile f) [f (.lastModified f)])))
+        take? (fn [loc t]
+                (when t
+                  (when-let [[f n] (now loc)]
+                    (when (and (not= n t) (same? f t)) n))))
+        files (into {} (for [[source t] (:file-mtime m)
+                             :let [n (take? (get-in m [:locations source]) t)]
+                             :when n]
+                         [source n]))
+        loaded (into {} (for [[res t] (:macro-loaded m)
+                              :let [n (take? res t)]
+                              :when n]
+                          [res n]))
+        expanded (into {} (for [[source deps] (:macro-files m)
+                                [res t] deps
+                                :let [n (take? res t)]
+                                :when n]
+                            [[source res] n]))]
+    (swap! model (fn [m]
+                   (as-> m m
+                     (update m :file-mtime merge files)
+                     (update m :macro-loaded merge loaded)
+                     (reduce-kv (fn [m path n] (assoc-in m (into [:macro-files] path) n))
+                                m expanded))))
+    (into (set (keys files)) (concat (keys loaded) (map second (keys expanded))))))
+
 (defn changed-files
   "Analysed files whose mtime differs from the one they were compiled at - edited
   since. A file with no mtime then (inside a jar) or none now (moved, deleted) is
