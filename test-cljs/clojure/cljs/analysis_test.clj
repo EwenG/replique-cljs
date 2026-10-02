@@ -376,8 +376,9 @@
   (let [cenv (compile-lints!)]
     (testing "an alias whose namespace nothing is used from; a JS alias never written"
       (is (= '{ol other.lib ReactDOM "react-dom"} (an/unused-aliases cenv 'app.core))))
-    (testing "a referred var, Closure name or JS export the source never uses"
-      (is (= '{y deep.util/y trimLeft goog.string/trimLeft useEffect ["react" "useEffect"]}
+    (testing "a referred var, macro, Closure name or JS export the source never uses"
+      (is (= '{y deep.util/y trimLeft goog.string/trimLeft useEffect ["react" "useEffect"]
+               twice-double clojure.cljs.analysis-test/twice-double}
              (an/unused-refers cenv 'app.core))))
     (testing "an :import never named"
       (is (= '{StringBuffer goog.string.StringBuffer} (an/unused-imports cenv 'app.core))))
