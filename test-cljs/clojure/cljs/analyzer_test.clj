@@ -1989,6 +1989,36 @@
       (h/analyze cenv '(declare three))
       (is (some? (:top-fn (h/analyze cenv 'three)))))))
 
+(deftest test-a-redefinition-replaces-what-the-name-said
+  ;; what a definition wrote on its name is merged onto the var, and the next
+  ;; definition takes it back: a defn- edited into a defn is public again, which
+  ;; is what compiling it afresh would have said
+  (let [cenv (h/core-env 'app.rd)
+        var-meta (fn [sym] (meta (.findInternedVar (env/cljs-ns cenv 'app.rd) sym)))]
+    (testing "a defn- made a defn is no longer private"
+      (h/analyze cenv '(defn- p [x] x))
+      (is (:private (var-meta 'p)))
+      (h/analyze cenv '(defn p [x] x))
+      (is (not (:private (var-meta 'p)))))
+
+    (testing "nor deprecated, nor documented, once the source stops saying so"
+      (h/analyze cenv '(def ^:deprecated d "the doc" 1))
+      (is (= "the doc" (:doc (var-meta 'd))))
+      (h/analyze cenv '(def d 2))
+      (is (not (:deprecated (var-meta 'd))))
+      (is (nil? (:doc (var-meta 'd)))))
+
+    (testing "but a forward declaration takes nothing back"
+      (h/analyze cenv '(defn- q [x] x))
+      (h/analyze cenv '(declare q))
+      (is (:private (var-meta 'q))))
+
+    (testing "and what was put on the var from elsewhere stays"
+      (h/analyze cenv '(def r 1))
+      (alter-meta! (.findInternedVar (env/cljs-ns cenv 'app.rd) 'r) assoc :impls #{'T})
+      (h/analyze cenv '(def r 2))
+      (is (= #{'T} (:impls (var-meta 'r)))))))
+
 (deftest test-a-compiler-flag-is-not-a-runtime-variable
   ;; §5.37. cljs.core defines *unchecked-if*, *unchecked-arrays* and
   ;; *warn-on-infer* as ordinary vars, but a set! of one is a message to the

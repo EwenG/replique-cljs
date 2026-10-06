@@ -573,11 +573,29 @@
       ;; merged rather than assoc'd over a redefinition, and a def in a file
       ;; therefore MOVES a var that a REPL had defined before it, which is what
       ;; somebody jumping to the definition wants: the last place it was written.
-      (alter-meta! v merge
-                   (cond-> (select-keys m [:line :column :end-line :end-column])
-                     *source-file* (assoc :file *source-file*)
-                     doc (assoc :doc doc)
-                     (meta sym) (merge (meta sym))))
+      ;;
+      ;; BUT WHAT THE LAST DEFINITION WROTE ON ITS NAME, A REDEFINITION REPLACES.
+      ;; Merged, a (defn- foo ...) edited into a (defn foo ...) would leave foo
+      ;; private for as long as the process lives - and so would a ^:deprecated,
+      ;; a ^:dynamic or a doc string taken out of the source - while the same
+      ;; edit compiled anew, or by cljs.analyzer, which assoc's the var's entry
+      ;; whole (analyzer.cljc:2051), says it is public. So the keys a definition
+      ;; wrote are remembered under ::written, and a def WITH AN INIT drops them
+      ;; before it writes its own. What is not written on the name stays: the
+      ;; position, which the merge moves anyway, and what was put on the var from
+      ;; elsewhere - a protocol's :impls, a macro's :macro. A declare drops
+      ;; nothing, for the reason :top-fn is kept below: it is a forward
+      ;; declaration of what is there, not a new definition of it.
+      (let [written (cond-> (set (keys (meta sym))) doc (conj :doc))]
+        (alter-meta! v (fn [old]
+                         (-> (if init? (apply dissoc old (::written old)) old)
+                             (merge (cond-> (select-keys m [:line :column :end-line :end-column])
+                                      *source-file* (assoc :file *source-file*)
+                                      doc (assoc :doc doc)
+                                      (meta sym) (merge (meta sym))))
+                             (assoc ::written (if init?
+                                                written
+                                                (into (::written old #{}) written)))))))
       (let [init (when init?
                    (name-defd-fn cenv sym (analyze cenv (not-tail env) init-form)))]
         ;; ^boolean ON A defn IS A RETURN TAG. (defn ^boolean nil? [x] ...) is how
